@@ -31,6 +31,15 @@ DEFINE_int32(bits_per_key, 10, "");
 
 namespace rocksdb {
 
+#define BLOOM_TEST_THOROUGH 1
+#ifdef BLOOM_TEST_THOROUGH
+static const int bloom_test_max_length = 10000000;
+static const int bloom_test_fp_probes = 100000;
+#else
+static const int bloom_test_max_length = 10000;
+static const int bloom_test_fp_probes = 10000;
+#endif
+
 static const int kVerbose = 1;
 
 static Slice Key(int i, char* buffer) {
@@ -47,8 +56,14 @@ static int NextLength(int length) {
     length += 10;
   } else if (length < 1000) {
     length += 100;
-  } else {
+  } else if (length < 10000) {
     length += 1000;
+  } else if (length < 100000) {
+    length += 10000;
+  } else if (length < 1000000) {
+    length += 100000;
+  } else {
+    length += 1000000;
   }
   return length;
 }
@@ -113,12 +128,12 @@ class BloomTest : public testing::Test {
   double FalsePositiveRate() {
     char buffer[sizeof(int)];
     int result = 0;
-    for (int i = 0; i < 10000; i++) {
+    for (int i = 0; i < bloom_test_fp_probes; i++) {
       if (Matches(Key(i + 1000000000, buffer))) {
         result++;
       }
     }
-    return result / 10000.0;
+    return result / (double)bloom_test_fp_probes;
   }
 };
 
@@ -142,11 +157,16 @@ TEST_F(BloomTest, VaryingLengths) {
   // Count number of filters that significantly exceed the false positive rate
   int mediocre_filters = 0;
   int good_filters = 0;
+  double rate_sum = 0.0;
+  int rate_sum_samples = 0;
+  double max_rate = 0.0;
 
-  for (int length = 1; length <= 10000; length = NextLength(length)) {
+  for (int length = 1; length <= bloom_test_max_length; length = NextLength(length)) {
     Reset();
     for (int i = 0; i < length; i++) {
-      Add(Key(i, buffer));
+      // For more independent results for various lengths, use different
+      // input keys between them (length * 10 + ...)
+      Add(Key(length * 10 + i, buffer));
     }
     Build();
 
@@ -154,12 +174,17 @@ TEST_F(BloomTest, VaryingLengths) {
 
     // All added keys must match
     for (int i = 0; i < length; i++) {
-      ASSERT_TRUE(Matches(Key(i, buffer)))
+      ASSERT_TRUE(Matches(Key(length * 10 + i, buffer)))
           << "Length " << length << "; key " << i;
     }
 
     // Check false positive rate
     double rate = FalsePositiveRate();
+    if (length >= 1000) {
+        rate_sum += rate;
+        rate_sum_samples++;
+    }
+    if (rate > max_rate) { max_rate = rate; }
     if (kVerbose >= 1) {
       fprintf(stderr, "False positives: %5.2f%% @ length = %6d ; bytes = %6d\n",
               rate*100.0, length, static_cast<int>(FilterSize()));
@@ -169,8 +194,9 @@ TEST_F(BloomTest, VaryingLengths) {
     else good_filters++;
   }
   if (kVerbose >= 1) {
-    fprintf(stderr, "Filters: %d good, %d mediocre\n",
-            good_filters, mediocre_filters);
+    fprintf(stderr, "Filters: %d good, %d mediocre (avg=%5.2f%% (l>=1000), max=%5.2f%%)\n",
+            good_filters, mediocre_filters,
+            rate_sum / rate_sum_samples * 100.0, max_rate * 100.0);
   }
   ASSERT_LE(mediocre_filters, good_filters/5);
 }
@@ -231,12 +257,12 @@ class FullBloomTest : public testing::Test {
   double FalsePositiveRate() {
     char buffer[sizeof(int)];
     int result = 0;
-    for (int i = 0; i < 10000; i++) {
+    for (int i = 0; i < bloom_test_fp_probes; i++) {
       if (Matches(Key(i + 1000000000, buffer))) {
         result++;
       }
     }
-    return result / 10000.0;
+    return result / (double)bloom_test_fp_probes;
   }
 };
 
@@ -274,11 +300,16 @@ TEST_F(FullBloomTest, FullVaryingLengths) {
   // Count number of filters that significantly exceed the false positive rate
   int mediocre_filters = 0;
   int good_filters = 0;
+  double rate_sum = 0.0;
+  int rate_sum_samples = 0;
+  double max_rate = 0.0;
 
-  for (int length = 1; length <= 10000; length = NextLength(length)) {
+  for (int length = 1; length <= bloom_test_max_length; length = NextLength(length)) {
     Reset();
     for (int i = 0; i < length; i++) {
-      Add(Key(i, buffer));
+      // For more independent results for various lengths, use different
+      // input keys between them (length * 10 + ...)
+      Add(Key(length * 10 + i, buffer));
     }
     Build();
 
@@ -286,12 +317,17 @@ TEST_F(FullBloomTest, FullVaryingLengths) {
 
     // All added keys must match
     for (int i = 0; i < length; i++) {
-      ASSERT_TRUE(Matches(Key(i, buffer)))
+      ASSERT_TRUE(Matches(Key(length * 10 + i, buffer)))
           << "Length " << length << "; key " << i;
     }
 
     // Check false positive rate
     double rate = FalsePositiveRate();
+    if (length >= 1000) {
+        rate_sum += rate;
+        rate_sum_samples++;
+    }
+    if (rate > max_rate) { max_rate = rate; }
     if (kVerbose >= 1) {
       fprintf(stderr, "False positives: %5.2f%% @ length = %6d ; bytes = %6d\n",
               rate*100.0, length, static_cast<int>(FilterSize()));
@@ -303,8 +339,9 @@ TEST_F(FullBloomTest, FullVaryingLengths) {
       good_filters++;
   }
   if (kVerbose >= 1) {
-    fprintf(stderr, "Filters: %d good, %d mediocre\n",
-            good_filters, mediocre_filters);
+    fprintf(stderr, "Filters: %d good, %d mediocre (avg=%5.2f%% (l>=1000), max=%5.2f%%)\n",
+            good_filters, mediocre_filters,
+            rate_sum / rate_sum_samples * 100.0, max_rate * 100.0);
   }
   ASSERT_LE(mediocre_filters, good_filters/5);
 }

@@ -7,6 +7,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#define PETERD_FIX_IMPL1_ENH 1
+#define PETERD_FIX_IMPL1_XOR 1
+
+#define PETERD_FIX_IMPL2_ODD 0
+#define PETERD_FIX_IMPL2_ENH 1
+#define PETERD_FIX_IMPL2_XOR 1
+
 #include "rocksdb/filter_policy.h"
 
 #include "rocksdb/slice.h"
@@ -124,10 +131,13 @@ inline void FullFilterBitsBuilder::AddHash(uint32_t h, char* data,
 #endif
   assert(num_lines > 0 && total_bits > 0);
 
-  const uint32_t delta = (h >> 17) | (h << 15);  // Rotate right 17 bits
+  uint32_t delta = (h >> 17) | (h << 15) | PETERD_FIX_IMPL2_ODD;  // Rotate right 17 bits
+  if (PETERD_FIX_IMPL2_XOR) { h ^= 0x6740bca3; }
   uint32_t b = (h % num_lines) * (CACHE_LINE_SIZE * 8);
+  if (PETERD_FIX_IMPL2_XOR) { h ^= 0x41fc0926; }
 
   for (uint32_t i = 0; i < num_probes_; ++i) {
+    if (PETERD_FIX_IMPL2_ENH) { delta += i; }
     // Since CACHE_LINE_SIZE is defined as 2^n, this line will be optimized
     // to a simple operation by compiler.
     const uint32_t bitpos = b + (h % (CACHE_LINE_SIZE * 8));
@@ -226,12 +236,15 @@ bool FullFilterBitsReader::HashMayMatch(const uint32_t& hash,
   const char* data = filter.data();
 
   uint32_t h = hash;
-  const uint32_t delta = (h >> 17) | (h << 15);  // Rotate right 17 bits
+  uint32_t delta = (h >> 17) | (h << 15) | PETERD_FIX_IMPL2_ODD;  // Rotate right 17 bits
+  if (PETERD_FIX_IMPL2_XOR) { h ^= 0x6740bca3; }
   uint32_t b = (h % num_lines) * (cache_line_size * 8);
+  if (PETERD_FIX_IMPL2_XOR) { h ^= 0x41fc0926; }
   PREFETCH(&data[b / 8], 0 /* rw */, 1 /* locality */);
   PREFETCH(&data[b / 8 + cache_line_size - 1], 0 /* rw */, 1 /* locality */);
 
   for (uint32_t i = 0; i < num_probes; ++i) {
+    if (PETERD_FIX_IMPL2_ENH) { delta += i; }
     // Since CACHE_LINE_SIZE is defined as 2^n, this line will be optimized
     //  to a simple and operation by compiler.
     const uint32_t bitpos = b + (h % (cache_line_size * 8));
@@ -272,7 +285,6 @@ class BloomFilterPolicy : public FilterPolicy {
 
     size_t bytes = (bits + 7) / 8;
     bits = bytes * 8;
-
     const size_t init_size = dst->size();
     dst->resize(init_size + bytes, 0);
     dst->push_back(static_cast<char>(num_probes_));  // Remember # of probes
@@ -281,8 +293,10 @@ class BloomFilterPolicy : public FilterPolicy {
       // Use double-hashing to generate a sequence of hash values.
       // See analysis in [Kirsch,Mitzenmacher 2006].
       uint32_t h = hash_func_(keys[i]);
-      const uint32_t delta = (h >> 17) | (h << 15);  // Rotate right 17 bits
+      uint32_t delta = (h >> 17) | (h << 15);  // Rotate right 17 bits
+      if (PETERD_FIX_IMPL1_XOR) { h ^= 0x6740bca3; }
       for (size_t j = 0; j < num_probes_; j++) {
+        if (PETERD_FIX_IMPL1_ENH) { delta += j; }
         const uint32_t bitpos = h % bits;
         array[bitpos/8] |= (1 << (bitpos % 8));
         h += delta;
@@ -308,8 +322,10 @@ class BloomFilterPolicy : public FilterPolicy {
     }
 
     uint32_t h = hash_func_(key);
-    const uint32_t delta = (h >> 17) | (h << 15);  // Rotate right 17 bits
+    uint32_t delta = (h >> 17) | (h << 15);  // Rotate right 17 bits
+    if (PETERD_FIX_IMPL1_XOR) { h ^= 0x6740bca3; }
     for (size_t j = 0; j < k; j++) {
+      if (PETERD_FIX_IMPL1_ENH) { delta += j; }
       const uint32_t bitpos = h % bits;
       if ((array[bitpos/8] & (1 << (bitpos % 8))) == 0) return false;
       h += delta;
