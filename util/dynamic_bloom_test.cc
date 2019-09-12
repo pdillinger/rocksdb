@@ -44,6 +44,8 @@ static Slice Key(uint64_t i, char* buffer) {
 class DynamicBloomTest : public testing::Test {};
 
 TEST_F(DynamicBloomTest, EmptyFilter) {
+  fprintf(stderr, "Using implementation %s\n", DynamicBloom::IMPL_NAME);
+
   Arena arena;
   DynamicBloom bloom1(&arena, 100, 2);
   ASSERT_TRUE(!bloom1.MayContain("hello"));

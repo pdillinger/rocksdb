@@ -16,6 +16,10 @@
 #include <atomic>
 #include <memory>
 
+#ifdef HAVE_AVX2
+#include <immintrin.h>
+#endif
+
 namespace rocksdb {
 
 class Slice;
@@ -73,7 +77,7 @@ class DynamicBloomTemplate : public Impl {
 // Inherited protected:
   //void SetNumProbes(uint32_t num_probes);
 
-  //uint32_t GetBlockBytes();
+  //uint32_t GetBlockBytes() const;
 
   //void SetData(char *data, size_t size);
 };
@@ -111,10 +115,10 @@ class DynamicBloomTemplate : public Impl {
 // total_bits > 2^32 (512MB). (The latter is a bad idea without the former,
 // because of false positives.)
 //
-class DynamicBloomImpl {
+class DynamicBloomImplNoSimd {
 public:
-  DynamicBloomImpl() : num_double_probes_(0), len_(0), data_(nullptr) {}
-  ~DynamicBloomImpl() {}
+  DynamicBloomImplNoSimd() : num_double_probes_(0), len_(0), data_(nullptr) {}
+  ~DynamicBloomImplNoSimd() {}
 
   void Prefetch(uint32_t hash);
 
@@ -124,10 +128,12 @@ public:
 
   void AddHashConcurrently(uint32_t hash);
 
+  static const char * const IMPL_NAME;
+
 protected:
   void SetNumProbes(uint32_t num_probes);
 
-  uint32_t GetBlockBytes();
+  uint32_t GetBlockBytes() const;
 
   void SetData(char *data, size_t size);
 
@@ -148,12 +154,6 @@ protected:
   template <typename OrFunc>
   inline void AddHash(uint32_t hash, const OrFunc& or_func);
 };
-
-
-typedef DynamicBloomTemplate<DynamicBloomImpl> DynamicBloom;
-
-
-// Implementation details that are templated or should be inlined:
 
 template <class Impl>
 DynamicBloomTemplate<Impl>::DynamicBloomTemplate(Allocator* allocator,
@@ -199,14 +199,14 @@ inline bool DynamicBloomTemplate<Impl>::MayContain(const Slice& key) const {
 }
 
 
-inline void DynamicBloomImpl::AddHash(uint32_t hash) {
+inline void DynamicBloomImplNoSimd::AddHash(uint32_t hash) {
   AddHash(hash, [](std::atomic<uint64_t>* ptr, uint64_t mask) {
     ptr->store(ptr->load(std::memory_order_relaxed) | mask,
                std::memory_order_relaxed);
   });
 }
 
-inline void DynamicBloomImpl::AddHashConcurrently(uint32_t hash) {
+inline void DynamicBloomImplNoSimd::AddHashConcurrently(uint32_t hash) {
   AddHash(hash, [](std::atomic<uint64_t>* ptr, uint64_t mask) {
     // Happens-before between AddHash and MaybeContains is handled by
     // access to versions_->LastSequence(), so all we have to do here is
@@ -224,7 +224,7 @@ inline void DynamicBloomImpl::AddHashConcurrently(uint32_t hash) {
 // local variable is initialized but not referenced
 #pragma warning(disable : 4189)
 #endif
-inline void DynamicBloomImpl::Prefetch(uint32_t h32) {
+inline void DynamicBloomImplNoSimd::Prefetch(uint32_t h32) {
   size_t a = fastrange32(len_, h32);
   PREFETCH(data_ + a, 0, 3);
 }
@@ -232,7 +232,7 @@ inline void DynamicBloomImpl::Prefetch(uint32_t h32) {
 #pragma warning(pop)
 #endif
 
-inline bool DynamicBloomImpl::MayContainHash(uint32_t h32) const {
+inline bool DynamicBloomImplNoSimd::MayContainHash(uint32_t h32) const {
   size_t a = fastrange32(len_, h32);
   PREFETCH(data_ + a, 0, 3);
   // Expand/remix with 64-bit golden ratio
@@ -252,7 +252,7 @@ inline bool DynamicBloomImpl::MayContainHash(uint32_t h32) const {
 }
 
 template <typename OrFunc>
-inline void DynamicBloomImpl::AddHash(uint32_t h32, const OrFunc& or_func) {
+inline void DynamicBloomImplNoSimd::AddHash(uint32_t h32, const OrFunc& or_func) {
   size_t a = fastrange32(len_, h32);
   PREFETCH(data_ + a, 0, 3);
   // Expand/remix with 64-bit golden ratio
@@ -268,5 +268,140 @@ inline void DynamicBloomImpl::AddHash(uint32_t h32, const OrFunc& or_func) {
     h = (h >> 12) | (h << 52);
   }
 }
+
+#ifdef HAVE_AVX2
+class DynamicBloomImplAvx2 {
+public:
+  DynamicBloomImplAvx2() : k_selector_(), len_(0), data_(nullptr) {}
+  ~DynamicBloomImplAvx2() {}
+
+  void Prefetch(uint32_t hash);
+
+  bool MayContainHash(uint32_t hash) const;
+
+  void AddHash(uint32_t hash);
+
+  void AddHashConcurrently(uint32_t hash);
+
+  static const char * const IMPL_NAME;
+
+protected:
+  void SetNumProbes(uint32_t num_probes);
+
+  uint32_t GetBlockBytes() const;
+
+  void SetData(char *data, size_t size);
+
+ private:
+  // A vector of eight 32-bit values, k (num_probes) of which are ones and
+  // the rest zeros.
+  __m256i k_selector_;
+
+  // Length of the structure, in 256-bit blocks.
+  uint32_t len_;
+
+  // Raw filter data
+  __m256i *data_;
+
+  // or_func(ptr, mask) should effect *ptr |= mask with the appropriate
+  // concurrency safety.
+  template <typename OrFunc>
+  inline void AddHash(uint32_t hash, const OrFunc& or_func);
+
+  inline __m256i GetMask(uint32_t hash) const;
+};
+
+
+inline __m256i DynamicBloomImplAvx2::GetMask(uint32_t h) const {
+  // Make eight copies of h
+  __m256i v = _mm256_set1_epi32(h);
+
+  // Start the process of selecting exactly k out of 8 sectors to actually use,
+  // with basic re-arrangement of values 0 to 7 using bottom bits of
+  // hash. (Bits above bottom three will be ignored.)
+  const __m256i list_0_to_7 = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+  __m256i s = _mm256_add_epi32(list_0_to_7, v);
+
+  // Use various multipliers to set up for extracting five 5-bit pieces of the
+  // input hash (enough not to conflict with above use of 3 bits) plus
+  // three 5-bit pieces of a modest remix of the input hash. (If writing
+  // non-SIMD code to be schema compatible with this code, this approach
+  // vs. independent remixes should be slightly faster for that non-SIMD
+  // code.)
+  const __m256i multipliers =
+      _mm256_setr_epi32(1 << 0, 1 << 5, 1 << 10, 1 << 15, 1 << 20,
+                        1628273 << 0, 1628273 << 5, 1628273 << 10);
+  v = _mm256_mullo_epi32(v, multipliers);
+
+  // Use those 0 to 7 values to permute the k selector 1s and 8-k selector 0s.
+  s = _mm256_permutevar8x32_epi32(k_selector_, s);
+
+  // Shift away all but top 5 re-mixed hash bits
+  v = _mm256_srli_epi32(v, 27);
+
+  // Generate mask by left-shifting the k selected 1s by those hash quantities
+  return _mm256_sllv_epi32(s, v);
+}
+
+inline void DynamicBloomImplAvx2::AddHash(uint32_t hash) {
+  AddHash(hash, [](__m256i* ptr, __m256i mask) {
+    _mm256_store_si256(ptr, _mm256_or_si256(*ptr, mask));
+  });
+}
+
+inline void DynamicBloomImplAvx2::AddHashConcurrently(uint32_t hash) {
+  AddHash(hash, [](__m256i* ptr, __m256i mask) {
+    // Happens-before between AddHash and MaybeContains is handled by
+    // access to versions_->LastSequence(), so all we have to do here is
+    // avoid races (so we don't give the compiler a license to mess up
+    // our code) and not lose bits.  std::memory_order_relaxed is enough
+    // for that.
+    static_assert(sizeof(std::atomic<int64_t>) == sizeof(int64_t),
+                  "Expecting zero-space-overhead atomic");
+    std::atomic<int64_t> *atomic_ptr =
+        reinterpret_cast<std::atomic<int64_t> *>(ptr);
+    int64_t *mask_ptr = reinterpret_cast<int64_t *>(&mask);
+    for (int i = 0; i < 4; ++i) {
+      if (mask_ptr[i]) {
+        atomic_ptr[i].fetch_or(mask_ptr[i], std::memory_order_relaxed);
+      }
+    }
+  });
+}
+
+inline void DynamicBloomImplAvx2::Prefetch(uint32_t h32) {
+  size_t a = fastrange32(len_, h32);
+  PREFETCH(data_ + a, 0, 3);
+}
+
+inline bool DynamicBloomImplAvx2::MayContainHash(uint32_t h) const {
+  size_t a = fastrange32(len_, h);
+  __m256i *ptr = data_ + a;
+  PREFETCH(ptr, 0, 3);
+  // Remix with golden ratio after fastrange
+  h *= 0x9e3779b9;
+  // Like ((~val) & mask) == 0)
+  return _mm256_testc_si256(*ptr, GetMask(h));
+}
+
+template <typename OrFunc>
+inline void DynamicBloomImplAvx2::AddHash(uint32_t h, const OrFunc& or_func) {
+  size_t a = fastrange32(len_, h);
+  __m256i *ptr = data_ + a;
+  PREFETCH(ptr, 0, 3);
+  // Remix with golden ratio after fastrange
+  h *= 0x9e3779b9;
+  // Like *ptr |= mask;
+  or_func(ptr, GetMask(h));
+}
+#endif // HAVE_AVX2
+
+
+// Type aliases / compile time choices
+#ifdef HAVE_AVX2
+typedef DynamicBloomTemplate<DynamicBloomImplAvx2> DynamicBloom;
+#else
+typedef DynamicBloomTemplate<DynamicBloomImplNoSimd> DynamicBloom;
+#endif // HAVE_AVX2
 
 }  // rocksdb
