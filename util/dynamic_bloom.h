@@ -15,6 +15,10 @@
 #include <atomic>
 #include <memory>
 
+#ifdef HAVE_AVX2
+#include <immintrin.h>
+#endif
+
 namespace rocksdb {
 
 class Slice;
@@ -31,7 +35,7 @@ class Logger;
 // should be less than roughly 100x the cost of a Bloom filter op.
 //
 // For simplicity and performance, the current implementation requires
-// num_probes to be a multiple of two and <= 10.
+// num_probes to be a multiple of two and <= 12 (<= 8 when using AVX2).
 //
 class DynamicBloom {
  public:
@@ -70,7 +74,10 @@ class DynamicBloom {
   // Multithreaded access to this function is OK
   bool MayContainHash(uint32_t hash) const;
 
-  void Prefetch(uint32_t h);
+  // Multithreaded access to this function is OK
+  void Prefetch(uint32_t hash);
+
+  static const char * const IMPL_NAME;
 
  private:
   // Length of the structure, in 64-bit words. For this structure, "word"
@@ -79,13 +86,18 @@ class DynamicBloom {
   // We make the k probes in pairs, two for each 64-bit read/write. Thus,
   // this stores k/2, the number of words to double-probe.
   const uint32_t kNumDoubleProbes;
-
+  // Raw filter data
   std::atomic<uint64_t>* data_;
+
+#ifdef HAVE_AVX2
+  __m256i shift_and_selector_matrix_;
+  __m256i GetMask(uint64_t h, uint32_t offset) const;
+#endif
 
   // or_func(ptr, mask) should effect *ptr |= mask with the appropriate
   // concurrency safety, working with bytes.
   template <typename OrFunc>
-  void AddHash(uint32_t hash, const OrFunc& or_func);
+  void AddHashNoSimd(uint32_t hash, const OrFunc& or_func);
 };
 
 inline void DynamicBloom::Add(const Slice& key) { AddHash(BloomHash(key)); }
@@ -94,15 +106,8 @@ inline void DynamicBloom::AddConcurrently(const Slice& key) {
   AddHashConcurrently(BloomHash(key));
 }
 
-inline void DynamicBloom::AddHash(uint32_t hash) {
-  AddHash(hash, [](std::atomic<uint64_t>* ptr, uint64_t mask) {
-    ptr->store(ptr->load(std::memory_order_relaxed) | mask,
-               std::memory_order_relaxed);
-  });
-}
-
 inline void DynamicBloom::AddHashConcurrently(uint32_t hash) {
-  AddHash(hash, [](std::atomic<uint64_t>* ptr, uint64_t mask) {
+  AddHashNoSimd(hash, [](std::atomic<uint64_t>* ptr, uint64_t mask) {
     // Happens-before between AddHash and MaybeContains is handled by
     // access to versions_->LastSequence(), so all we have to do here is
     // avoid races (so we don't give the compiler a license to mess up
@@ -157,36 +162,86 @@ inline bool DynamicBloom::MayContainHash(uint32_t h32) const {
   PREFETCH(data_ + a, 0, 3);
   // Expand/remix with 64-bit golden ratio
   uint64_t h = 0x9e3779b97f4a7c13ULL * h32;
+#ifdef HAVE_AVX2
+  // Translate to vector address
+  const __m256i *ptr = reinterpret_cast<const __m256i*>(data_) + (a >> 2);
+  // Like ((~*ptr) & mask) == 0)
+  return _mm256_testc_si256(*ptr, GetMask(h, a & 3));
+#else
   for (unsigned i = 0;; ++i) {
     // Two bit probes per uint64_t probe
-    uint64_t mask = ((uint64_t)1 << (h & 63))
-                  | ((uint64_t)1 << ((h >> 6) & 63));
+    uint64_t mask = ((uint64_t)1 << (h & 31))
+                  | ((uint64_t)1 << 32 << ((h >> 32) & 31));
     uint64_t val = data_[a ^ i].load(std::memory_order_relaxed);
     if (i + 1 >= kNumDoubleProbes) {
       return (val & mask) == mask;
     } else if ((val & mask) != mask) {
       return false;
     }
-    h = (h >> 12) | (h << 52);
+    h = (h >> 5) | (h << 59);
   }
+#endif
 }
 
 template <typename OrFunc>
-inline void DynamicBloom::AddHash(uint32_t h32, const OrFunc& or_func) {
+inline void DynamicBloom::AddHashNoSimd(uint32_t h32, const OrFunc& or_func) {
   size_t a = fastrange32(kLen, h32);
-  PREFETCH(data_ + a, 0, 3);
+  PREFETCH(data_ + a, 1, 3);
   // Expand/remix with 64-bit golden ratio
   uint64_t h = 0x9e3779b97f4a7c13ULL * h32;
   for (unsigned i = 0;; ++i) {
     // Two bit probes per uint64_t probe
-    uint64_t mask = ((uint64_t)1 << (h & 63))
-                  | ((uint64_t)1 << ((h >> 6) & 63));
+    uint64_t mask = ((uint64_t)1 << (h & 31))
+                  | ((uint64_t)1 << 32 << ((h >> 32) & 31));
     or_func(&data_[a ^ i], mask);
     if (i + 1 >= kNumDoubleProbes) {
       return;
     }
-    h = (h >> 12) | (h << 52);
+    h = (h >> 5) | (h << 59);
   }
+}
+
+inline void DynamicBloom::AddHash(uint32_t h32) {
+#ifdef HAVE_AVX2
+  size_t a = fastrange32(kLen, h32);
+  PREFETCH(data_ + a, 1, 3);
+  // Expand/remix with 64-bit golden ratio
+  uint64_t h = 0x9e3779b97f4a7c13ULL * h32;
+  // Translate to vector address
+  __m256i *ptr = reinterpret_cast<__m256i*>(data_) + (a >> 2);
+  // Like *ptr |= mask
+  _mm256_store_si256(ptr, _mm256_or_si256(*ptr, GetMask(h, a & 3)));
+#else
+  AddHashNoSimd(hash, [](std::atomic<uint64_t>* ptr, uint64_t mask) {
+    ptr->store(ptr->load(std::memory_order_relaxed) | mask,
+               std::memory_order_relaxed);
+  });
+#endif
+}
+
+inline __m256i DynamicBloom::GetMask(uint64_t h, uint32_t offset) const {
+  // Extract shift and selector information for selected offset (0 to 3)
+  __m256i hash_shifts =
+      _mm256_srli_epi32(shift_and_selector_matrix_, offset * 8);
+
+  // Make four copies of h (to be split into four each hi and low 32-bits)
+  __m256i hash_data = _mm256_set1_epi64x(h);
+
+  __m256i selectors = _mm256_srli_epi32(hash_shifts, 5);
+
+  const __m256i all_thirty_ones = _mm256_set1_epi32(31);
+  const __m256i all_ones = _mm256_set1_epi32(1);
+
+  hash_shifts = _mm256_and_si256(hash_shifts, all_thirty_ones);
+
+  hash_data = _mm256_srlv_epi32(hash_data, hash_shifts);
+
+  selectors = _mm256_and_si256(selectors, all_ones);
+
+  hash_data = _mm256_and_si256(hash_data, all_thirty_ones);
+
+  // Generate mask by left-shifting the k selected 1s by those hash quantities
+  return _mm256_sllv_epi32(selectors, hash_data);
 }
 
 }  // rocksdb

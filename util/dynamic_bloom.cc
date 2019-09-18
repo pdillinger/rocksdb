@@ -16,6 +16,7 @@ namespace rocksdb {
 
 namespace {
 
+#ifndef HAVE_AVX2
 uint32_t roundUpToPow2(uint32_t x) {
   uint32_t rv = 1;
   while (rv < x) {
@@ -23,7 +24,7 @@ uint32_t roundUpToPow2(uint32_t x) {
   }
   return rv;
 }
-
+#endif
 }
 
 DynamicBloom::DynamicBloom(Allocator* allocator, uint32_t total_bits,
@@ -31,14 +32,22 @@ DynamicBloom::DynamicBloom(Allocator* allocator, uint32_t total_bits,
                            size_t huge_page_tlb_size, Logger* logger)
     // Round down, except round up with 1
     : kNumDoubleProbes((num_probes + (num_probes == 1)) / 2) {
-  assert(num_probes % 2 == 0); // limitation of current implementation
-  assert(num_probes <= 10); // limitation of current implementation
+  assert(num_probes % 2 == 0); // limitation of current implementation(s)
+#ifdef HAVE_AVX2
+  assert(num_probes <= 8); // limitation of current SIMD implementation
+#else
+  assert(num_probes <= 12); // limitation of current non-SIMD implementation
+#endif
   assert(kNumDoubleProbes > 0);
 
+#ifdef HAVE_AVX2
+  uint32_t block_bytes = sizeof(__m256i);
+#else
   // Determine how much to round off + align by so that x ^ i (that's xor) is
   // a valid u64 index if x is a valid u64 index and 0 <= i < kNumDoubleProbes.
   uint32_t block_bytes = /*bytes/u64*/ 8 *
                          /*u64s*/ std::max(1U, roundUpToPow2(kNumDoubleProbes));
+#endif
   uint32_t block_bits = block_bytes * 8;
   uint32_t blocks = (total_bits + block_bits - 1) / block_bits;
   uint32_t sz = blocks * block_bytes;
@@ -66,6 +75,26 @@ DynamicBloom::DynamicBloom(Allocator* allocator, uint32_t total_bits,
   static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t),
                 "Expecting zero-space-overhead atomic");
   data_ = reinterpret_cast<std::atomic<uint64_t>*>(raw);
+
+#ifdef HAVE_AVX2
+  shift_and_selector_matrix_ = _mm256_set1_epi32(0);
+  uint64_t *matrix = reinterpret_cast<uint64_t*>(&shift_and_selector_matrix_);
+  for (unsigned i = 0; i < /* offset upper bound */ 4; ++i) {
+    for (unsigned j = 0; j < kNumDoubleProbes; ++j) {
+      matrix[i ^ j] |= ((32 + j * 5) << (i * 8));
+    }
+  }
+  for (unsigned i = 0; i < /* offset upper bound */ 4; ++i) {
+    matrix[i] |= matrix[i] << 32;
+  }
+#endif
 }
+
+const char * const DynamicBloom::IMPL_NAME =
+#ifdef HAVE_AVX2
+    "Avx2";
+#else
+    "NoSimd";
+#endif
 
 }  // rocksdb
