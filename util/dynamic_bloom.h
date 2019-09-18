@@ -217,25 +217,26 @@ inline void DynamicBloom::AddHash(uint32_t h32) {
   // Like *ptr |= mask
   _mm256_store_si256(ptr, _mm256_or_si256(*ptr, GetMask(h, matrix_[kNumDoubleProbes][a & 3])));
 #else
-  AddHashNoSimd(hash, [](std::atomic<uint64_t>* ptr, uint64_t mask) {
+  AddHashNoSimd(h32, [](std::atomic<uint64_t>* ptr, uint64_t mask) {
     ptr->store(ptr->load(std::memory_order_relaxed) | mask,
                std::memory_order_relaxed);
   });
 #endif
 }
 
+#ifdef HAVE_AVX2
 inline __m256i DynamicBloom::GetMask(uint64_t h, const ShiftsAndSelectors &ss) const {
   // Make four copies of h (to be split into four each hi and low 32-bits)
   __m256i hash_data = _mm256_set1_epi64x(h);
 
-  const __m256i all_thirty_ones = _mm256_set1_epi32(31);
+  hash_data = _mm256_sllv_epi32(hash_data, ss.shifts_);
 
-  hash_data = _mm256_srlv_epi32(hash_data, ss.shifts_);
-
-  hash_data = _mm256_and_si256(hash_data, all_thirty_ones);
+  // Shift away all but top 5 hash bits
+  hash_data = _mm256_srli_epi32(hash_data, 27);
 
   // Generate mask by left-shifting the k selected 1s by those hash quantities
   return _mm256_sllv_epi32(ss.selectors_, hash_data);
 }
+#endif
 
 }  // rocksdb

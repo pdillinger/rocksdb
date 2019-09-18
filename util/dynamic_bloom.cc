@@ -86,7 +86,8 @@ ShiftsAndSelectors::ShiftsAndSelectors(unsigned double_probes, unsigned offset) 
   shifts.fill(0);
   selectors.fill(0);
   for (unsigned i = 0; i < double_probes; ++i) {
-    shifts[offset ^ i] = (static_cast<int64_t>(i * 5) << 32) + i * 5;
+    int shift = 27 - (i * 5);
+    shifts[offset ^ i] = (static_cast<int64_t>(shift) << 32) + shift;
     selectors[offset ^ i] = (static_cast<int64_t>(1) << 32) + 1;
   }
   shifts_ = _mm256_setr_epi64x(shifts[0], shifts[1], shifts[2], shifts[3]);
