@@ -75,20 +75,37 @@ DynamicBloom::DynamicBloom(Allocator* allocator, uint32_t total_bits,
   static_assert(sizeof(std::atomic<uint64_t>) == sizeof(uint64_t),
                 "Expecting zero-space-overhead atomic");
   data_ = reinterpret_cast<std::atomic<uint64_t>*>(raw);
+}
 
 #ifdef HAVE_AVX2
-  shift_and_selector_matrix_ = _mm256_set1_epi32(0);
-  uint64_t *matrix = reinterpret_cast<uint64_t*>(&shift_and_selector_matrix_);
-  for (unsigned i = 0; i < /* offset upper bound */ 4; ++i) {
-    for (unsigned j = 0; j < kNumDoubleProbes; ++j) {
-      matrix[i ^ j] |= ((32 + j * 5) << (i * 8));
-    }
+typedef DynamicBloom::ShiftsAndSelectors ShiftsAndSelectors;
+
+ShiftsAndSelectors::ShiftsAndSelectors(unsigned double_probes, unsigned offset) {
+  std::array<int64_t,4> shifts;
+  std::array<int64_t,4> selectors;
+  shifts.fill(0);
+  selectors.fill(0);
+  for (unsigned i = 0; i < double_probes; ++i) {
+    shifts[offset ^ i] = (static_cast<int64_t>(i * 5) << 32) + i * 5;
+    selectors[offset ^ i] = (static_cast<int64_t>(1) << 32) + 1;
   }
-  for (unsigned i = 0; i < /* offset upper bound */ 4; ++i) {
-    matrix[i] |= matrix[i] << 32;
-  }
-#endif
+  shifts_ = _mm256_setr_epi64x(shifts[0], shifts[1], shifts[2], shifts[3]);
+  selectors_ = _mm256_setr_epi64x(selectors[0], selectors[1], selectors[2], selectors[3]);
 }
+
+ShiftsAndSelectors DynamicBloom::matrix_[5][4] = {
+  { ShiftsAndSelectors(0,0), ShiftsAndSelectors(0,1),
+    ShiftsAndSelectors(0,2), ShiftsAndSelectors(0,3) },
+  { ShiftsAndSelectors(1,0), ShiftsAndSelectors(1,1),
+    ShiftsAndSelectors(1,2), ShiftsAndSelectors(1,3) },
+  { ShiftsAndSelectors(2,0), ShiftsAndSelectors(2,1),
+    ShiftsAndSelectors(2,2), ShiftsAndSelectors(2,3) },
+  { ShiftsAndSelectors(3,0), ShiftsAndSelectors(3,1),
+    ShiftsAndSelectors(3,2), ShiftsAndSelectors(3,3) },
+  { ShiftsAndSelectors(4,0), ShiftsAndSelectors(4,1),
+    ShiftsAndSelectors(4,2), ShiftsAndSelectors(4,3) },
+};
+#endif
 
 const char * const DynamicBloom::IMPL_NAME =
 #ifdef HAVE_AVX2

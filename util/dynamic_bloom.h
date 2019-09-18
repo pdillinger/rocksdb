@@ -79,6 +79,16 @@ class DynamicBloom {
 
   static const char * const IMPL_NAME;
 
+#ifdef HAVE_AVX2
+  struct ShiftsAndSelectors {
+    ShiftsAndSelectors(unsigned double_probes, unsigned offset);
+    __m256i shifts_;
+    __m256i selectors_;
+  };
+  static ShiftsAndSelectors matrix_[5][4];
+  __m256i GetMask(uint64_t h, const ShiftsAndSelectors &ss) const;
+#endif
+
  private:
   // Length of the structure, in 64-bit words. For this structure, "word"
   // will always refer to 64-bit words.
@@ -88,11 +98,6 @@ class DynamicBloom {
   const uint32_t kNumDoubleProbes;
   // Raw filter data
   std::atomic<uint64_t>* data_;
-
-#ifdef HAVE_AVX2
-  __m256i shift_and_selector_matrix_;
-  __m256i GetMask(uint64_t h, uint32_t offset) const;
-#endif
 
   // or_func(ptr, mask) should effect *ptr |= mask with the appropriate
   // concurrency safety, working with bytes.
@@ -166,7 +171,7 @@ inline bool DynamicBloom::MayContainHash(uint32_t h32) const {
   // Translate to vector address
   const __m256i *ptr = reinterpret_cast<const __m256i*>(data_) + (a >> 2);
   // Like ((~*ptr) & mask) == 0)
-  return _mm256_testc_si256(*ptr, GetMask(h, a & 3));
+  return _mm256_testc_si256(*ptr, GetMask(h, matrix_[kNumDoubleProbes][a & 3]));
 #else
   for (unsigned i = 0;; ++i) {
     // Two bit probes per uint64_t probe
@@ -210,7 +215,7 @@ inline void DynamicBloom::AddHash(uint32_t h32) {
   // Translate to vector address
   __m256i *ptr = reinterpret_cast<__m256i*>(data_) + (a >> 2);
   // Like *ptr |= mask
-  _mm256_store_si256(ptr, _mm256_or_si256(*ptr, GetMask(h, a & 3)));
+  _mm256_store_si256(ptr, _mm256_or_si256(*ptr, GetMask(h, matrix_[kNumDoubleProbes][a & 3])));
 #else
   AddHashNoSimd(hash, [](std::atomic<uint64_t>* ptr, uint64_t mask) {
     ptr->store(ptr->load(std::memory_order_relaxed) | mask,
@@ -219,29 +224,18 @@ inline void DynamicBloom::AddHash(uint32_t h32) {
 #endif
 }
 
-inline __m256i DynamicBloom::GetMask(uint64_t h, uint32_t offset) const {
-  // Extract shift and selector information for selected offset (0 to 3)
-  __m256i hash_shifts =
-      _mm256_srli_epi32(shift_and_selector_matrix_, offset * 8);
-
+inline __m256i DynamicBloom::GetMask(uint64_t h, const ShiftsAndSelectors &ss) const {
   // Make four copies of h (to be split into four each hi and low 32-bits)
   __m256i hash_data = _mm256_set1_epi64x(h);
 
-  __m256i selectors = _mm256_srli_epi32(hash_shifts, 5);
-
   const __m256i all_thirty_ones = _mm256_set1_epi32(31);
-  const __m256i all_ones = _mm256_set1_epi32(1);
 
-  hash_shifts = _mm256_and_si256(hash_shifts, all_thirty_ones);
-
-  hash_data = _mm256_srlv_epi32(hash_data, hash_shifts);
-
-  selectors = _mm256_and_si256(selectors, all_ones);
+  hash_data = _mm256_srlv_epi32(hash_data, ss.shifts_);
 
   hash_data = _mm256_and_si256(hash_data, all_thirty_ones);
 
   // Generate mask by left-shifting the k selected 1s by those hash quantities
-  return _mm256_sllv_epi32(selectors, hash_data);
+  return _mm256_sllv_epi32(ss.selectors_, hash_data);
 }
 
 }  // rocksdb
