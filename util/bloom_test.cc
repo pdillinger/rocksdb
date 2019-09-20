@@ -302,6 +302,17 @@ class FullBloomTest : public testing::Test {
     return bits_reader_->MayMatch(s);
   }
 
+  uint64_t PackedMatches() {
+    char buffer[sizeof(int)];
+    uint64_t result = 0;
+    for (int i = 0; i < 64; i++) {
+      if (Matches(Key(i + 12345, buffer))) {
+        result |= 1 << i;
+      }
+    }
+    return result;
+  }
+
   double FalsePositiveRate() {
     char buffer[sizeof(int)];
     int result = 0;
@@ -462,26 +473,56 @@ TEST_F(FullBloomTest, Schema) {
   ResetPolicy();
 }
 
-struct CorruptFilterTester {
+struct RawFilterTester {
   std::array<char, 3000> data_;
   Slice cur_slice_;
   char* metadata_ptr_;
 
-  CorruptFilterTester() : metadata_ptr_(&data_.back() - 4) {}
+  RawFilterTester() : metadata_ptr_(&data_.back() - 4) {}
 
-  Slice& Reset(uint32_t len_without_metadata, uint32_t num_lines,
-               uint32_t num_probes, bool fill_ones) {
-    data_.fill(fill_ones ? 0xff : 0);
+
+  Slice& ResetNoFill(uint32_t len_without_metadata, uint32_t num_lines,
+               uint32_t num_probes) {
     metadata_ptr_[0] = static_cast<char>(num_probes);
     EncodeFixed32(metadata_ptr_ + 1, num_lines);
     cur_slice_ = Slice(metadata_ptr_ - len_without_metadata,
                        len_without_metadata + /*metadata*/ 5);
     return cur_slice_;
   }
+
+  Slice& Reset(uint32_t len_without_metadata, uint32_t num_lines,
+               uint32_t num_probes, bool fill_ones) {
+    data_.fill(fill_ones ? 0xff : 0);
+    return ResetNoFill(len_without_metadata, num_lines, num_probes);
+  }
+
+  Slice& ResetWeirdFill(uint32_t len_without_metadata, uint32_t num_lines,
+                        uint32_t num_probes) {
+    for (uint32_t i = 0; i < data_.size(); ++i) {
+      data_[i] = static_cast<char>(0x7b7b >> (i % 7));
+    }
+    return ResetNoFill(len_without_metadata, num_lines, num_probes);
+  }
 };
 
+TEST_F(FullBloomTest, RawSchema) {
+  RawFilterTester cft;
+  // Two probes, about 3/4 bits set: ~50% "FP" rate
+  // One 256-byte cache line.
+  OpenRaw(cft.ResetWeirdFill(256, 1, 2));
+  ASSERT_EQ(PackedMatches(), 18446744073675927543ULL);
+
+  // Two 128-byte cache lines.
+  OpenRaw(cft.ResetWeirdFill(256, 2, 2));
+  ASSERT_EQ(PackedMatches(), 18446744073407559151ULL);
+
+  // Four 64-byte cache lines.
+  OpenRaw(cft.ResetWeirdFill(256, 4, 2));
+  ASSERT_EQ(PackedMatches(), 18446744073441107966ULL);
+}
+
 TEST_F(FullBloomTest, CorruptFilters) {
-  CorruptFilterTester cft;
+  RawFilterTester cft;
 
   for (bool fill : {false, true}) {
     // Good filter bits - returns same as fill
