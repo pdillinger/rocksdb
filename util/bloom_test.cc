@@ -533,6 +533,12 @@ TEST_F(FullBloomTest, CorruptFilters) {
     ASSERT_FALSE(Matches("world"));
 
     // Bad filter bits - returns true for safety
+    // No solution to 0 * x == CACHE_LINE_SIZE
+    OpenRaw(cft.Reset(CACHE_LINE_SIZE, 0, 6, fill));
+    ASSERT_TRUE(Matches("hello"));
+    ASSERT_TRUE(Matches("world"));
+
+    // Bad filter bits - returns true for safety
     // Can't have 3 * x == 4 for integer x
     OpenRaw(cft.Reset(4, 3, 6, fill));
     ASSERT_TRUE(Matches("hello"));
