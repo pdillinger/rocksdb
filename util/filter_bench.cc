@@ -33,7 +33,7 @@ using GFLAGS_NAMESPACE::SetUsageMessage;
 
 DEFINE_int64(seed, 0, "Seed for random number generators");
 
-DEFINE_uint32(working_mem_size_mb, 200,
+DEFINE_double(working_mem_size_mb, 200,
               "MB of memory to get up to among all filters");
 
 DEFINE_uint32(average_keys_per_filter, 10000,
@@ -179,6 +179,8 @@ void FilterBench::Go() {
   size_t totalMemoryUsed = 0;
   size_t totalKeysAdded = 0;
 
+  rocksdb::StopWatchNano timer(rocksdb::Env::Default(), true);
+
   while (totalMemoryUsed < 1024 * 1024 * FLAGS_working_mem_size_mb) {
     uint32_t filterId = random();
     uint32_t keysToAdd = FLAGS_average_keys_per_filter +
@@ -196,6 +198,9 @@ void FilterBench::Go() {
     totalKeysAdded += keysToAdd;
   }
 
+  uint64_t elapsedNanos = timer.ElapsedNanos();
+  double ns = (double)elapsedNanos / totalKeysAdded;
+  std::cout << "Build avg ns/key: " << ns << std::endl;
   std::cout << "Number of filters: " << infos.size() << std::endl;
   std::cout << "Total memory (MB): " << totalMemoryUsed / 1024.0 / 1024.0
             << std::endl;
