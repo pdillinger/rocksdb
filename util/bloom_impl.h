@@ -14,6 +14,10 @@
 #include "rocksdb/slice.h"
 #include "util/hash.h"
 
+#ifdef HAVE_AVX2
+#include <immintrin.h>
+#endif
+
 namespace rocksdb {
 
 // A legacy Bloom filter implementation with no locality of probes (slow).
@@ -196,4 +200,108 @@ public:
     }
   }
 };
+
+class FastLocalBloomImpl {
+public:
+  static inline void AddHash(uint32_t h, uint32_t len_bytes,
+                             int num_probes, char *data) {
+    uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h) << 6;
+    uint8_t *data_at_cache_line = reinterpret_cast<uint8_t*>(data + bytes_to_cache_line);
+    PREFETCH(data_at_cache_line, 1 /* rw */, 1 /* locality */);
+    for (int i = 0; i < num_probes; ++i) {
+      h *= 0x9e3779b9UL;
+      int bitpos = h >> (32 - 9);
+      data_at_cache_line[bitpos >> 3] |= (uint8_t(1) << (bitpos & 7));
+    }
+  }
+
+  static inline void PrepareHashMayMatch(uint32_t h, uint32_t len_bytes,
+                                         const char *data,
+                                         uint32_t /*out*/*byte_offset) {
+    uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h) << 6;
+    PREFETCH(data + bytes_to_cache_line, 1 /* rw */, 1 /* locality */);
+    *byte_offset = bytes_to_cache_line;
+  }
+
+  static inline bool HashMayMatch(uint32_t h, uint32_t len_bytes,
+                                  int num_probes, const char *data) {
+    uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h) << 6;
+    return HashMayMatchPrepared(h, len_bytes, num_probes,
+                                data, bytes_to_cache_line);
+  }
+
+  static inline bool HashMayMatchPrepared(uint32_t h, uint32_t len_bytes,
+                                          int num_probes, const char *data,
+                                          uint32_t bytes_to_cache_line) {
+    (void)len_bytes; // ignored
+    const uint8_t *data_at_cache_line = reinterpret_cast<const uint8_t*>(data + bytes_to_cache_line);
+#ifdef HAVE_AVX2
+    for (;;) {
+      // Eight copies of hash
+      __m256i v = _mm256_set1_epi32(h);
+
+      // Powers of 32-bit golden ratio, mod 2**32
+      const __m256i multipliers =
+          _mm256_setr_epi32(0x9e3779b9,
+                            0xe35e67b1,
+                            0x734297e9,
+                            0x35fbe861,
+                            0xdeb7c719,
+                            0x448b211,
+                            0x3459b749,
+                            0xab25f4c1);
+
+      v = _mm256_mullo_epi32(v, multipliers);
+
+      __m256i x = _mm256_srli_epi32(v, 28);
+
+      // Option 1 (Requires AVX512 - unverified)
+      //__m256i lower = reinterpret_cast<__m256i*>(table + a)[0];
+      //__m256i upper = reinterpret_cast<__m256i*>(table + a)[1];
+      //x = _mm256_permutex2var_epi32(lower, x, upper);
+      // END Option 1
+      // Option 2
+      //x = _mm256_i32gather_epi32((const int *)(table + a), x, /*bytes / i32*/4);
+      // END Option 2
+      // Option 3
+      __m256i lower = reinterpret_cast<const __m256i*>(data_at_cache_line)[0];
+      __m256i upper = reinterpret_cast<const __m256i*>(data_at_cache_line)[1];
+      lower = _mm256_permutevar8x32_epi32(lower, x);
+      upper = _mm256_permutevar8x32_epi32(upper, x);
+      __m256i junk = _mm256_srai_epi32(v, 31);
+      x = _mm256_blendv_epi8(lower, upper, junk);
+      // END Option 3
+
+      __m256i k_selector = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+      k_selector = _mm256_sub_epi32(k_selector, _mm256_set1_epi32(num_probes));
+      // Keep only high bit; negative after subtract -> use/select
+      k_selector = _mm256_srli_epi32(k_selector, 31);
+
+      v = _mm256_slli_epi32(v, 4);
+      v = _mm256_srli_epi32(v, 27);
+      v = _mm256_sllv_epi32(k_selector, v);
+      if (num_probes <= 8) {
+        // Like ((~val) & mask) == 0)
+        return _mm256_testc_si256(x, v);
+      } else if (!_mm256_testc_si256(x, v)) {
+        return false;
+      } else {
+        // Need another iteration
+        h *= 0xab25f4c1;
+        num_probes -= 8;
+      }
+    }
+#else
+    for (int i = 0; i < num_probes; ++i) {
+      h *= 0x9e3779b9UL;
+      int bitpos = h >> (32 - 9);
+      if ((data_at_cache_line[bitpos >> 3] & (uint8_t(1) << (bitpos & 7))) == 0) {
+        return false;
+      }
+    }
+    return true;
+#endif
+  }
+};
+
 }  // namespace rocksdb
