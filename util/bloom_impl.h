@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #include "rocksdb/slice.h"
+#include "util/hash.h"
 
 namespace rocksdb {
 
@@ -137,4 +138,62 @@ public:
   }
 };
 
+class SemiLocalBloomImpl {
+public:
+  static inline void AddHash(uint32_t h32, uint32_t len_bytes,
+                             int num_probes, char *data) {
+    uint32_t a = fastrange32(len_bytes, h32);
+    uint64_t h = h32;
+    for (int i = 0;;) {
+      h *= 0x9e3779b97f4a7c13ULL;
+      for (int j = 0; j < 7; ++j) {
+        data[a] |= (1 << (h & 7));
+        ++i;
+        if (i >= num_probes) {
+          return;
+        }
+        a += ((h >> 3) & 63);
+        if (a >= len_bytes) { a -= len_bytes; }
+        h = (h >> 9) | (h << 55);
+      }
+    }
+  }
+
+  static inline void PrepareHashMayMatch(uint32_t h32, uint32_t len_bytes,
+                                         const char *data,
+                                         uint32_t /*out*/*byte_offset) {
+    uint32_t a = fastrange32(len_bytes, h32);
+    PREFETCH(data + a, 0 /* rw */, 1 /* locality */);
+    *byte_offset = a;
+  }
+
+  static inline bool HashMayMatch(uint32_t h32, uint32_t len_bytes,
+                                  int num_probes, const char *data) {
+    uint32_t a = fastrange32(len_bytes, h32);
+    return HashMayMatchPrepared(h32, len_bytes, num_probes,
+                                data, a);
+  }
+
+  static inline bool HashMayMatchPrepared(uint32_t h32, uint32_t len_bytes,
+                                          int num_probes, const char *data,
+                                          uint32_t byte_offset) {
+    uint32_t a = byte_offset;
+    uint64_t h = h32;
+    for (int i = 0;;) {
+      h *= 0x9e3779b97f4a7c13ULL;
+      for (int j = 0; j < 7; ++j) {
+        if ((data[a] & (1 << (h & 7))) == 0) {
+          return false;
+        }
+        ++i;
+        if (i >= num_probes) {
+          return true;
+        }
+        a += ((h >> 3) & 63);
+        if (a >= len_bytes) { a -= len_bytes; }
+        h = (h >> 9) | (h << 55);
+      }
+    }
+  }
+};
 }  // namespace rocksdb
