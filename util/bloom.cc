@@ -325,18 +325,7 @@ class MaxCacheFilterBitsBuilder : public FilterBitsBuilder {
 
   void BuildBloomCacheLine(char *data_at_cache_line, std::vector<uint32_t>::iterator begin, std::vector<uint32_t>::iterator end) {
     for (auto it = begin; it != end; ++it) {
-      uint32_t hash = *it;
-      int bit = hash & 255;
-      data_at_cache_line[bit >> 3] |= (1 << (bit & 7));
-      hash >>= 8;
-      bit = hash & 255;
-      data_at_cache_line[bit >> 3] |= (1 << (bit & 7));
-      hash >>= 8;
-      bit = hash & 255;
-      data_at_cache_line[32 + (bit >> 3)] |= (1 << (bit & 7));
-      hash >>= 8;
-      bit = hash & 255;
-      data_at_cache_line[32 + (bit >> 3)] |= (1 << (bit & 7));
+      FastLocalBloomImpl::AddHashPrepared(*it, /*num_probes*/4, data_at_cache_line);
     }
     for (int i = 0; i < 64; ++i) {
       if (data_at_cache_line[i] == 0) {
@@ -387,24 +376,7 @@ class MaxCacheFilterBitsReader : public FilterBitsReader {
       return false;
     } else {
       //fprintf(stderr, "Checking bloom for %x\n", hash);
-      // Use k=4 Bloom, two probes in lower 256 bits, two in upper
-      int bit = hash & 255;
-      if ((data_at_cache_line[bit >> 3] & (1 << (bit & 7))) == 0) {
-        return false;
-      }
-      hash >>= 8;
-      bit = hash & 255;
-      if ((data_at_cache_line[bit >> 3] & (1 << (bit & 7))) == 0) {
-        return false;
-      }
-      hash >>= 8;
-      bit = hash & 255;
-      if ((data_at_cache_line[32 + (bit >> 3)] & (1 << (bit & 7))) == 0) {
-        return false;
-      }
-      hash >>= 8;
-      bit = hash & 255;
-      return (data_at_cache_line[32 + (bit >> 3)] & (1 << (bit & 7))) != 0;
+      return FastLocalBloomImpl::HashMayMatchPrepared(hash, /*num_probes*/4, reinterpret_cast<const char *>(data_at_cache_line));
     }
   }
 
@@ -612,7 +584,7 @@ class FastLocalFilterBitsReader : public FilterBitsReader {
     FastLocalBloomImpl::PrepareHashMayMatch(
         hash, len_bytes_, data_, /*out*/ &byte_offset);
     return FastLocalBloomImpl::HashMayMatchPrepared(
-        hash, len_bytes_, num_probes_, data_, byte_offset);
+        hash, num_probes_, data_ + byte_offset);
   }
 
   virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
@@ -624,8 +596,8 @@ class FastLocalFilterBitsReader : public FilterBitsReader {
                                               /*out*/ &byte_offsets[i]);
     }
     for (int i = 0; i < num_keys; ++i) {
-      may_match[i] = FastLocalBloomImpl::HashMayMatchPrepared(hashes[i], len_bytes_, num_probes_,
-                                                      data_, byte_offsets[i]);
+      may_match[i] = FastLocalBloomImpl::HashMayMatchPrepared(hashes[i], num_probes_,
+                                                      data_ + byte_offsets[i]);
     }
   }
 
@@ -804,10 +776,10 @@ class BloomFilterPolicy : public FilterPolicy {
         char raw_locality_val = contents.data()[len_with_meta - 4];
         raw_num_probes = contents.data()[len_with_meta - 3];
         uint32_t len = len_with_meta - 5;
-        if (raw_locality_val == 1 && raw_num_probes > 0 && raw_num_probes <= 16) {
+        if (raw_locality_val == 1 && raw_num_probes > 0 && raw_num_probes <= 30) {
           return new SemiLocalFilterBitsReader(contents.data(), raw_num_probes, len);
         }
-        if (raw_locality_val == 2 && raw_num_probes > 0 && raw_num_probes <= 16) {
+        if (raw_locality_val == 2 && raw_num_probes > 0 && raw_num_probes <= 30) {
           return new FastLocalFilterBitsReader(contents.data(), raw_num_probes, len);
         }
       } else if (raw_num_probes == -2) {

@@ -206,8 +206,13 @@ public:
   static inline void AddHash(uint32_t h, uint32_t len_bytes,
                              int num_probes, char *data) {
     uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h) << 6;
-    uint8_t *data_at_cache_line = reinterpret_cast<uint8_t*>(data + bytes_to_cache_line);
+    char *data_at_cache_line = data + bytes_to_cache_line;
     PREFETCH(data_at_cache_line, 1 /* rw */, 1 /* locality */);
+    AddHashPrepared(h, num_probes, data_at_cache_line);
+  }
+
+  static inline void AddHashPrepared(uint32_t h, int num_probes,
+                                     char *data_at_cache_line) {
     for (int i = 0; i < num_probes; ++i) {
       h *= 0x9e3779b9UL;
       int bitpos = h >> (32 - 9);
@@ -226,15 +231,11 @@ public:
   static inline bool HashMayMatch(uint32_t h, uint32_t len_bytes,
                                   int num_probes, const char *data) {
     uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h) << 6;
-    return HashMayMatchPrepared(h, len_bytes, num_probes,
-                                data, bytes_to_cache_line);
+    return HashMayMatchPrepared(h, num_probes, data + bytes_to_cache_line);
   }
 
-  static inline bool HashMayMatchPrepared(uint32_t h, uint32_t len_bytes,
-                                          int num_probes, const char *data,
-                                          uint32_t bytes_to_cache_line) {
-    (void)len_bytes; // ignored
-    const uint8_t *data_at_cache_line = reinterpret_cast<const uint8_t*>(data + bytes_to_cache_line);
+  static inline bool HashMayMatchPrepared(uint32_t h, int num_probes,
+                                          const char *data_at_cache_line) {
 #ifdef HAVE_AVX2
     for (;;) {
       // Eight copies of hash
@@ -295,7 +296,7 @@ public:
     for (int i = 0; i < num_probes; ++i) {
       h *= 0x9e3779b9UL;
       int bitpos = h >> (32 - 9);
-      if ((data_at_cache_line[bitpos >> 3] & (uint8_t(1) << (bitpos & 7))) == 0) {
+      if ((data_at_cache_line[bitpos >> 3] & (char(1) << (bitpos & 7))) == 0) {
         return false;
       }
     }
