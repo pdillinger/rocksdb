@@ -73,7 +73,7 @@ struct KeyMaker {
     assert(size >= 8);
     memset(data_.get(), 0, size);
   }
-  std::unique_ptr<char> data_;
+  std::unique_ptr<char[]> data_;
   Slice slice_;
   uint32_t *vals_;
 

@@ -326,6 +326,7 @@ class FullBloomTest : public testing::Test {
 };
 
 TEST_F(FullBloomTest, FilterSize) {
+  ASSERT_TRUE(getenv("ROCKSDB_CUSTOM_FILTER_IMPL") == nullptr);
   uint32_t dont_care1, dont_care2;
   auto full_bits_builder = GetFullFilterBitsBuilder();
   for (int n = 1; n < 100; n++) {
