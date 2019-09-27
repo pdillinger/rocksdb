@@ -7,8 +7,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include "port/port.h"
 #include "rocksdb/filter_policy.h"
-
 #include "rocksdb/slice.h"
 #include "table/block_based/block_based_filter_block.h"
 #include "table/block_based/full_filter_block.h"
@@ -17,6 +17,13 @@
 #include "util/bloom_impl.h"
 #include "util/coding.h"
 #include "util/hash.h"
+
+#ifdef HAVE_POPCNT
+#include <x86intrin.h>
+#endif
+#if defined(HAVE_AVX2) || defined(HAVE_BMI2)
+#include <immintrin.h>
+#endif
 
 namespace rocksdb {
 
@@ -203,6 +210,7 @@ class MaxCacheFilterBitsBuilder : public FilterBitsBuilder {
     }
 
     data[len] = static_cast<char>(-2);
+    data[len+1] = static_cast<char>(1);
 
     const char* const_data = data;
     buf->reset(const_data);
@@ -378,6 +386,440 @@ class MaxCacheFilterBitsReader : public FilterBitsReader {
       //fprintf(stderr, "Checking bloom for %x\n", hash);
       return FastLocalBloomImpl::HashMayMatchPrepared(hash, /*num_probes*/4, reinterpret_cast<const char *>(data_at_cache_line));
     }
+  }
+
+  using FilterBitsReader::MayMatch; // inherit overload
+
+/*
+  virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
+    uint32_t hashes[MultiGetContext::MAX_BATCH_SIZE];
+    uint32_t byte_offsets[MultiGetContext::MAX_BATCH_SIZE];
+    for (int i = 0; i < num_keys; ++i) {
+      hashes[i] = BloomHash(*keys[i]);
+      SemiLocalBloomImpl::PrepareHashMayMatch(hashes[i], len_bytes_, data_,
+                                              &byte_offsets[i]);
+    }
+    for (int i = 0; i < num_keys; ++i) {
+      may_match[i] = SemiLocalBloomImpl::HashMayMatchPrepared(hashes[i], len_bytes_, num_probes_,
+                                                      data_, byte_offsets[i]);
+    }
+  }
+*/
+ private:
+  const char* data_;
+  const uint32_t num_cache_lines_;
+};
+
+inline void bit_table_set_bit(char *data, uint32_t bit_offset) {
+  data[bit_offset >> 3] |= char(1) << (bit_offset & 7);
+}
+
+inline bool bit_table_get_bit(const char *data, uint32_t bit_offset) {
+  return (data[bit_offset >> 3] >> (bit_offset & 7)) & 1;
+}
+
+// Might access 5 bytes from starting address
+uint32_t bit_table_get(const char *data, uint32_t bit_offset, uint32_t mask) {
+  //fprintf(stderr, "--> Getting val at offset %d\n", bit_offset);
+  data += bit_offset >> 3;
+  bit_offset &= 7;
+  const uint8_t *udata = reinterpret_cast<const uint8_t*>(data);
+  //fprintf(stderr, "--> Bytes: %02x%02x%02x%02x%02x\n", udata[4], udata[3], udata[2], udata[1], udata[0]);
+  uint64_t rv = static_cast<uint64_t>(udata[0]) + (static_cast<uint64_t>(udata[1]) << 8) + (static_cast<uint64_t>(udata[2]) << 16) + (static_cast<uint64_t>(udata[3]) << 24) + (static_cast<uint64_t>(udata[4]) << 32);
+  //fprintf(stderr, "--> Raw:   %010lx\n", rv);
+  return static_cast<uint32_t>(rv >> bit_offset) & mask;
+}
+
+// Might access 5 bytes from starting address, or extra aligned 32 bits
+void bit_table_or_put(char *data, uint32_t bit_offset, uint32_t val) {
+  //fprintf(stderr, "--> Putting val %x at offset %d\n", val, bit_offset);
+#ifdef HAVE_SSE42 // XXX: stand-in for endianness
+  uint32_t *data32 = reinterpret_cast<uint32_t*>(data);
+  assert((bit_offset >> 5) < 15); // make sure we don't write beyond cache line
+  data32 += bit_offset >> 5;
+  bit_offset &= 31;
+  data32[0] |= val << bit_offset;
+  data32[1] |= val >> 1 >> (31 - bit_offset);
+#else
+  data += bit_offset >> 3;
+  bit_offset &= 7;
+  uint8_t *udata = reinterpret_cast<uint8_t*>(data);
+  //fprintf(stderr, "--> Before: %02x%02x%02x%02x%02x\n", udata[4], udata[3], udata[2], udata[1], udata[0]);
+  udata[0] |= static_cast<uint8_t>(val << bit_offset);
+  udata[1] |= static_cast<uint8_t>(val >> (8 - bit_offset));
+  udata[2] |= static_cast<uint8_t>(val >> (16 - bit_offset));
+  udata[3] |= static_cast<uint8_t>(val >> (24 - bit_offset));
+  udata[4] |= static_cast<uint8_t>(uint64_t(val) >> (32 - bit_offset));
+  //fprintf(stderr, "--> After:  %02x%02x%02x%02x%02x\n", udata[4], udata[3], udata[2], udata[1], udata[0]);
+#endif
+}
+
+inline uint32_t popcnt_char(char v) {
+  uint32_t a = v & 0x55U;
+  uint32_t b = a + ((v & 0xaaU) >> 1);
+  a = b & 0x33;
+  b = a + ((b & 0xcc) >> 2);
+  a = b & 0xf;
+  b = a + ((b & 0xf0) >> 4);
+  return b;
+}
+
+inline uint32_t backward_nbits_popcnt(const char *data, uint32_t nbits) {
+  uint32_t rv = 0;
+#ifdef HAVE_POPCNT
+  while (nbits > 0) {
+    uint64_t tmp;
+    data -= sizeof(tmp);
+    memcpy(&tmp, data, sizeof(tmp));
+    if (nbits < 64) {
+      tmp >>= (64 - nbits);
+      rv += _popcnt64(tmp);
+      nbits = 0;
+      break;
+    }
+    rv += _popcnt64(tmp);
+    nbits -= 64;
+  }
+#else
+  while (nbits >= 8) {
+    rv += popcnt_char(*(--data));
+    nbits -= 8;
+  }
+  if (nbits > 0) {
+    rv += popcnt_char(static_cast<char>(static_cast<uint8_t>(*(--data)) >> (8 - nbits)));
+  }
+#endif
+  return rv;
+}
+
+// Returns 1-based index, or zero if n = 0.
+inline uint32_t nth_set_bit_index1(const char *data, uint32_t n) {
+#if defined(HAVE_POPCNT) && defined(HAVE_BMI2)
+  assert(n < 128);
+  const uint64_t *data64 = reinterpret_cast<const uint64_t*>(data);
+  if (n == 0) {
+    return 0;
+  }
+  uint32_t rv = 1; // 1-based return
+  if (n > 64) {
+    n -= _popcnt64(*data64);
+    ++data64;
+    rv += 64;
+  }
+  for (;;) {
+    assert(n <= 64);
+    assert(n > 0);
+    uint64_t val = _pdep_u64(uint64_t(1) << (n - 1), *data64);
+    if (val != 0) {
+      rv += _tzcnt_u64(val);
+      return rv;
+    }
+    // else not in that uint64
+    n -= _popcnt64(*data64);
+    ++data64;
+    rv += 64;
+  }
+#else
+  uint32_t count = 0;
+  uint32_t i = 0;
+  while (count < n) {
+    count += bit_table_get_bit(data, i);
+    ++i;
+  }
+  return i;
+#endif
+}
+
+// Each cache line:
+// Last byte is metadata / marker:
+//  If any of top two bits are non-zero, k=4 Bloom
+//  Else, bottom 6 bits configure quotient filter for that many additions + 16,
+//    So something in the range 16 to 79 (inclusive)
+//
+// That leaves bottom 504 bits for actual data. So based on metadata, finds
+// largest val_bits for which count * (val_bits + 2) - 1 <= 504. Note that
+// we only need count - 1 "change" bits. This ensures we have at least
+// `count` "mapped" bits, but thanks to fastrange, we can use as many bits
+// are remaining for mapped bits, i.e. 504 - (count - 1) - count * val_bits,
+// which should be in the magic zone 1-2x count for number of mapped bits.
+// (Section 9.5.3.1 of http://peterd.org/pcd-diss.pdf)
+//
+// Since processing the "change" bits is trickier, let's put them at the
+// beginning for alignment, and "mapped" bits immediately before metadata byte,
+// in reverse order, for at least byte alignment on the end. Vals float in the
+// middle.
+//
+class MaxCache2FilterBitsBuilder : public FilterBitsBuilder {
+ public:
+  MaxCache2FilterBitsBuilder(const int bits_per_key)
+      : bits_per_key_(bits_per_key) {
+    assert(bits_per_key_);
+  }
+
+  // No Copy allowed
+  MaxCache2FilterBitsBuilder(const MaxCacheFilterBitsBuilder&) = delete;
+  void operator=(const MaxCacheFilterBitsBuilder&) = delete;
+
+  ~MaxCache2FilterBitsBuilder() {}
+
+  virtual void AddKey(const Slice& key) override {
+    uint32_t hash = BloomHash(key);
+    if (hash_entries_.size() == 0 || hash != hash_entries_.back()) {
+      hash_entries_.push_back(hash);
+    }
+  }
+
+  virtual Slice Finish(std::unique_ptr<const char[]>* buf) override {
+    uint32_t num_cache_lines = 0;
+    if (bits_per_key_ > 0 && hash_entries_.size() > 0) {
+      num_cache_lines = static_cast<uint32_t>((uint64_t(1) * hash_entries_.size() * bits_per_key_ + 511 /*XXX + hash_entries_.size() / 2*/) / 512);
+    }
+    uint32_t len = num_cache_lines * 64;
+    uint32_t len_with_metadata = len + 5;
+    char* data = new char[len_with_metadata];
+    memset(data, 0, len_with_metadata);
+    assert(data);
+
+    //fprintf(stderr, "-> Building with %d cache lines\n", num_cache_lines);
+    if (len > 0) {
+      // Too slow:
+      //std::sort(hash_entries_.begin(), hash_entries_.end());
+
+      // Partition into buckets with temporary allocation
+      // (Fast enough for now; could save temp space with counting sort)
+      std::unique_ptr<std::vector<uint32_t>[]> buckets(new std::vector<uint32_t>[num_cache_lines]);
+      for (size_t i = 0; i < hash_entries_.size(); ++i) {
+        uint32_t cache_line = fastrange32(num_cache_lines, hash_entries_[i]);
+        //fprintf(stderr, "Preparing hash %x on cache line %d\n", hash_entries_[i], cache_line);
+        buckets[cache_line].push_back(hash_entries_[i] * 0x9e3779b9);
+      }
+      for (uint32_t i = 0; i < num_cache_lines; ++i) {
+        BuildCacheLine(data + (i << 6), buckets[i].begin(), buckets[i].end());
+      }
+      // Alternative
+      // Partition into buckets with counting
+      /*
+      std::unique_ptr<uint32_t[]> index_by_bucket(new uint32[num_cache_lines+1]);
+      for (uint32_t i = 0; i < num_cache_lines + 1; ++i) {
+        index_by_bucket[i] = 0;
+      }
+      // First store counts in index_by_bucket
+      for (size_t i = 0; i < hash_entries_.size(); ++i) {
+        uint32_t cache_line = fastrange32(num_cache_lines, hash_entries_[i]);
+        //fprintf(stderr, "Preparing hash %x on cache line %d\n", hash_entries_[i], cache_line);
+        index_by_bucket[cache_line + 1]++;
+      }
+      // Change to indexes with summation
+      for (uint32_t i = 2; i < num_cache_lines + 1; ++i) {
+        index_by_bucket[i] += index_by_bucket[i - 1];
+      }
+      ...
+      */
+      // END Alternative
+    }
+
+    data[len] = static_cast<char>(-2);
+    data[len+1] = static_cast<char>(2);
+
+    const char* const_data = data;
+    buf->reset(const_data);
+    hash_entries_.clear();
+
+    return Slice(data, len_with_metadata);
+  }
+
+  int CalculateNumEntry(const uint32_t bytes) {
+    return static_cast<int>(uint64_t(8) * bytes / bits_per_key_);
+  }
+
+ private:
+  int bits_per_key_;
+  int num_probes_;
+  std::vector<uint32_t> hash_entries_;
+  std::array<std::array<uint32_t, 79>, 140> val_bucket_;
+  std::array<uint32_t, 140> val_bucket_idx_;
+
+  void BuildCacheLine(char *data_at_cache_line, std::vector<uint32_t>::iterator begin, std::vector<uint32_t>::iterator end) {
+    uint32_t count = static_cast<uint32_t>(end - begin);
+
+    // This also means min entry size is 6
+    if (count > 79) {
+      BuildBloomCacheLine(data_at_cache_line, begin, end);
+      return;
+    }
+    // For configuration, pretend we have at least 16 items. First, it's
+    // accurate enough for practical purposes and it allows us to encode 16-79
+    // using 6 bits.
+    count = std::max(count, 16U);
+    uint32_t base_bits = 505U / count;
+    assert(base_bits >= 6);
+    assert(base_bits <= 31);
+    uint32_t val_bits = base_bits - 2;
+    uint32_t val_mask = (uint32_t(1) << val_bits) - 1;
+    uint32_t mapped_bits = 505 - (count * (base_bits - 1));
+    assert(mapped_bits >= count);
+    assert(mapped_bits <= count * 2);
+    //fprintf(stderr, "Building quotient with count %d, %d base bits, %d mapped_bits\n", count, base_bits, mapped_bits);
+
+    // Set metadata bit
+    data_at_cache_line[63] = count - 16;
+
+#if 1
+    // Reset val buffer
+    val_bucket_idx_.fill(0);
+
+    for (auto it = begin; it != end; ++it) {
+      uint32_t h = *it;
+      uint32_t addr = fastrange32(mapped_bits, h);
+      uint32_t val = h & val_mask;
+      //fprintf(stderr, "-> Val %x @ %d (%x)\n", val, addr, h);
+      val_bucket_[addr][val_bucket_idx_[addr]++] = val;
+      bit_table_set_bit(data_at_cache_line, 503 - addr);
+    }
+
+    uint32_t cur = 0;
+    for (uint32_t i = 0; i < mapped_bits; ++i) {
+      const uint32_t num_j = val_bucket_idx_[i];
+      if (num_j == 0) {
+        continue;
+      }
+      if (cur > 0) {
+        assert(cur < count);
+        bit_table_set_bit(data_at_cache_line, cur - 1);
+      }
+      for (uint32_t j = 0; j < num_j; ++j) {
+        assert(cur < count);
+        uint32_t val = val_bucket_[i][j];
+        bit_table_or_put(data_at_cache_line, count - 1 + (cur * val_bits), val);
+        //fprintf(stderr, "-> Re-read val %x\n", bit_table_get(data_at_cache_line, mapped_bits + (val_bits * i), val_mask));
+        assert(val == bit_table_get(data_at_cache_line, count - 1 + (cur * val_bits), val_mask));
+        ++cur;
+      }
+    }
+    assert(cur == count);
+
+#else
+    // We have to add in order, mostly
+    std::sort(begin, end);
+
+    /*
+    uint64_t val_buffer = 0;
+    uint32_t val_buffer_within_offset = mapped_bits & 31;
+    uint32_t val_buffer_to_offset = mapped_bits >> 5;
+    */
+
+    uint32_t last_addr = 999;
+    uint32_t i = 0;
+    for (auto it = begin; it != end; ++it, ++i) {
+      uint32_t h = *it;
+      uint32_t addr = fastrange32(mapped_bits, h);
+      uint32_t val = h & val_mask;
+      //fprintf(stderr, "-> Val %x @ %d (%x)\n", val, addr, h);
+
+      if (addr != last_addr) {
+        bit_table_set_bit(data_at_cache_line, 503 - addr);
+        //fprintf(stderr, "-> Set mapped @ 503 - %d\n", addr);
+        if (i > 0) {
+          bit_table_set_bit(data_at_cache_line, i - 1);
+        }
+        //fprintf(stderr, "-> Set change @ %d - 1\n", i);
+      }
+
+      bit_table_or_put(data_at_cache_line, count - 1 + (i * val_bits), val);
+      //fprintf(stderr, "-> Re-read val %x\n", bit_table_get(data_at_cache_line, mapped_bits + (val_bits * i), val_mask));
+      assert(val == bit_table_get(data_at_cache_line, count - 1 + (val_bits * i), val_mask));
+
+      /*
+      val_buffer |= uint64_t(val) << val_buffer_within_offset;
+      val_buffer_within_offset += val_bits;
+      if (val_buffer_within_offset >= 32) {
+        // XXX: endianness
+        reinterpret_cast<uint32_t*>(data_at_cache_line)[val_buffer_to_offset++] |= static_cast<uint32_t>(val_buffer);
+        val_buffer >>= 32;
+        val_buffer_within_offset -= 32;
+      }*/
+
+      last_addr = addr;
+    }
+    //reinterpret_cast<uint32_t*>(data_at_cache_line)[val_buffer_to_offset] |= static_cast<uint32_t>(val_buffer);
+#endif
+    //fprintf(stderr, "Built quotient\n");
+  }
+
+  void BuildBloomCacheLine(char *data_at_cache_line, std::vector<uint32_t>::iterator begin, std::vector<uint32_t>::iterator end) {
+    for (auto it = begin; it != end; ++it) {
+      FastLocalBloomImpl::AddHashPrepared(*it, /*num_probes*/4, data_at_cache_line);
+    }
+    if ((data_at_cache_line[63] & char(0xc0)) == 0) {
+      // set one bit to make one of the top two bits non-zero
+      data_at_cache_line[63] |= char(0x80);
+    }
+    //fprintf(stderr, "Built bloom\n");
+  }
+};
+
+class MaxCache2FilterBitsReader : public FilterBitsReader {
+ public:
+  MaxCache2FilterBitsReader(const char* data,
+    uint32_t num_cache_lines)
+    : data_(data), num_cache_lines_(num_cache_lines) {
+    }
+
+  // No Copy allowed
+  MaxCache2FilterBitsReader(const MaxCacheFilterBitsReader&) = delete;
+  void operator=(const MaxCacheFilterBitsReader&) = delete;
+
+  ~MaxCache2FilterBitsReader() override {}
+
+  bool MayMatch(const Slice& key) override {
+    uint32_t hash = BloomHash(key);
+    uint32_t line_offset = fastrange32(num_cache_lines_, hash) << 6;
+    //fprintf(stderr, "Checking for %x on cache line %d\n", hash, line_offset >> 6);
+    hash *= 0x9e3779b9;
+    const char *data_at_cache_line = data_ + line_offset;
+    // Top two bits of last byte non-zero -> Bloom
+    if (data_at_cache_line[63] >> 6) {
+      //fprintf(stderr, "Checking bloom\n");
+      return FastLocalBloomImpl::HashMayMatchPrepared(hash, /*num_probes*/4, data_at_cache_line);
+    }
+    // else Quotient filter
+    uint32_t count = (data_at_cache_line[63] & 63U) + 16;
+    uint32_t base_bits = 505U / count;
+    uint32_t val_bits = base_bits - 2;
+    uint32_t val_mask = (uint32_t(1) << val_bits) - 1;
+    uint32_t mapped_bits = 505 - (count * (base_bits - 1));
+
+    uint32_t addr = fastrange32(mapped_bits, hash);
+    uint32_t val = hash & val_mask;
+
+    //fprintf(stderr, "Checking quotient for val %x @ %d (%x)\n", val, addr, hash);
+    if (!bit_table_get_bit(data_at_cache_line, 503 - addr)) {
+      //fprintf(stderr, "Not mapped\n");
+      return false; // no entries for address
+    }
+
+    uint32_t prior = backward_nbits_popcnt(data_at_cache_line + 63, addr);
+    assert(prior <= addr);
+    uint32_t i = nth_set_bit_index1(data_at_cache_line, prior);
+    assert (i < count);
+    for (;; ++i) {
+      uint32_t entry = bit_table_get(data_at_cache_line, count - 1 + (val_bits * i), val_mask);
+      //fprintf(stderr, "In sync at position %d, read %d\n", i, entry);
+      if (entry == val) {
+        //fprintf(stderr, "Found\n");
+        return true; // found
+      }
+      if (i + 1 >= count) {
+        // already checked last entry
+        break;
+      }
+      if (bit_table_get_bit(data_at_cache_line, i)) {
+        // change bit set; next entry assoc with different addr
+        break;
+      }
+    }
+    //fprintf(stderr, "Not found\n");
+    return false; // not found
   }
 
   using FilterBitsReader::MayMatch; // inherit overload
@@ -747,6 +1189,9 @@ class BloomFilterPolicy : public FilterPolicy {
       if (0 == strcmp(custom_filter_impl, "maxcache")) {
         return new MaxCacheFilterBitsBuilder(bits_per_key_);
       }
+      if (0 == strcmp(custom_filter_impl, "maxcache2")) {
+        return new MaxCache2FilterBitsBuilder(bits_per_key_);
+      }
     }
 
     return new FullFilterBitsBuilder(bits_per_key_, num_probes_);
@@ -783,10 +1228,16 @@ class BloomFilterPolicy : public FilterPolicy {
           return new FastLocalFilterBitsReader(contents.data(), raw_num_probes, len);
         }
       } else if (raw_num_probes == -2) {
+        char raw_variant_val = contents.data()[len_with_meta - 4];
         // Marker for MaxCache implementation
         uint32_t len = len_with_meta - 5;
         assert((len & 63) == 0);
-        return new MaxCacheFilterBitsReader(contents.data(), len / 64);
+        if (raw_variant_val == 1) {
+          return new MaxCacheFilterBitsReader(contents.data(), len / 64);
+        }
+        if (raw_variant_val == 2) {
+          return new MaxCache2FilterBitsReader(contents.data(), len / 64);
+        }
       }
       // otherwise
       // Treat as zero probes (always FP) for now.

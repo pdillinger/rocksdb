@@ -224,7 +224,7 @@ public:
                                          const char *data,
                                          uint32_t /*out*/*byte_offset) {
     uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h) << 6;
-    PREFETCH(data + bytes_to_cache_line, 1 /* rw */, 1 /* locality */);
+    PREFETCH(data + bytes_to_cache_line, 0 /* rw */, 1 /* locality */);
     *byte_offset = bytes_to_cache_line;
   }
 
@@ -265,8 +265,11 @@ public:
       //x = _mm256_i32gather_epi32((const int *)(table + a), x, /*bytes / i32*/4);
       // END Option 2
       // Option 3
-      __m256i lower = reinterpret_cast<const __m256i*>(data_at_cache_line)[0];
-      __m256i upper = reinterpret_cast<const __m256i*>(data_at_cache_line)[1];
+      // Potentially unaligned:
+      const __m256i *mm_data =
+          reinterpret_cast<const __m256i*>(data_at_cache_line);
+      __m256i lower = _mm256_loadu_si256(mm_data);
+      __m256i upper = _mm256_loadu_si256(mm_data + 1);
       lower = _mm256_permutevar8x32_epi32(lower, x);
       upper = _mm256_permutevar8x32_epi32(upper, x);
       __m256i junk = _mm256_srai_epi32(v, 31);
