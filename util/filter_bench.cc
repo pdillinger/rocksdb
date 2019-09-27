@@ -52,6 +52,8 @@ DEFINE_uint32(new_reader_every, 0,
 
 DEFINE_bool(quick, false, "Run more limited set of tests, fewer queries");
 
+DEFINE_bool(allow_bad_fp_rate, false, "Continue even if FP rate is bad");
+
 void _always_assert_fail(int line, const char *file, const char *expr) {
   fprintf(stderr, "%s: %d: Assertion %s failed\n", file, line, expr);
   abort();
@@ -208,7 +210,7 @@ void FilterBench::Go() {
   double bpk = totalMemoryUsed * 8.0 / totalKeysAdded;
   std::cout << "Bits/key actual: " << bpk << std::endl;
   if (!FLAGS_quick) {
-    double tolerableRate = std::pow(2.0, -(bpk - 1.0) / 1.5);
+    double tolerableRate = std::pow(2.0, -(bpk - 1.0) / (1.4 + bpk / 50.0));
     std::cout << "Best possible FP rate %: " << 100.0 * std::pow(2.0, -bpk)
               << std::endl;
     std::cout << "Tolerable FP rate %: " << 100.0 * tolerableRate << std::endl;
@@ -232,7 +234,9 @@ void FilterBench::Go() {
     double prelimRate = (double)fps / outside_q_per_f / infos.size();
     std::cout << " Prelim FP rate %: " << (100.0 * prelimRate) << std::endl;
 
-    always_assert(prelimRate < tolerableRate);
+    if (!FLAGS_allow_bad_fp_rate) {
+      always_assert(prelimRate < tolerableRate);
+    }
   }
 
   std::cout << "----------------------------" << std::endl;
