@@ -771,12 +771,8 @@ class MaxCache2FilterBitsReader : public FilterBitsReader {
 
   ~MaxCache2FilterBitsReader() override {}
 
-  bool MayMatch(const Slice& key) override {
-    uint32_t hash = BloomHash(key);
-    uint32_t line_offset = fastrange32(num_cache_lines_, hash) << 6;
-    //fprintf(stderr, "Checking for %x on cache line %d\n", hash, line_offset >> 6);
+  bool HashMayMatchPrepared(const char *data_at_cache_line, uint32_t hash) {
     hash *= 0x9e3779b9;
-    const char *data_at_cache_line = data_ + line_offset;
     // Top two bits of last byte non-zero -> Bloom
     if (data_at_cache_line[63] >> 6) {
       //fprintf(stderr, "Checking bloom\n");
@@ -822,23 +818,28 @@ class MaxCache2FilterBitsReader : public FilterBitsReader {
     return false; // not found
   }
 
-  using FilterBitsReader::MayMatch; // inherit overload
+  bool MayMatch(const Slice& key) override {
+    uint32_t hash = BloomHash(key);
+    uint32_t line_offset = fastrange32(num_cache_lines_, hash) << 6;
+    //fprintf(stderr, "Checking for %x on cache line %d\n", hash, line_offset >> 6);
+    return HashMayMatchPrepared(data_ + line_offset, hash);
+  }
 
-/*
   virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
     uint32_t hashes[MultiGetContext::MAX_BATCH_SIZE];
     uint32_t byte_offsets[MultiGetContext::MAX_BATCH_SIZE];
     for (int i = 0; i < num_keys; ++i) {
-      hashes[i] = BloomHash(*keys[i]);
-      SemiLocalBloomImpl::PrepareHashMayMatch(hashes[i], len_bytes_, data_,
-                                              &byte_offsets[i]);
+      uint32_t hash = BloomHash(*keys[i]);
+      uint32_t line_offset = fastrange32(num_cache_lines_, hash) << 6;
+      PREFETCH(data_ + line_offset, 0 /* rw */, 1 /* locality */);
+      hashes[i] = hash;
+      byte_offsets[i] = line_offset;
     }
     for (int i = 0; i < num_keys; ++i) {
-      may_match[i] = SemiLocalBloomImpl::HashMayMatchPrepared(hashes[i], len_bytes_, num_probes_,
-                                                      data_, byte_offsets[i]);
+      may_match[i] = HashMayMatchPrepared(data_ + byte_offsets[i], hashes[i]);
     }
   }
-*/
+
  private:
   const char* data_;
   const uint32_t num_cache_lines_;
