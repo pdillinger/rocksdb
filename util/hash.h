@@ -49,12 +49,30 @@ struct SliceHasher {
   uint32_t operator()(const Slice& s) const { return GetSliceHash(s); }
 };
 
-// An alternative to % for mapping a hash value to an arbitrary range. See
-// https://github.com/lemire/fastrange and
+// An alternative to % for mapping a 32-bit hash value to an arbitrary smaller
+// range. See https://github.com/lemire/fastrange and
 // https://github.com/pdillinger/wormhashing/blob/2c4035a4462194bf15f3e9fc180c27c513335225/bloom_simulation_tests/foo.cc#L57
 inline uint32_t fastrange32(uint32_t a, uint32_t h) {
   uint64_t product = static_cast<uint64_t>(a) * h;
   return static_cast<uint32_t>(product >> 32);
+}
+
+// An alternative to % for mapping a 64-bit hash value to an arbitrary range
+// that fits in size_t. See https://github.com/lemire/fastrange and
+// https://github.com/pdillinger/wormhashing/blob/2c4035a4462194bf15f3e9fc180c27c513335225/bloom_simulation_tests/foo.cc#L57
+inline size_t fastrange64(size_t a, uint64_t h) {
+#if SIZE_MAX == UINT64_MAX
+  // 64-bit. Expect __uint128_t to be available
+  __uint128_t wide = __uint128_t(a) * h;
+  return static_cast<uint64_t>(wide >> 64);
+#else
+  // 32-bit. Use an adequate implementation based on `a` being 32-bit.
+  uint64_t semiwide = uint64_t(a & 0xffffffff) * uint64_t(h & 0xffffffff);
+  uint32_t upper_of_lower = static_cast<uint32_t>(semiwide >> 32);
+  semiwide = uint64_t(a & 0xffffffff) * uint64_t(h >> 32);
+  semiwide += upper_of_lower;
+  return static_cast<size_t>(semiwide >> 32);
+#endif
 }
 
 }  // namespace rocksdb

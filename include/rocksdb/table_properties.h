@@ -47,6 +47,7 @@ struct TablePropertiesNames {
   static const std::string kFormatVersion;
   static const std::string kFixedKeyLen;
   static const std::string kFilterPolicy;
+  static const std::string kFilterConfig;
   static const std::string kColumnFamilyName;
   static const std::string kColumnFamilyId;
   static const std::string kComparator;
@@ -195,6 +196,12 @@ struct TableProperties {
   // The name of the filter policy used in this table.
   // If no filter policy is used, `filter_policy_name` will be an empty string.
   std::string filter_policy_name;
+
+  // A string descriptor of a FilterBitsConfig used in this table, the
+  // preferred alternative to embedding metadata in the filter bits.
+  // If no filter config is used, `filter_config_string` will be empty string
+  // and metadata will be inferred from the filter bits.
+  std::string filter_config_string;
 
   // The name of the comparator used in this table.
   std::string comparator_name;

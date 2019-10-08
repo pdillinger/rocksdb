@@ -1465,29 +1465,51 @@ Status BlockBasedTable::PrefetchIndexAndFilterBlocks(
 
   // Find filter handle and filter type
   if (rep_->filter_policy) {
-    for (auto filter_type :
-         {Rep::FilterType::kFullFilter, Rep::FilterType::kPartitionedFilter,
-          Rep::FilterType::kBlockFilter}) {
-      std::string prefix;
-      switch (filter_type) {
-        case Rep::FilterType::kFullFilter:
-          prefix = kFullFilterBlockPrefix;
+    // In case we ever decide to generate both new and old filters, look
+    // for the new first.
+    for (const auto& qualifier : {kFilterWithConfig, std::string()}) {
+      for (const auto& filter_type :
+           {Rep::FilterType::kFullFilter, Rep::FilterType::kPartitionedFilter,
+            Rep::FilterType::kBlockFilter}) {
+        std::string prefix;
+        switch (filter_type) {
+          case Rep::FilterType::kFullFilter:
+            prefix = kFullFilterBlockPrefix;
+            break;
+          case Rep::FilterType::kPartitionedFilter:
+            prefix = kPartitionedFilterBlockPrefix;
+            break;
+          case Rep::FilterType::kBlockFilter:
+            prefix = kFilterBlockPrefix;
+            break;
+          default:
+            assert(0);
+        }
+        std::string filter_block_key = prefix;
+        filter_block_key.append(qualifier);
+        filter_block_key.append(rep_->filter_policy->Name());
+        if (FindMetaBlock(meta_iter, filter_block_key, &rep_->filter_handle)
+                .ok()) {
+          if (qualifier == kFilterWithConfig) {
+            // Expect/require a table-wide FilterBitsConfig, specified in a
+            // table property.
+            if (rep_->table_properties != nullptr) {
+              rep_->filter_config = FilterBitsConfig::FromConfigString(
+                  rep_->table_properties->filter_config_string);
+            }
+            if (rep_->filter_config == nullptr) {
+              // Missing or unable to parse filter config. Could be a future
+              // version. Fall back to no filter.
+              rep_->filter_type = Rep::FilterType::kNoFilter;
+              break;
+            }
+            // Now, the presence of a non-null filter_config signals that
+            // it should be used to interpret filter bits rather than
+            // using GetFilterBitsReader.
+          }
+          rep_->filter_type = filter_type;
           break;
-        case Rep::FilterType::kPartitionedFilter:
-          prefix = kPartitionedFilterBlockPrefix;
-          break;
-        case Rep::FilterType::kBlockFilter:
-          prefix = kFilterBlockPrefix;
-          break;
-        default:
-          assert(0);
-      }
-      std::string filter_block_key = prefix;
-      filter_block_key.append(rep_->filter_policy->Name());
-      if (FindMetaBlock(meta_iter, filter_block_key, &rep_->filter_handle)
-              .ok()) {
-        rep_->filter_type = filter_type;
-        break;
+        }
       }
     }
   }

@@ -849,10 +849,14 @@ void BlockBasedTableBuilder::WriteFilterBlock(
     std::string key;
     if (rep_->filter_builder->IsBlockBased()) {
       key = BlockBasedTable::kFilterBlockPrefix;
+      assert(!rep_->filter_builder->GetConfig());
     } else {
       key = rep_->table_options.partition_filters
                 ? BlockBasedTable::kPartitionedFilterBlockPrefix
                 : BlockBasedTable::kFullFilterBlockPrefix;
+      if (rep_->filter_builder->GetConfig()) {
+        key.append(BlockBasedTable::kFilterWithConfig);
+      }
     }
     key.append(rep_->table_options.filter_policy->Name());
     meta_index_builder->Add(key, filter_block_handle);
@@ -918,6 +922,20 @@ void BlockBasedTableBuilder::WritePropertiesBlock(
         rep_->table_options.filter_policy != nullptr
             ? rep_->table_options.filter_policy->Name()
             : "";
+    rep_->props.filter_config_string = "";
+    if (rep_->filter_builder != nullptr) {
+      auto config = rep_->filter_builder->GetConfig();
+      if (config != nullptr) {
+        rep_->props.filter_config_string = config->ToConfigString();
+#ifndef NDEBUG
+        // Assert that this config string is recognized by FromConfigString
+        auto recreated =
+            FilterBitsConfig::FromConfigString(rep_->props.filter_config_string);
+        assert(recreated != nullptr);
+        assert(rep_->props.filter_config_string == recreated->ToConfigString());
+#endif
+      }
+    }
     rep_->props.index_size =
         rep_->index_builder->IndexSize() + kBlockTrailerSize;
     rep_->props.comparator_name = rep_->ioptions.user_comparator != nullptr
@@ -1192,4 +1210,6 @@ const std::string BlockBasedTable::kFilterBlockPrefix = "filter.";
 const std::string BlockBasedTable::kFullFilterBlockPrefix = "fullfilter.";
 const std::string BlockBasedTable::kPartitionedFilterBlockPrefix =
     "partitionedfilter.";
+const std::string BlockBasedTable::kFilterWithConfig = "withconfig.";
+
 }  // namespace rocksdb

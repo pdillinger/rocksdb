@@ -16,6 +16,7 @@
 #include "third-party/folly/folly/ConstexprMath.h"
 #include "util/bloom_impl.h"
 #include "util/coding.h"
+#include "util/filters_impl.h"
 #include "util/hash.h"
 
 namespace rocksdb {
@@ -249,11 +250,58 @@ void FullFilterBitsReader::GetFilterMeta(const Slice& filter, int* num_probes,
 
 // An implementation of filter policy
 class BloomFilterPolicy : public FilterPolicy {
+  static constexpr int kUseFullBuilder = 0;
+  static constexpr int kUseBlockBasedBuilder = 1;
+
+  static int ToMilliBitsPerKey(double bits_per_key) {
+    if (bits_per_key < 1.0) {
+      // Lower limit
+      return 1000 /*millibits*/;
+    } else if (bits_per_key < 100.0) {
+      // OK
+      return static_cast<int>(bits_per_key * 1000.0 + 0.5) /*millibits*/;
+    } else {
+      // Upper limit (should include NaN case)
+      return 100000 /*millibits*/;
+    }
+  }
+
+  static int RefinePreferred(int preferred, int millibits_per_key) {
+    // No changes for now
+    (void)millibits_per_key;
+    assert(preferred >= kUseFullBuilder);
+    assert(preferred <= int(BuiltinFilterImpl::kFastLocalBloom));
+    return preferred;
+  }
+
+  static int GetNumProbes(int millibits_per_key) {
+    // We intentionally round down to reduce probing cost a little bit
+    // 0.69 =~ ln(2)
+    int num_probes = static_cast<int>(millibits_per_key * 0.69 / 1000.0);
+    if (num_probes < 1) num_probes = 1;
+    if (num_probes > 30) num_probes = 30;
+    return num_probes;
+  }
+
  public:
   explicit BloomFilterPolicy(int bits_per_key, bool use_block_based_builder)
-      : bits_per_key_(bits_per_key), hash_func_(BloomHash),
-        use_block_based_builder_(use_block_based_builder) {
-    initialize();
+      : millibits_per_key_(ToMilliBitsPerKey(bits_per_key)),
+        preferred_(RefinePreferred(
+            use_block_based_builder ? kUseBlockBasedBuilder : kUseFullBuilder,
+            millibits_per_key_)),
+        num_probes_(GetNumProbes(millibits_per_key_)) {
+    assert(preferred_ == kUseFullBuilder ||
+           preferred_ == kUseBlockBasedBuilder);
+  }
+
+  explicit BloomFilterPolicy(double bits_per_key,
+                             BuiltinFilterImpl preferred_impl)
+      : millibits_per_key_(ToMilliBitsPerKey(bits_per_key)),
+        preferred_(RefinePreferred(int(preferred_impl), millibits_per_key_)),
+        num_probes_(GetNumProbes(millibits_per_key_)) {
+    assert(preferred_ != kUseFullBuilder);
+    assert(preferred_ != kUseBlockBasedBuilder);
+    CreateConfig();
   }
 
   ~BloomFilterPolicy() override {}
@@ -262,7 +310,8 @@ class BloomFilterPolicy : public FilterPolicy {
 
   void CreateFilter(const Slice* keys, int n, std::string* dst) const override {
     // Compute bloom filter size (in both bits and bytes)
-    uint32_t bits = static_cast<uint32_t>(n * bits_per_key_);
+    uint32_t bits =
+        static_cast<uint32_t>(n * int64_t(millibits_per_key_) / 1000);
 
     // For small n, we can see a very high false positive rate.  Fix it
     // by enforcing a minimum bloom filter length.
@@ -276,7 +325,7 @@ class BloomFilterPolicy : public FilterPolicy {
     dst->push_back(static_cast<char>(num_probes_));  // Remember # of probes
     char* array = &(*dst)[init_size];
     for (int i = 0; i < n; i++) {
-      LegacyNoLocalityBloomImpl::AddHash(hash_func_(keys[i]), bits, num_probes_,
+      LegacyNoLocalityBloomImpl::AddHash(BloomHash(keys[i]), bits, num_probes_,
                                          array);
     }
   }
@@ -299,16 +348,25 @@ class BloomFilterPolicy : public FilterPolicy {
       return true;
     }
     // NB: using k not num_probes_
-    return LegacyNoLocalityBloomImpl::HashMayMatch(hash_func_(key), bits, k,
+    return LegacyNoLocalityBloomImpl::HashMayMatch(BloomHash(key), bits, k,
                                                    array);
   }
 
   FilterBitsBuilder* GetFilterBitsBuilder() const override {
-    if (use_block_based_builder_) {
-      return nullptr;
+    switch (preferred_) {
+      case kUseBlockBasedBuilder:
+        return nullptr;
+      case int(BuiltinFilterImpl::kFastLocalBloom):
+        assert(config_);
+        return new FastLocalBloomBuilder(
+            millibits_per_key_,
+            std::static_pointer_cast<const FastLocalBloomConfig>(config_));
     }
-
-    return new FullFilterBitsBuilder(bits_per_key_, num_probes_);
+    // else (incl fallback)
+    assert(preferred_ == kUseFullBuilder);
+    // Round to integer bits_per_key
+    int bits_per_key = (millibits_per_key_ + 500) / 1000;
+    return new FullFilterBitsBuilder(bits_per_key, num_probes_);
   }
 
   FilterBitsReader* GetFilterBitsReader(const Slice& contents) const override {
@@ -316,20 +374,27 @@ class BloomFilterPolicy : public FilterPolicy {
   }
 
   // If choose to use block based builder
-  bool UseBlockBasedBuilder() { return use_block_based_builder_; }
+  bool UseBlockBasedBuilder() { return preferred_ == kUseBlockBasedBuilder; }
 
  private:
-  int bits_per_key_;
-  int num_probes_;
-  uint32_t (*hash_func_)(const Slice& key);
+  // Average bits to allocate per key added to the filter, in thousandths of
+  // a bit (to avoid hassles of internal computation with floating point).
+  const int millibits_per_key_;
+  // Either kUseFullBuilder, kUseBlockBasedBuilder, or a BuiltinFilterImpl
+  const int preferred_;
+  // Number of probes for Bloom filter (often called 'k'), in case that's
+  // applicable
+  const int num_probes_;
+  // When using a BuiltinFilterImpl, the config used by the builder.
+  std::shared_ptr<const FilterBitsConfig> config_;
 
-  const bool use_block_based_builder_;
-
-  void initialize() {
-    // We intentionally round down to reduce probing cost a little bit
-    num_probes_ = static_cast<int>(bits_per_key_ * 0.69);  // 0.69 =~ ln(2)
-    if (num_probes_ < 1) num_probes_ = 1;
-    if (num_probes_ > 30) num_probes_ = 30;
+  void CreateConfig() {
+    switch (preferred_) {
+      case int(BuiltinFilterImpl::kFastLocalBloom):
+        config_ = std::make_shared<FastLocalBloomConfig>(num_probes_);
+        return;
+    }
+    assert(false);
   }
 };
 
@@ -337,7 +402,53 @@ class BloomFilterPolicy : public FilterPolicy {
 
 const FilterPolicy* NewBloomFilterPolicy(int bits_per_key,
                                          bool use_block_based_builder) {
+  // XXX/temporary: try new one in place of non-block for testing
+  /*if (!use_block_based_builder) {
+    return new BloomFilterPolicy(bits_per_key, BuiltinFilterImpl::kFastLocalBloom);
+  }*/
   return new BloomFilterPolicy(bits_per_key, use_block_based_builder);
+}
+
+const FilterPolicy* NewBloomFilterPolicy(double bits_per_key,
+                                         BuiltinFilterImpl preferred_impl) {
+  return new BloomFilterPolicy(bits_per_key, preferred_impl);
+}
+
+const std::string FastLocalBloomConfig::ID = "FastLocalBloom";
+
+std::shared_ptr<const FilterBitsConfig> FilterBitsConfig::FromConfigString(
+    const std::string& str) {
+  size_t open_paren = str.find_first_of('(');
+  size_t close_paren = str.find_first_of(')');
+  if (open_paren == std::string::npos || close_paren != str.size() - 1) {
+    // Parse failure
+    assert(false);
+    return nullptr;
+  }
+  std::string id = str.substr(0, open_paren);
+  std::vector<int> args;
+  {
+    // Split into args on commas (and don't raise exceptions)
+    std::string args_str = str.substr(open_paren + 1, close_paren - open_paren - 1);
+    while (!args_str.empty()) {
+      size_t comma = args_str.find_first_of(',');
+      if (comma == std::string::npos) {
+        args.push_back(std::atoi(args_str.c_str()));
+        args_str = "";
+      } else {
+        args.push_back(std::atoi(args_str.substr(0, comma).c_str()));
+        args_str = args_str.substr(comma + 1);
+      }
+    }
+  }
+  if (id == FastLocalBloomConfig::ID) {
+    if (args.size() == 1) {
+      return std::make_shared<FastLocalBloomConfig>(args[0]);
+    }
+  }
+  // Unrecognized implementation, bad number of args, etc.
+  assert(false);
+  return nullptr;
 }
 
 }  // namespace rocksdb

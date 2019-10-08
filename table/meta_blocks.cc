@@ -100,6 +100,9 @@ void PropertyBlockBuilder::AddTableProperty(const TableProperties& props) {
   if (!props.filter_policy_name.empty()) {
     Add(TablePropertiesNames::kFilterPolicy, props.filter_policy_name);
   }
+  if (!props.filter_config_string.empty()) {
+    Add(TablePropertiesNames::kFilterConfig, props.filter_config_string);
+  }
   if (!props.comparator_name.empty()) {
     Add(TablePropertiesNames::kComparator, props.comparator_name);
   }
@@ -314,6 +317,8 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
       *(pos->second) = val;
     } else if (key == TablePropertiesNames::kFilterPolicy) {
       new_table_properties->filter_policy_name = raw_val.ToString();
+    } else if (key == TablePropertiesNames::kFilterConfig) {
+      new_table_properties->filter_config_string = raw_val.ToString();
     } else if (key == TablePropertiesNames::kColumnFamilyName) {
       new_table_properties->column_family_name = raw_val.ToString();
     } else if (key == TablePropertiesNames::kComparator) {

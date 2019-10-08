@@ -92,6 +92,10 @@ Slice FullFilterBlockBuilder::Finish(const BlockHandle& /*tmp*/,
   return Slice();
 }
 
+std::shared_ptr<const FilterBitsConfig> FullFilterBlockBuilder::GetConfig() {
+  return filter_bits_builder_->GetConfig();
+}
+
 FullFilterBlockReader::FullFilterBlockReader(
     const BlockBasedTable* t, CachableEntry<BlockContents>&& filter_block)
     : FilterBlockReaderCommon(t, std::move(filter_block)) {
@@ -170,14 +174,23 @@ bool FullFilterBlockReader::MayMatch(
 
   if (filter_block.GetValue()->data.size() != 0) {
     assert(table());
-    assert(table()->get_rep());
+    auto rep = table()->get_rep();
+    assert(rep);
 
-    std::unique_ptr<FilterBitsReader> filter_bits_reader(
-        table()->get_rep()->filter_policy->GetFilterBitsReader(
-            filter_block.GetValue()->data));
-    assert(filter_bits_reader != nullptr);
+    bool may_match;
+    if (rep->filter_config == nullptr) {
+      // Old way
+      std::unique_ptr<FilterBitsReader> filter_bits_reader(
+          rep->filter_policy->GetFilterBitsReader(
+              filter_block.GetValue()->data));
+      assert(filter_bits_reader != nullptr);
+      may_match = filter_bits_reader->MayMatch(entry);
+    } else {
+      // New way
+      may_match = rep->filter_config->MayMatch(filter_block.GetValue()->data, entry);
+    }
 
-    if (filter_bits_reader->MayMatch(entry)) {
+    if (may_match) {
       PERF_COUNTER_ADD(bloom_sst_hit_count, 1);
       return true;
     } else {
@@ -235,12 +248,8 @@ void FullFilterBlockReader::MayMatch(
   }
 
   assert(table());
-  assert(table()->get_rep());
-
-  std::unique_ptr<FilterBitsReader> filter_bits_reader(
-      table()->get_rep()->filter_policy->GetFilterBitsReader(
-          filter_block.GetValue()->data));
-  assert(filter_bits_reader != nullptr);
+  auto rep = table()->get_rep();
+  assert(rep);
 
   // We need to use an array instead of autovector for may_match since
   // &may_match[0] doesn't work for autovector<bool> (compiler error). So
@@ -261,7 +270,18 @@ void FullFilterBlockReader::MayMatch(
       filter_range.SkipKey(iter);
     }
   }
-  filter_bits_reader->MayMatch(num_keys, &keys[0], &may_match[0]);
+
+  if (rep->filter_config == nullptr) {
+    // Old way
+    std::unique_ptr<FilterBitsReader> filter_bits_reader(
+        rep->filter_policy->GetFilterBitsReader(
+            filter_block.GetValue()->data));
+    assert(filter_bits_reader != nullptr);
+    filter_bits_reader->MayMatch(num_keys, &keys[0], &may_match[0]);
+  } else {
+    // New way
+    rep->filter_config->MayMatch(filter_block.GetValue()->data, num_keys, &keys[0], &may_match[0]);
+  }
 
   int i = 0;
   for (auto iter = filter_range.begin(); iter != filter_range.end(); ++iter) {

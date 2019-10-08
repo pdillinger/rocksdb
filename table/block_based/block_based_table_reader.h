@@ -78,6 +78,12 @@ class BlockBasedTable : public TableReader {
   static const std::string kFilterBlockPrefix;
   static const std::string kFullFilterBlockPrefix;
   static const std::string kPartitionedFilterBlockPrefix;
+
+  // When combined with one of the prefixes above, indicates that a
+  // FilterBitsConfig is associated with the table, for interpreting the
+  // filter bits, rather than embedding metadata in each filter itself.
+  static const std::string kFilterWithConfig;
+
   // The longest prefix of the cache key used to identify blocks.
   // For Posix files the unique ID is three varints.
   static const size_t kMaxCacheKeyPrefixSize = kMaxVarint64Length * 3 + 1;
@@ -531,6 +537,7 @@ struct BlockBasedTable::Rep {
     kPartitionedFilter,
   };
   FilterType filter_type;
+  std::shared_ptr<const FilterBitsConfig> filter_config;
   BlockHandle filter_handle;
   BlockHandle compression_dict_handle;
 

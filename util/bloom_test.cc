@@ -19,6 +19,7 @@ int main() {
 
 #include "logging/logging.h"
 #include "memory/arena.h"
+#include "rocksdb/filter_bits_config.h"
 #include "rocksdb/filter_policy.h"
 #include "table/full_filter_bits_builder.h"
 #include "test_util/testharness.h"
@@ -323,6 +324,7 @@ class FullBloomTest : public testing::Test {
 TEST_F(FullBloomTest, FilterSize) {
   uint32_t dont_care1, dont_care2;
   auto full_bits_builder = GetFullFilterBitsBuilder();
+  ASSERT_TRUE(full_bits_builder != nullptr);
   for (int n = 1; n < 100; n++) {
     auto space = full_bits_builder->CalculateSpace(n, &dont_care1, &dont_care2);
     auto n2 = full_bits_builder->CalculateNumEntry(space);
@@ -635,6 +637,133 @@ TEST_F(FullBloomTest, CorruptFilters) {
     ASSERT_TRUE(Matches("hello"));
     ASSERT_TRUE(Matches("world"));
   }
+}
+
+class FastLocalBloomTest : public testing::Test {
+ private:
+  std::unique_ptr<const FilterPolicy> policy_;
+  std::unique_ptr<FilterBitsBuilder> bits_builder_;
+  std::shared_ptr<const FilterBitsConfig> bits_config_;
+  std::unique_ptr<const char[]> buf_;
+  size_t filter_size_;
+
+ public:
+  FastLocalBloomTest()
+      :  // Create with a 0.2 bit / key handicap - still good accuracy
+        policy_(NewBloomFilterPolicy(FLAGS_bits_per_key - 0.2,
+                                     BuiltinFilterImpl::kFastLocalBloom)),
+        filter_size_(0) {
+    Reset();
+  }
+
+  void Reset() {
+    bits_builder_.reset(policy_->GetFilterBitsBuilder());
+    bits_config_ = bits_builder_->GetConfig();
+    buf_.reset(nullptr);
+    filter_size_ = 0;
+  }
+
+  void Add(const Slice& s) { bits_builder_->AddKey(s); }
+
+  void Build() {
+    Slice filter = bits_builder_->Finish(&buf_);
+    filter_size_ = filter.size();
+  }
+
+  size_t FilterSize() const { return filter_size_; }
+
+  Slice FilterData() { return Slice(buf_.get(), filter_size_); }
+
+  bool Matches(const Slice& s) {
+    if (!buf_) {
+      Build();
+    }
+    return bits_config_->MayMatch(FilterData(), s);
+  }
+
+  double FalsePositiveRate() {
+    char buffer[sizeof(int)];
+    int result = 0;
+    for (int i = 0; i < 10000; i++) {
+      if (Matches(Key(i + 1000000000, buffer))) {
+        result++;
+      }
+    }
+    return result / 10000.0;
+  }
+};
+
+/*
+TEST_F(FastLocalBloomTest, FilterSize) {
+  uint32_t dont_care1, dont_care2;
+  auto full_bits_builder = GetFullFilterBitsBuilder();
+  ASSERT_TRUE(full_bits_builder != nullptr);
+  for (int n = 1; n < 100; n++) {
+    auto space = full_bits_builder->CalculateSpace(n, &dont_care1, &dont_care2);
+    auto n2 = full_bits_builder->CalculateNumEntry(space);
+    ASSERT_GE(n2, n);
+    auto space2 =
+        full_bits_builder->CalculateSpace(n2, &dont_care1, &dont_care2);
+    ASSERT_EQ(space, space2);
+  }
+}
+*/
+
+TEST_F(FastLocalBloomTest, FullEmptyFilter) {
+  // Empty filter is not match, at this level
+  ASSERT_TRUE(!Matches("hello"));
+  ASSERT_TRUE(!Matches("world"));
+}
+
+TEST_F(FastLocalBloomTest, FullSmall) {
+  Add("hello");
+  Add("world");
+  ASSERT_TRUE(Matches("hello"));
+  ASSERT_TRUE(Matches("world"));
+  ASSERT_TRUE(!Matches("x"));
+  ASSERT_TRUE(!Matches("foo"));
+}
+
+TEST_F(FastLocalBloomTest, FullVaryingLengths) {
+  char buffer[sizeof(int)];
+
+  // Count number of filters that significantly exceed the false positive rate
+  int mediocre_filters = 0;
+  int good_filters = 0;
+
+  for (int length = 1; length <= 10000; length = NextLength(length)) {
+    Reset();
+    for (int i = 0; i < length; i++) {
+      Add(Key(i, buffer));
+    }
+    Build();
+
+    ASSERT_LE(FilterSize(),
+              (size_t)((length * 10 / 8) + CACHE_LINE_SIZE * 2 + 5));
+
+    // All added keys must match
+    for (int i = 0; i < length; i++) {
+      ASSERT_TRUE(Matches(Key(i, buffer)))
+          << "Length " << length << "; key " << i;
+    }
+
+    // Check false positive rate
+    double rate = FalsePositiveRate();
+    if (kVerbose >= 1) {
+      fprintf(stderr, "False positives: %5.2f%% @ length = %6d ; bytes = %6d\n",
+              rate * 100.0, length, static_cast<int>(FilterSize()));
+    }
+    ASSERT_LE(rate, 0.02);  // Must not be over 2%
+    if (rate > 0.0125)
+      mediocre_filters++;  // Allowed, but not too often
+    else
+      good_filters++;
+  }
+  if (kVerbose >= 1) {
+    fprintf(stderr, "Filters: %d good, %d mediocre\n", good_filters,
+            mediocre_filters);
+  }
+  ASSERT_LE(mediocre_filters, good_filters / 5);
 }
 
 }  // namespace rocksdb

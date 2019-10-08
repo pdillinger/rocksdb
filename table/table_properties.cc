@@ -119,6 +119,11 @@ std::string TableProperties::ToString(
       filter_policy_name.empty() ? std::string("N/A") : filter_policy_name,
       prop_delim, kv_delim);
 
+  AppendProperty(
+      result, "filter config",
+      filter_config_string.empty() ? std::string("N/A") : filter_config_string,
+      prop_delim, kv_delim);
+
   AppendProperty(result, "prefix extractor name",
                  prefix_extractor_name.empty() ? std::string("N/A")
                                                : prefix_extractor_name,
@@ -216,6 +221,7 @@ const std::string TablePropertiesNames::kNumRangeDeletions =
     "rocksdb.num.range-deletions";
 const std::string TablePropertiesNames::kFilterPolicy =
     "rocksdb.filter.policy";
+const std::string TablePropertiesNames::kFilterConfig = "rocksdb.filter.config";
 const std::string TablePropertiesNames::kFormatVersion =
     "rocksdb.format.version";
 const std::string TablePropertiesNames::kFixedKeyLen =

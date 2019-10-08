@@ -24,6 +24,7 @@
 #include <string>
 #include <vector>
 #include "db/dbformat.h"
+#include "rocksdb/filter_bits_config.h"
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"
@@ -70,6 +71,9 @@ class FilterBlockBuilder {
     return ret;
   }
   virtual Slice Finish(const BlockHandle& tmp, Status* status) = 0;
+  virtual std::shared_ptr<const FilterBitsConfig> GetConfig() {
+    return nullptr;
+  }
 };
 
 // A FilterBlockReader is used to parse filter from SST table.

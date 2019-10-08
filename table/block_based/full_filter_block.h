@@ -54,6 +54,7 @@ class FullFilterBlockBuilder : public FilterBlockBuilder {
   virtual size_t NumAdded() const override { return num_added_; }
   virtual Slice Finish(const BlockHandle& tmp, Status* status) override;
   using FilterBlockBuilder::Finish;
+  virtual std::shared_ptr<const FilterBitsConfig> GetConfig() override;
 
  protected:
   virtual void AddKey(const Slice& key);
