@@ -71,6 +71,13 @@ XXH32        6.8 GB/s            6.0 GB/s
 #ifndef XXHASH_H_5627135585666179
 #define XXHASH_H_5627135585666179 1
 
+
+//#ifndef XXH_STATIC_LINKING_ONLY
+//#define XXH_STATIC_LINKING_ONLY 1 /* access experimental APIs */
+//#endif
+#ifndef XXH_INLINE_ALL
+#define XXH_INLINE_ALL
+#endif
 #define XXH_NAMESPACE ROCKSDB_
 
 #if defined (__cplusplus)

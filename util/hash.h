@@ -9,6 +9,10 @@
 //
 // Simple hash function used for internal data structures
 
+//TODO // Inlining doesn't generally help for variable-size inputs.
+// If you want best performance on fixed-size inputs, reference the specific
+// hash function you want to use, like XXH3
+
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
@@ -24,8 +28,14 @@ extern uint64_t NPHash64(const char* data, size_t n, uint32_t seed);
 
 extern uint32_t Hash(const char* data, size_t n, uint32_t seed);
 
+extern uint64_t Hash64(const char* data, size_t n, uint64_t seed);
+
 inline uint32_t BloomHash(const Slice& key) {
   return Hash(key.data(), key.size(), 0xbc9f1d34);
+}
+
+inline uint64_t BloomHash64(const Slice& key) {
+  return Hash64(key.data(), key.size(), 0xbc9f1d34);
 }
 
 inline uint64_t GetSliceNPHash64(const Slice& s) {

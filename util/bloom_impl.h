@@ -140,45 +140,51 @@ class LegacyLocalityBloomImpl {
   }
 };
 
+// Note: with only 32-bit hash available, let h1 be same as h2, but obviously
+// better, especially with millions of keys, to get them from a single 64-bit
+// hash. Using 32-bit fastrange to pick a cache line makes the accuracy suffer
+// as you get into 10s of GB for a single filter, and abruptly break down at
+// 256GB (2^32 cache lines). Switch to 64-bit fastrange if you need filters so
+// big. ;)
 class FastLocalBloomImpl {
 public:
-  static inline void AddHash(uint32_t h, uint32_t len_bytes,
+  static inline void AddHash(uint32_t h1, uint32_t h2, uint32_t len_bytes,
                              int num_probes, char *data) {
-    uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h) << 6;
+    uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h1) << 6;
     char *data_at_cache_line = data + bytes_to_cache_line;
     PREFETCH(data_at_cache_line, 1 /* rw */, 1 /* locality */);
-    AddHashPrepared(h, num_probes, data_at_cache_line);
+    AddHashPrepared(h2, num_probes, data_at_cache_line);
   }
 
-  static inline void AddHashPrepared(uint32_t h, int num_probes,
+  static inline void AddHashPrepared(uint32_t h2, int num_probes,
                                      char *data_at_cache_line) {
     for (int i = 0; i < num_probes; ++i) {
-      h *= 0x9e3779b9UL;
-      int bitpos = h >> (32 - 9);
+      h2 *= 0x9e3779b9UL;
+      int bitpos = h2 >> (32 - 9);
       data_at_cache_line[bitpos >> 3] |= (uint8_t(1) << (bitpos & 7));
     }
   }
 
-  static inline void PrepareHashMayMatch(uint32_t h, uint32_t len_bytes,
+  static inline void PrepareHashMayMatch(uint32_t h1, uint32_t len_bytes,
                                          const char *data,
                                          uint32_t /*out*/*byte_offset) {
-    uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h) << 6;
+    uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h1) << 6;
     PREFETCH(data + bytes_to_cache_line, 0 /* rw */, 1 /* locality */);
     *byte_offset = bytes_to_cache_line;
   }
 
-  static inline bool HashMayMatch(uint32_t h, uint32_t len_bytes,
+  static inline bool HashMayMatch(uint32_t h1, uint32_t h2, uint32_t len_bytes,
                                   int num_probes, const char *data) {
-    uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h) << 6;
-    return HashMayMatchPrepared(h, num_probes, data + bytes_to_cache_line);
+    uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h1) << 6;
+    return HashMayMatchPrepared(h2, num_probes, data + bytes_to_cache_line);
   }
 
-  static inline bool HashMayMatchPrepared(uint32_t h, int num_probes,
+  static inline bool HashMayMatchPrepared(uint32_t h2, int num_probes,
                                           const char *data_at_cache_line) {
 #ifdef HAVE_AVX2
     for (;;) {
       // Eight copies of hash
-      __m256i v = _mm256_set1_epi32(h);
+      __m256i v = _mm256_set1_epi32(h2);
 
       // Powers of 32-bit golden ratio, mod 2**32
       const __m256i multipliers =
@@ -196,8 +202,9 @@ public:
       __m256i x = _mm256_srli_epi32(v, 28);
 
       // Option 1 (Requires AVX512 - unverified)
-      //__m256i lower = reinterpret_cast<__m256i*>(table + a)[0];
-      //__m256i upper = reinterpret_cast<__m256i*>(table + a)[1];
+      //const __m256i *mm_data = reinterpret_cast<const __m256i*>(data_at_cache_line);
+      //__m256i lower = _mm256_loadu_si256(mm_data);
+      //__m256i upper = _mm256_loadu_si256(mm_data + 1);
       //x = _mm256_permutex2var_epi32(lower, x, upper);
       // END Option 1
       // Option 2
@@ -229,14 +236,14 @@ public:
         return false;
       } else {
         // Need another iteration
-        h *= 0xab25f4c1;
+        h2 *= 0xab25f4c1;
         num_probes -= 8;
       }
     }
 #else
     for (int i = 0; i < num_probes; ++i) {
-      h *= 0x9e3779b9UL;
-      int bitpos = h >> (32 - 9);
+      h2 *= 0x9e3779b9UL;
+      int bitpos = h2 >> (32 - 9);
       if ((data_at_cache_line[bitpos >> 3] & (char(1) << (bitpos & 7))) == 0) {
         return false;
       }
