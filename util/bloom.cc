@@ -147,7 +147,7 @@ class FastLocalBloomBitsBuilder : public FilterBitsBuilder {
   ~FastLocalBloomBitsBuilder() {}
 
   virtual void AddKey(const Slice& key) override {
-    uint32_t hash = BloomHash(key);
+    uint64_t hash = BloomHash64(key);
     if (hash_entries_.size() == 0 || hash != hash_entries_.back()) {
       hash_entries_.push_back(hash);
     }
@@ -156,7 +156,7 @@ class FastLocalBloomBitsBuilder : public FilterBitsBuilder {
   virtual Slice Finish(std::unique_ptr<const char[]>* buf) override {
     uint32_t num_cache_lines = 0;
     if (bits_per_key_ > 0 && hash_entries_.size() > 0) {
-      num_cache_lines = static_cast<uint32_t>((uint64_t(1) * hash_entries_.size() * bits_per_key_ + 511 /*XXX + hash_entries_.size() / 2*/) / 512);
+      num_cache_lines = static_cast<uint32_t>((uint64_t{1} * hash_entries_.size() * bits_per_key_ + 511 /*XXX + hash_entries_.size() / 2*/) / 512);
     }
     uint32_t len = num_cache_lines * 64;
     uint32_t len_with_metadata = len + 5;
@@ -166,7 +166,9 @@ class FastLocalBloomBitsBuilder : public FilterBitsBuilder {
 
     if (len > 0) {
       for (auto h : hash_entries_) {
-        FastLocalBloomImpl::AddHash(h, len, num_probes_, data);
+        uint32_t h1 = static_cast<uint32_t>(h);
+        uint32_t h2 = static_cast<uint32_t>(h >> 32);
+        FastLocalBloomImpl::AddHash(h1, h2, len, num_probes_, data);
       }
     }
 
@@ -181,14 +183,14 @@ class FastLocalBloomBitsBuilder : public FilterBitsBuilder {
     return Slice(data, len_with_metadata);
   }
 
-  int CalculateNumEntry(const uint32_t bytes) {
+  int CalculateNumEntry(const uint32_t bytes) override {
     return static_cast<int>(uint64_t(8) * bytes / bits_per_key_);
   }
 
  private:
   int bits_per_key_;
   int num_probes_;
-  std::vector<uint32_t> hash_entries_;
+  std::vector<uint64_t> hash_entries_;
 };
 
 class FastLocalFilterBitsReader : public FilterBitsReader {
@@ -206,21 +208,26 @@ class FastLocalFilterBitsReader : public FilterBitsReader {
   ~FastLocalFilterBitsReader() override {}
 
   bool MayMatch(const Slice& key) override {
-    uint32_t hash = BloomHash(key);
+    uint64_t h = BloomHash64(key);
+    uint32_t h1 = static_cast<uint32_t>(h);
+    uint32_t h2 = static_cast<uint32_t>(h >> 32);
     uint32_t byte_offset;
     FastLocalBloomImpl::PrepareHashMayMatch(
-        hash, len_bytes_, data_, /*out*/ &byte_offset);
+        h1, len_bytes_, data_, /*out*/ &byte_offset);
     return FastLocalBloomImpl::HashMayMatchPrepared(
-        hash, num_probes_, data_ + byte_offset);
+        h2, num_probes_, data_ + byte_offset);
   }
 
   virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
     uint32_t hashes[MultiGetContext::MAX_BATCH_SIZE];
     uint32_t byte_offsets[MultiGetContext::MAX_BATCH_SIZE];
     for (int i = 0; i < num_keys; ++i) {
-      hashes[i] = BloomHash(*keys[i]);
-      FastLocalBloomImpl::PrepareHashMayMatch(hashes[i], len_bytes_, data_,
+      uint64_t h = BloomHash64(*keys[i]);
+      uint32_t h1 = static_cast<uint32_t>(h);
+      uint32_t h2 = static_cast<uint32_t>(h >> 32);
+      FastLocalBloomImpl::PrepareHashMayMatch(h1, len_bytes_, data_,
                                               /*out*/ &byte_offsets[i]);
+      hashes[i] = h2;
     }
     for (int i = 0; i < num_keys; ++i) {
       may_match[i] = FastLocalBloomImpl::HashMayMatchPrepared(hashes[i], num_probes_,
