@@ -67,7 +67,7 @@ uint64_t Hash64(const char* key, size_t len, uint64_t seed) {
   // XXX For testing: above 32-bit hash
   //*
   (void)seed;
-  uint32_t h = HashInline(key, len, seed);
+  uint32_t h = HashInline(key, len, static_cast<uint32_t>(seed));
   return (uint64_t(h) << 32) + h;
   //*/
 
