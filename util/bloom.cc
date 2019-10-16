@@ -648,14 +648,14 @@ class MaxCache2FilterBitsBuilder : public FilterBitsBuilder {
       return;
     }
     // For configuration, pretend we have at least 16 items. First, it's
-    // accurate enough for practical purposes and it allows us to encode 16-79
-    // using 6 bits.
+    // accurate enough for practical purposes and it allows us to encode
+    // the count of 16-79 using 6 bits.
     count = std::max(count, 16U);
     uint32_t base_bits = 505U / count;
     assert(base_bits >= 6);
     assert(base_bits <= 31);
     uint32_t val_bits = base_bits - 2;
-    uint32_t val_mask = (uint32_t(1) << val_bits) - 1;
+    uint32_t xval_mask = (uint32_t(1) << (val_bits + 1)) - 1;
     uint32_t mapped_bits = 505 - (count * (base_bits - 1));
     assert(mapped_bits >= count);
     assert(mapped_bits <= count * 2);
@@ -671,9 +671,16 @@ class MaxCache2FilterBitsBuilder : public FilterBitsBuilder {
     for (auto it = begin; it != end; ++it) {
       uint32_t h = *it;
       uint32_t addr = fastrange32(mapped_bits, h);
-      uint32_t val = h & val_mask;
+      uint32_t xval = h & xval_mask;
       //fprintf(stderr, "-> Val %x @ %d (%x)\n", val, addr, h);
-      val_bucket_[addr][val_bucket_idx_[addr]++] = val;
+      uint32_t idx = val_bucket_idx_[addr]++;
+      val_bucket_[addr][idx] = xval;
+      // insertion sort
+      while (idx > 0 && val_bucket_[addr][idx - 1] > val_bucket_[addr][idx]) {
+          std::swap(val_bucket_[addr][idx - 1], val_bucket_[addr][idx]);
+          --idx;
+      }
+      // set mapped bit
       bit_table_set_bit(data_at_cache_line, 503 - addr);
     }
 
@@ -687,9 +694,16 @@ class MaxCache2FilterBitsBuilder : public FilterBitsBuilder {
         assert(cur < count);
         bit_table_set_bit(data_at_cache_line, cur - 1);
       }
+      for (uint32_t j = 1; j < num_j; ++j) {
+        uint32_t &prev_xval = val_bucket_[i][j - 1];
+        uint32_t &cur_xval = val_bucket_[i][j];
+        if ((cur_xval & 1) == 0) {
+          std::swap(prev_xval, cur_xval);
+        }
+      }
       for (uint32_t j = 0; j < num_j; ++j) {
         assert(cur < count);
-        uint32_t val = val_bucket_[i][j];
+        uint32_t val = val_bucket_[i][j] >> 1;
         bit_table_or_put(data_at_cache_line, count - 1 + (cur * val_bits), val);
         //fprintf(stderr, "-> Re-read val %x\n", bit_table_get(data_at_cache_line, mapped_bits + (val_bits * i), val_mask));
         assert(val == bit_table_get(data_at_cache_line, count - 1 + (cur * val_bits), val_mask));
@@ -782,11 +796,11 @@ class MaxCache2FilterBitsReader : public FilterBitsReader {
     uint32_t count = (data_at_cache_line[63] & 63U) + 16;
     uint32_t base_bits = 505U / count;
     uint32_t val_bits = base_bits - 2;
-    uint32_t val_mask = (uint32_t(1) << val_bits) - 1;
+    uint32_t xval_mask = (uint32_t(1) << (val_bits + 1)) - 1;
     uint32_t mapped_bits = 505 - (count * (base_bits - 1));
 
     uint32_t addr = fastrange32(mapped_bits, hash);
-    uint32_t val = hash & val_mask;
+    uint32_t xval = hash & xval_mask;
 
     //fprintf(stderr, "Checking quotient for val %x @ %d (%x)\n", val, addr, hash);
     if (!bit_table_get_bit(data_at_cache_line, 503 - addr)) {
@@ -798,24 +812,37 @@ class MaxCache2FilterBitsReader : public FilterBitsReader {
     assert(prior <= addr);
     uint32_t i = nth_set_bit_index1(data_at_cache_line, prior);
     assert (i < count);
+
+    bool found = false;
+    bool smaller_after_found = false;
+    bool smaller_before_found = false;
     for (;; ++i) {
-      uint32_t entry = bit_table_get(data_at_cache_line, count - 1 + (val_bits * i), val_mask);
+      uint32_t entry = bit_table_get(data_at_cache_line, count - 1 + (val_bits * i), xval_mask >> 1);
       //fprintf(stderr, "In sync at position %d, read %d\n", i, entry);
-      if (entry == val) {
-        //fprintf(stderr, "Found\n");
-        return true; // found
+      if (entry < (xval >> 1)) {
+        if (found) {
+          smaller_after_found = true;
+        } else {
+          smaller_before_found = true;
+        }
+      } else if (entry == (xval >> 1)) {
+        if (found) {
+          if (smaller_after_found) {
+            // found both ways
+            return true;
+          }
+        } else {
+          found = true;
+        }
       }
-      if (i + 1 >= count) {
-        // already checked last entry
-        break;
-      }
-      if (bit_table_get_bit(data_at_cache_line, i)) {
-        // change bit set; next entry assoc with different addr
+      if (i + 1 >= count || bit_table_get_bit(data_at_cache_line, i)) {
+        // no more entries or next entry assoc with different addr
         break;
       }
     }
     //fprintf(stderr, "Not found\n");
-    return false; // not found
+    return found && ((!smaller_after_found && !smaller_before_found) ||
+      ((xval & 1) == 0) == smaller_after_found);
   }
 
   bool MayMatch(const Slice& key) override {
