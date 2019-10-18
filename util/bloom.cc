@@ -156,7 +156,10 @@ class FastLocalBloomBitsBuilder : public FilterBitsBuilder {
   virtual Slice Finish(std::unique_ptr<const char[]>* buf) override {
     uint32_t num_cache_lines = 0;
     if (bits_per_key_ > 0 && hash_entries_.size() > 0) {
-      num_cache_lines = static_cast<uint32_t>((uint64_t{1} * hash_entries_.size() * bits_per_key_ + 511 /*XXX + hash_entries_.size() / 2*/) / 512);
+      num_cache_lines = static_cast<uint32_t>(
+          (uint64_t{1} * hash_entries_.size() * bits_per_key_ +
+           511 /*XXX + hash_entries_.size() / 2*/) /
+          512);
     }
     uint32_t len = num_cache_lines * 64;
     uint32_t len_with_metadata = len + 5;
@@ -212,10 +215,10 @@ class FastLocalFilterBitsReader : public FilterBitsReader {
     uint32_t h1 = static_cast<uint32_t>(h);
     uint32_t h2 = static_cast<uint32_t>(h >> 32);
     uint32_t byte_offset;
-    FastLocalBloomImpl::PrepareHashMayMatch(
-        h1, len_bytes_, data_, /*out*/ &byte_offset);
-    return FastLocalBloomImpl::HashMayMatchPrepared(
-        h2, num_probes_, data_ + byte_offset);
+    FastLocalBloomImpl::PrepareHashMayMatch(h1, len_bytes_, data_,
+                                            /*out*/ &byte_offset);
+    return FastLocalBloomImpl::HashMayMatchPrepared(h2, num_probes_,
+                                                    data_ + byte_offset);
   }
 
   virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {

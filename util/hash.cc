@@ -7,9 +7,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include "util/hash.h"
 #include <string.h>
 #include "util/coding.h"
-#include "util/hash.h"
 #include "util/util.h"
 #include "util/xxhash.h"
 
@@ -57,7 +57,7 @@ inline uint32_t HashInline(const char* data, size_t n, uint32_t seed) {
   }
   return h;
 }
-}
+}  // namespace
 
 uint32_t Hash(const char* data, size_t n, uint32_t seed) {
   return HashInline(data, n, seed);
@@ -111,7 +111,7 @@ uint64_t Hash64(const char* key, size_t len, uint64_t seed) {
   // NB: this is currently an experimental version of XXH3 and we are stuck
   // with it if this code is pushed to master.
   //(void)seed; return XXH3_64bits(key, len);
-  //return XXH3_64bits_withSeed(key, len, seed);
+  // return XXH3_64bits_withSeed(key, len, seed);
 }
 
 }  // namespace rocksdb

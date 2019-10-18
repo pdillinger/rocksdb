@@ -9,7 +9,7 @@
 //
 // Common hash functions with convenient interfaces.
 
-//TODO // Inlining doesn't generally help for variable-size inputs.
+// TODO // Inlining doesn't generally help for variable-size inputs.
 // If you want best performance on fixed-size inputs, reference the specific
 // hash function you want to use, like XXH3
 
