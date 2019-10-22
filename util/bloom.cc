@@ -470,11 +470,11 @@ class BloomFilterPolicy : public FilterPolicy {
     // other: reserved
 
     char block_and_probes = contents.data()[len_with_meta - 3];
-    int log2_block_bytes = ((block_and_probes >> 5) & 7) + 5;
-    // 0 in top 3 bits -> 5 -> 64-byte (Intel cache line)
+    int log2_block_bytes = ((block_and_probes >> 5) & 7) + 6;
+    // 0 in top 3 bits -> 6 -> 64-byte (Intel cache line)
     // reserved:
-    // 1 in top 3 bits -> 6 -> 128-byte
-    // 2 in top 3 bits -> 7 -> 256-byte
+    // 1 in top 3 bits -> 7 -> 128-byte
+    // 2 in top 3 bits -> 8 -> 256-byte
     // ...
 
     int num_probes = (block_and_probes & 31);
@@ -487,13 +487,13 @@ class BloomFilterPolicy : public FilterPolicy {
 
     uint16_t rest = DecodeFixed16(contents.data() + len_with_meta - 2);
     if (rest != 0) {
-      // Reserved, possible for hash seed
+      // Reserved, possibly for hash seed
       // Future safe
       return new AlwaysTrueFilter();
     }
 
     if (sub_impl_val == 0) {        // FastLocalBloom
-      if (log2_block_bytes == 5) {  // Only block size supported for now
+      if (log2_block_bytes == 6) {  // Only block size supported for now
         return new FastLocalBloomBitsReader(contents.data(), num_probes, len);
       }
     }

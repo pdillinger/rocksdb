@@ -68,7 +68,7 @@ uint64_t Hash64(const char* key, size_t len, uint64_t seed) {
   //*
   (void)seed;
   uint32_t h = HashInline(key, len, seed);
-  return (uint64_t(h) << 32) + h;
+  return (uint64_t(h * 0x9e3779b9) << 32) + h;
   //*/
 
   // Attempted 64-bit port of above

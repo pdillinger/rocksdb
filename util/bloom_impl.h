@@ -155,8 +155,8 @@ class LegacyLocalityBloomImpl {
 // 0.9535%. This implementation yields something around 0.957%.
 // (Compare to LegacyLocalityBloomImpl<false> at )
 //
-// This implementation can use a 32-bit hash (let h1 be same as h2) or a
-// 64-bit hash (split into two uint32s). With many millions of keys, the
+// This implementation can use a 32-bit hash (let h2 be h1 * 0x9e3779b9) or
+// a 64-bit hash (split into two uint32s). With many millions of keys, the
 // false positive rate associated with using a 32-bit hash can dominate the
 // false positive rate of the underlying filter. At 10 bits/key setting, the
 // inflection point is about 40 million keys, so 32-bit hash is a bad idea
@@ -170,145 +170,150 @@ class LegacyLocalityBloomImpl {
 // each cache line has negligible impact for 64-byte cache lines, for
 // arbitrary filter size.
 //
-// This implementation is closely tied to Intel cache line size, 64 bytes ==
-// 512 bits. If there's sufficient demand for other cache line sizes and no
-// SIMD optimization, a slightly different, more complex implementation might
-// be worthwhile (probably not compatible with Intel AVX2 SIMD):
-// (1) Get more than one bit index from each re-mix,
-// (2) Re-mix full 64 bit hash (to minimize re-mixing), and
-// (3) Use rotation in addition to multiplication for remixing
+// This implementation is currently tied to Intel cache line size, 64 bytes ==
+// 512 bits. If there's sufficient demand for other cache line sizes, this is
+// a pretty good implementation to extend, but slight performance enhancements
+// are possible with an alternate implementation (probably not very compatible
+// with SIMD):
+// (1) Use rotation in addition to multiplication for remixing
 // (like murmur hash). (Using multiplication alone *slightly* hurts accuracy
 // because lower bits never depend on original upper bits.)
+// (2) Extract more than one bit index from each re-mix. (Only if rotation
+// or similar is part of remix, because otherwise you're making the
+// multiplication-only problem worse.)
+// (3) Re-mix full 64 bit hash, to get maximum number of bit indices per
+// re-mix.
 //
 class FastLocalBloomImpl {
-public:
- static inline void AddHash(uint32_t h1, uint32_t h2, uint32_t len_bytes,
-                            int num_probes, char *data) {
-   uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h1) << 6;
-   char *data_at_cache_line = data + bytes_to_cache_line;
-   PREFETCH(data_at_cache_line, 1 /* rw */, 1 /* locality */);
-   AddHashPrepared(h2, num_probes, data_at_cache_line);
- }
+ public:
+  static inline void AddHash(uint32_t h1, uint32_t h2, uint32_t len_bytes,
+                             int num_probes, char *data) {
+    uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h1) << 6;
+    char *data_at_cache_line = data + bytes_to_cache_line;
+    PREFETCH(data_at_cache_line, 1 /* rw */, 1 /* locality */);
+    AddHashPrepared(h2, num_probes, data_at_cache_line);
+  }
 
- static inline void AddHashPrepared(uint32_t h2, int num_probes,
-                                    char *data_at_cache_line) {
-   for (int i = 0; i < num_probes; ++i) {
-     h2 *= 0x9e3779b9UL;
-     // 9-bit address within 512 bit cache line
-     int bitpos = h2 >> (32 - 9);
-     data_at_cache_line[bitpos >> 3] |= (uint8_t(1) << (bitpos & 7));
-   }
- }
-
- static inline void PrepareHashMayMatch(uint32_t h1, uint32_t len_bytes,
-                                        const char *data,
-                                        uint32_t /*out*/ *byte_offset) {
-   uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h1) << 6;
-   PREFETCH(data + bytes_to_cache_line, 0 /* rw */, 1 /* locality */);
-   *byte_offset = bytes_to_cache_line;
- }
-
- static inline bool HashMayMatch(uint32_t h1, uint32_t h2, uint32_t len_bytes,
-                                 int num_probes, const char *data) {
-   uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h1) << 6;
-   return HashMayMatchPrepared(h2, num_probes, data + bytes_to_cache_line);
- }
-
- static inline bool HashMayMatchPrepared(uint32_t h2, int num_probes,
-                                         const char *data_at_cache_line) {
-#ifdef HAVE_AVX2
-   int rem_probes = num_probes;
-   for (;;) {
-     // Eight copies of hash
-     __m256i hash_vector = _mm256_set1_epi32(h2);
-
-     // Powers of 32-bit golden ratio, mod 2**32.
-     const __m256i multipliers =
-         _mm256_setr_epi32(0x9e3779b9, 0xe35e67b1, 0x734297e9, 0x35fbe861,
-                           0xdeb7c719, 0x448b211, 0x3459b749, 0xab25f4c1);
-
-     // Same effect as repeated multiplication by 0x9e3779b9 thanks to
-     // associativity of multiplication.
-     hash_vector = _mm256_mullo_epi32(hash_vector, multipliers);
-
-     // Shift right by 28 bits to get 4-bit addresses of 32-bit values within
-     // a cache line.
-     const __m256i word_addresses = _mm256_srli_epi32(hash_vector, 28);
-
-     // Gather 32-bit values spread over 512 bits by 4-bit address.
-     // Option 1: AVX2 gather (seems to be a little slow - understandable)
-     // const __m256i value_vector =
-     //     _mm256_i32gather_epi32(static_cast<const int *>(data_at_cache_line),
-     //                            word_addresses,
-     //                            /*bytes / i32*/ 4);
-     // END Option 1
-     // Option 2: AVX512 permute hack (Requires AVX512 - unverified)
-     // const __m256i *mm_data =
-     //     reinterpret_cast<const __m256i*>(data_at_cache_line);
-     // const __m256i lower = _mm256_loadu_si256(mm_data);
-     // const __m256i upper = _mm256_loadu_si256(mm_data + 1);
-     // const __m256i value_vector =
-     //     _mm256_permutex2var_epi32(lower, word_addresses, upper);
-     // END Option 2
-     // Option 3: Permute+blend hack (seems to be fastest with just AVX2)
-     // Potentially unaligned as we're not *always* cache-aligned -> loadu
-     const __m256i *mm_data =
-         reinterpret_cast<const __m256i *>(data_at_cache_line);
-     __m256i lower = _mm256_loadu_si256(mm_data);
-     __m256i upper = _mm256_loadu_si256(mm_data + 1);
-     // Use lowest three bits to order probing values, as if all from same
-     // 256 bit piece.
-     lower = _mm256_permutevar8x32_epi32(lower, word_addresses);
-     upper = _mm256_permutevar8x32_epi32(upper, word_addresses);
-     // Just top 1 bit of address, to select between lower and upper.
-     const __m256i upper_lower_selector = _mm256_srai_epi32(hash_vector, 31);
-     // Finally: the next 8 probed 32-bit values, in probing sequence order.
-     const __m256i value_vector =
-         _mm256_blendv_epi8(lower, upper, upper_lower_selector);
-     // END Option 3
-
-     // We might not need to probe all 8, so build a mask for selecting only
-     // what we need.
-     const __m256i zero_to_seven = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
-     __m256i k_selector =
-         _mm256_sub_epi32(zero_to_seven, _mm256_set1_epi32(rem_probes));
-     // Keep only high bit; negative after subtract -> use/select
-     k_selector = _mm256_srli_epi32(k_selector, 31);
-
-     // Strip off the 4 bit word address (shift left)
-     __m256i bit_addresses = _mm256_slli_epi32(hash_vector, 4);
-     // And keep only 5-bit (32 - 27) bit-within-32-bit-word addresses.
-     bit_addresses = _mm256_srli_epi32(bit_addresses, 27);
-     // Build a bit mask
-     const __m256i bit_mask = _mm256_sllv_epi32(k_selector, bit_addresses);
-
-     // Like ((~val) & mask) == 0)
-     bool match_so_far = _mm256_testc_si256(value_vector, bit_mask) != 0;
-
-     // This check first so that it's easy for branch predictor to optimize
-     // num_probes <= 8 case, making it free of unpredictable branches.
-     if (rem_probes <= 8) {
-       return match_so_far;
-     } else if (!match_so_far) {
-       return false;
-     } else {
-       // Need another iteration. 0xab25f4c1 == golden ratio to the 8th power
-       h2 *= 0xab25f4c1;
-       rem_probes -= 8;
-     }
-   }
-#else
-    for (int i = 0; i < num_probes; ++i) {
-      h2 *= 0x9e3779b9UL;
+  static inline void AddHashPrepared(uint32_t h2, int num_probes,
+                                     char *data_at_cache_line) {
+    uint32_t h = h2;
+    for (int i = 0; i < num_probes; ++i, h *= uint32_t{0x9e3779b9}) {
       // 9-bit address within 512 bit cache line
-      int bitpos = h2 >> (32 - 9);
+      int bitpos = h >> (32 - 9);
+      data_at_cache_line[bitpos >> 3] |= (uint8_t(1) << (bitpos & 7));
+    }
+  }
+
+  static inline void PrepareHashMayMatch(uint32_t h1, uint32_t len_bytes,
+                                         const char *data,
+                                         uint32_t /*out*/ *byte_offset) {
+    uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h1) << 6;
+    PREFETCH(data + bytes_to_cache_line, 0 /* rw */, 1 /* locality */);
+    *byte_offset = bytes_to_cache_line;
+  }
+
+  static inline bool HashMayMatch(uint32_t h1, uint32_t h2, uint32_t len_bytes,
+                                  int num_probes, const char *data) {
+    uint32_t bytes_to_cache_line = fastrange32(len_bytes >> 6, h1) << 6;
+    return HashMayMatchPrepared(h2, num_probes, data + bytes_to_cache_line);
+  }
+
+  static inline bool HashMayMatchPrepared(uint32_t h2, int num_probes,
+                                          const char *data_at_cache_line) {
+    uint32_t h = h2;
+#ifdef HAVE_AVX2
+    int rem_probes = num_probes;
+
+    // Powers of 32-bit golden ratio, mod 2**32.
+    const __m256i multipliers =
+        _mm256_setr_epi32(0x00000001, 0x9e3779b9, 0xe35e67b1, 0x734297e9,
+                          0x35fbe861, 0xdeb7c719, 0x448b211, 0x3459b749);
+
+    for (;;) {
+      // Eight copies of hash
+      __m256i hash_vector = _mm256_set1_epi32(h);
+
+      // Same effect as repeated multiplication by 0x9e3779b9 thanks to
+      // associativity of multiplication.
+      hash_vector = _mm256_mullo_epi32(hash_vector, multipliers);
+
+      // Shift right by 28 bits to get 4-bit addresses of 32-bit values within
+      // a cache line.
+      const __m256i word_addresses = _mm256_srli_epi32(hash_vector, 28);
+
+      // Gather 32-bit values spread over 512 bits by 4-bit address.
+      //
+      // Option 1: AVX2 gather (seems to be a little slow - understandable)
+      // const __m256i value_vector =
+      //     _mm256_i32gather_epi32(static_cast<const int
+      //     *>(data_at_cache_line),
+      //                            word_addresses,
+      //                            /*bytes / i32*/ 4);
+      // END Option 1
+      // Potentially unaligned as we're not *always* cache-aligned -> loadu
+      const __m256i *mm_data =
+          reinterpret_cast<const __m256i *>(data_at_cache_line);
+      __m256i lower = _mm256_loadu_si256(mm_data);
+      __m256i upper = _mm256_loadu_si256(mm_data + 1);
+      // Option 2: AVX512VL permute hack
+      // Only negligibly faster than Option 3, so not yet worth supporting
+      //const __m256i value_vector =
+      //    _mm256_permutex2var_epi32(lower, word_addresses, upper);
+      // END Option 2
+      // Option 3: AVX2 permute+blend hack
+      // Use lowest three bits to order probing values, as if all from same
+      // 256 bit piece.
+      lower = _mm256_permutevar8x32_epi32(lower, word_addresses);
+      upper = _mm256_permutevar8x32_epi32(upper, word_addresses);
+      // Just top 1 bit of address, to select between lower and upper.
+      const __m256i upper_lower_selector = _mm256_srai_epi32(hash_vector, 31);
+      // Finally: the next 8 probed 32-bit values, in probing sequence order.
+      const __m256i value_vector =
+          _mm256_blendv_epi8(lower, upper, upper_lower_selector);
+      // END Option 3
+
+      // We might not need to probe all 8, so build a mask for selecting only
+      // what we need. The k_selector(s) could be pre-computed but that
+      // doesn't seem to make a noticeable performance difference.
+      const __m256i zero_to_seven = _mm256_setr_epi32(0, 1, 2, 3, 4, 5, 6, 7);
+      __m256i k_selector =
+          _mm256_sub_epi32(zero_to_seven, _mm256_set1_epi32(rem_probes));
+      // Keep only high bit; negative after subtract -> use/select
+      k_selector = _mm256_srli_epi32(k_selector, 31);
+
+      // Strip off the 4 bit word address (shift left)
+      __m256i bit_addresses = _mm256_slli_epi32(hash_vector, 4);
+      // And keep only 5-bit (32 - 27) bit-within-32-bit-word addresses.
+      bit_addresses = _mm256_srli_epi32(bit_addresses, 27);
+      // Build a bit mask
+      const __m256i bit_mask = _mm256_sllv_epi32(k_selector, bit_addresses);
+
+      // Like ((~value_vector) & bit_mask) == 0)
+      bool match_so_far = _mm256_testc_si256(value_vector, bit_mask) != 0;
+
+      // This check first so that it's easy for branch predictor to optimize
+      // num_probes <= 8 case, making it free of unpredictable branches.
+      if (rem_probes <= 8) {
+        return match_so_far;
+      } else if (!match_so_far) {
+        return false;
+      } else {
+        // Need another iteration. 0xab25f4c1 == golden ratio to the 8th power
+        h *= 0xab25f4c1;
+        rem_probes -= 8;
+      }
+    }
+#else
+    for (int i = 0; i < num_probes; ++i, h *= uint32_t{0x9e3779b9}) {
+      // 9-bit address within 512 bit cache line
+      int bitpos = h >> (32 - 9);
       if ((data_at_cache_line[bitpos >> 3] & (char(1) << (bitpos & 7))) == 0) {
         return false;
       }
     }
     return true;
 #endif
- }
+  }
 };
 
 }  // namespace rocksdb
