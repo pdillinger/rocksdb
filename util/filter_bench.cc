@@ -332,7 +332,7 @@ void FilterBench::Go() {
   }
 
   std::cout << "----------------------------" << std::endl;
-  std::cout << "Inside queries..." << std::endl;
+  std::cout << "Inside queries (mostly)..." << std::endl;
   for (TestMode tm : testModes) {
     random_.Seed(FLAGS_seed + 1);
     double f = RandomQueryTest(/*inside*/ true, /*dry_run*/ false, tm);
@@ -344,7 +344,7 @@ void FilterBench::Go() {
   std::cout << fp_rate_report_.str();
 
   std::cout << "----------------------------" << std::endl;
-  std::cout << "Outside queries..." << std::endl;
+  std::cout << "Outside queries (mostly)..." << std::endl;
   for (TestMode tm : testModes) {
     random_.Seed(FLAGS_seed + 2);
     double f = RandomQueryTest(/*inside*/ false, /*dry_run*/ false, tm);
@@ -410,6 +410,11 @@ double FilterBench::RandomQueryTest(bool inside, bool dry_run, TestMode mode) {
   rocksdb::StopWatchNano timer(rocksdb::Env::Default(), true);
 
   for (uint64_t q = 0; q < max_queries; q += batch_size) {
+    // We don't want to give too much edge to branch predictors in a synthetic
+    // test, so we need to inject some variability. 1/16 queries will go the
+    // other way.
+    bool inside_this_time = inside ^ ((q & 15) == 15);
+
     uint32_t filter_index;
     if (random_.Next() <= primary_filter_threshold) {
       filter_index = random_.Uniformish(num_primary_filters);
@@ -420,7 +425,7 @@ double FilterBench::RandomQueryTest(bool inside, bool dry_run, TestMode mode) {
     }
     FilterInfo &info = infos_[filter_index];
     for (uint32_t i = 0; i < batch_size; ++i) {
-      if (inside) {
+      if (inside_this_time) {
         batch_slices[i] =
             kms_[i].Get(info.filter_id_, random_.Uniformish(info.keys_added_));
       } else {
@@ -447,7 +452,7 @@ double FilterBench::RandomQueryTest(bool inside, bool dry_run, TestMode mode) {
                                batch_results.get());
       }
       for (uint32_t i = 0; i < batch_size; ++i) {
-        if (inside) {
+        if (inside_this_time) {
           ALWAYS_ASSERT(batch_results[i]);
         } else {
           info.false_positives_ += batch_results[i];
@@ -485,7 +490,7 @@ double FilterBench::RandomQueryTest(bool inside, bool dry_run, TestMode mode) {
             may_match = info.reader_->MayMatch(batch_slices[i]);
           }
         }
-        if (inside) {
+        if (inside_this_time) {
           ALWAYS_ASSERT(may_match);
         } else {
           info.false_positives_ += may_match;
