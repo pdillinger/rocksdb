@@ -157,9 +157,7 @@ class FastLocalBloomBitsBuilder : public FilterBitsBuilder {
     uint32_t num_cache_lines = 0;
     if (bits_per_key_ > 0 && hash_entries_.size() > 0) {
       num_cache_lines = static_cast<uint32_t>(
-          (uint64_t{1} * hash_entries_.size() * bits_per_key_ +
-           511 /*XXX + hash_entries_.size() / 2*/) /
-          512);
+          (uint64_t{1} * hash_entries_.size() * bits_per_key_ + 511) / 512);
     }
     uint32_t len = num_cache_lines * 64;
     uint32_t len_with_metadata = len + 5;
@@ -175,9 +173,13 @@ class FastLocalBloomBitsBuilder : public FilterBitsBuilder {
       }
     }
 
+    // -1 = Marker for newer Bloom implementations
     data[len] = static_cast<char>(-1);
-    data[len + 1] = static_cast<char>(2);
+    // 0 = Marker for this sub-implementation
+    data[len + 1] = static_cast<char>(0);
+    // num_probes (and 0 in upper bits for 64-byte block size)
     data[len + 2] = static_cast<char>(num_probes_);
+    // rest of metadata stays zero
 
     const char* const_data = data;
     buf->reset(const_data);
@@ -196,19 +198,16 @@ class FastLocalBloomBitsBuilder : public FilterBitsBuilder {
   std::vector<uint64_t> hash_entries_;
 };
 
-class FastLocalFilterBitsReader : public FilterBitsReader {
+class FastLocalBloomBitsReader : public FilterBitsReader {
  public:
-  FastLocalFilterBitsReader(const char* data,
-    int num_probes,
-    uint32_t len_bytes)
-    : data_(data), num_probes_(num_probes), len_bytes_(len_bytes) {
-    }
+  FastLocalBloomBitsReader(const char* data, int num_probes, uint32_t len_bytes)
+      : data_(data), num_probes_(num_probes), len_bytes_(len_bytes) {}
 
   // No Copy allowed
-  FastLocalFilterBitsReader(const FastLocalFilterBitsReader&) = delete;
-  void operator=(const FastLocalFilterBitsReader&) = delete;
+  FastLocalBloomBitsReader(const FastLocalBloomBitsReader&) = delete;
+  void operator=(const FastLocalBloomBitsReader&) = delete;
 
-  ~FastLocalFilterBitsReader() override {}
+  ~FastLocalBloomBitsReader() override {}
 
   bool MayMatch(const Slice& key) override {
     uint64_t h = BloomHash64(key);
@@ -243,7 +242,6 @@ class FastLocalFilterBitsReader : public FilterBitsReader {
   const int num_probes_;
   const uint32_t len_bytes_;
 };
-
 
 class AlwaysTrueFilter : public FilterBitsReader {
  public:
@@ -399,14 +397,8 @@ class BloomFilterPolicy : public FilterPolicy {
       // Note: < 0 (or unsigned > 127) indicate special new implementations
       // (or reserved for future use)
       if (raw_num_probes == -1) {
-        // Marker for new Bloom implementations
-        // Read more metadata
-        char raw_locality_val = contents.data()[len_with_meta - 4];
-        raw_num_probes = contents.data()[len_with_meta - 3];
-        uint32_t len = len_with_meta - 5;
-        if (raw_locality_val == 2 && raw_num_probes > 0 && raw_num_probes <= 30) {
-          return new FastLocalFilterBitsReader(contents.data(), raw_num_probes, len);
-        }
+        // Marker for newer Bloom implementations
+        return GetBloomBitsReader(contents);
       }
       // otherwise
       // Treat as zero probes (always FP) for now.
@@ -463,6 +455,51 @@ class BloomFilterPolicy : public FilterPolicy {
     num_probes_ = static_cast<int>(bits_per_key_ * 0.69);  // 0.69 =~ ln(2)
     if (num_probes_ < 1) num_probes_ = 1;
     if (num_probes_ > 30) num_probes_ = 30;
+  }
+
+  // For newer Bloom filter implementations
+  FilterBitsReader* GetBloomBitsReader(const Slice& contents) const {
+    uint32_t len_with_meta = static_cast<uint32_t>(contents.size());
+
+    uint32_t len = len_with_meta - 5;
+    assert(len > 0);  // precondition
+
+    // Read more metadata
+    char sub_impl_val = contents.data()[len_with_meta - 4];
+    // 0: FastLocalBloom
+    // other: reserved
+
+    char block_and_probes = contents.data()[len_with_meta - 3];
+    int log2_block_bytes = ((block_and_probes >> 5) & 7) + 5;
+    // 0 in top 3 bits -> 5 -> 64-byte (Intel cache line)
+    // reserved:
+    // 1 in top 3 bits -> 6 -> 128-byte
+    // 2 in top 3 bits -> 7 -> 256-byte
+    // ...
+
+    int num_probes = (block_and_probes & 31);
+    // num_probes in bottom 5 bits, except 0 and 31 reserved
+
+    if (num_probes < 1 || num_probes > 30) {
+      // Reserved / future safe
+      return new AlwaysTrueFilter();
+    }
+
+    uint16_t rest = DecodeFixed16(contents.data() + len_with_meta - 2);
+    if (rest != 0) {
+      // Reserved, possible for hash seed
+      // Future safe
+      return new AlwaysTrueFilter();
+    }
+
+    if (sub_impl_val == 0) {        // FastLocalBloom
+      if (log2_block_bytes == 5) {  // Only block size supported for now
+        return new FastLocalBloomBitsReader(contents.data(), num_probes, len);
+      }
+    }
+    // otherwise
+    // Reserved / future safe
+    return new AlwaysTrueFilter();
   }
 };
 

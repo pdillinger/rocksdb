@@ -296,7 +296,7 @@ public:
        h2 *= 0xab25f4c1;
        rem_probes -= 8;
      }
-    }
+   }
 #else
     for (int i = 0; i < num_probes; ++i) {
       h2 *= 0x9e3779b9UL;
