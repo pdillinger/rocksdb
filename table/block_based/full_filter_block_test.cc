@@ -206,24 +206,24 @@ TEST_F(FullFilterBlockTest, DuplicateEntries) {
   {  // empty prefixes
     std::unique_ptr<const SliceTransform> prefix_extractor(
         NewFixedPrefixTransform(0));
-    const bool WHOLE_KEY = true;
-    FullFilterBlockBuilder builder(prefix_extractor.get(), WHOLE_KEY,
-                                   table_options_.filter_policy->GetFilterBitsBuilder());
-    ASSERT_EQ(0, builder.NumAdded());
-    builder.Add("key");  // test with empty prefix
-
     auto bits_builder = dynamic_cast<FullFilterBitsBuilder*>(
         table_options_.filter_policy->GetFilterBitsBuilder());
-    ASSERT_TRUE(bits_builder != nullptr);
+    const bool WHOLE_KEY = true;
+    FullFilterBlockBuilder builder(prefix_extractor.get(), WHOLE_KEY,
+                                   bits_builder);
+    ASSERT_EQ(0, builder.NumAdded());
+    builder.Add("key");  // test with empty prefix
     ASSERT_EQ(2, bits_builder->hash_entries_.size());
   }
 
   // mix of empty and non-empty
   std::unique_ptr<const SliceTransform> prefix_extractor(
       NewFixedPrefixTransform(7));
+  auto bits_builder = dynamic_cast<FullFilterBitsBuilder*>(
+      table_options_.filter_policy->GetFilterBitsBuilder());
   const bool WHOLE_KEY = true;
   FullFilterBlockBuilder builder(prefix_extractor.get(), WHOLE_KEY,
-                                 table_options_.filter_policy->GetFilterBitsBuilder());
+                                 bits_builder);
   ASSERT_EQ(0, builder.NumAdded());
   builder.Add("");  // test with empty key too
   builder.Add("prefix1key1");
@@ -231,10 +231,6 @@ TEST_F(FullFilterBlockTest, DuplicateEntries) {
   builder.Add("prefix1key2");
   builder.Add("prefix1key3");
   builder.Add("prefix2key4");
-
-  auto bits_builder = dynamic_cast<FullFilterBitsBuilder*>(
-      table_options_.filter_policy->GetFilterBitsBuilder());
-  ASSERT_TRUE(bits_builder != nullptr);
   // two prefix adn 4 keys
   ASSERT_EQ(1 + 2 + 4, bits_builder->hash_entries_.size());
 }
