@@ -22,24 +22,42 @@ namespace rocksdb {
 // The hash results are thus applicable to change. (Thus, it rarely makes
 // sense to specify a seed for this function.)
 inline uint64_t NPHash64(const char* data, size_t n, uint32_t seed = 0) {
-  // XXH3 currently experimental, but generally faster than other quality
+  // XXH3 currently preview, but generally faster than other quality
   // 64-bit hash functions.
   return XXH3p_64bits_withSeed(data, n, seed);
 }
 
 extern uint32_t Hash(const char* data, size_t n, uint32_t seed);
 
+inline uint64_t Hash64(const char* data, size_t n, uint64_t seed) {
+  // We are standardizing on a preview release of XXH3, because that's the
+  // best available at time of standardizing.
+  return XXH3p_64bits_withSeed(data, n, seed);
+}
+
+// TODO: consider rename to LegacyBloomHash
 inline uint32_t BloomHash(const Slice& key) {
   return Hash(key.data(), key.size(), 0xbc9f1d34);
+}
+
+inline uint64_t GetSliceHash64(const Slice& key) {
+  return Hash64(key.data(), key.size(), 0);
 }
 
 inline uint64_t GetSliceNPHash64(const Slice& s) {
   return NPHash64(s.data(), s.size());
 }
 
+// TODO: consider rename to GetSliceHash32
 inline uint32_t GetSliceHash(const Slice& s) {
   return Hash(s.data(), s.size(), 397);
 }
+
+// Useful for splitting up a 64-bit hash
+inline uint32_t Upper32of64(uint64_t v) {
+  return static_cast<uint32_t>(v >> 32);
+}
+inline uint32_t Lower32of64(uint64_t v) { return static_cast<uint32_t>(v); }
 
 // std::hash compatible interface.
 struct SliceHasher {

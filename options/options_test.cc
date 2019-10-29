@@ -535,6 +535,7 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
   ASSERT_EQ(new_opt.block_size_deviation, 8);
   ASSERT_EQ(new_opt.block_restart_interval, 4);
   ASSERT_TRUE(new_opt.filter_policy != nullptr);
+  ASSERT_EQ(new_opt.filter_policy->AsOptionString(), "bloomfilter:4:true");
 
   // unknown option
   ASSERT_NOK(GetBlockBasedTableOptionsFromString(table_opt,
@@ -561,22 +562,31 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
             new_opt.cache_index_and_filter_blocks);
   ASSERT_EQ(table_opt.index_type, new_opt.index_type);
 
+  // more valid filter policies
+  ASSERT_OK(GetBlockBasedTableOptionsFromString(
+      table_opt, "filter_policy=bloomfilter:1:false", &new_opt));
+  ASSERT_TRUE(new_opt.filter_policy != nullptr);
+  ASSERT_EQ(new_opt.filter_policy->AsOptionString(), "bloomfilter:1:false");
+
+  ASSERT_OK(GetBlockBasedTableOptionsFromString(
+      table_opt, "filter_policy=fastlocalbloom:12", &new_opt));
+  ASSERT_TRUE(new_opt.filter_policy != nullptr);
+  ASSERT_EQ(new_opt.filter_policy->AsOptionString(), "fastlocalbloom:12");
+
   // unrecognized filter policy name
   ASSERT_NOK(GetBlockBasedTableOptionsFromString(table_opt,
-             "cache_index_and_filter_blocks=1;"
              "filter_policy=bloomfilterxx:4:true",
              &new_opt));
-  ASSERT_EQ(table_opt.cache_index_and_filter_blocks,
-            new_opt.cache_index_and_filter_blocks);
   ASSERT_EQ(table_opt.filter_policy, new_opt.filter_policy);
 
   // unrecognized filter policy config
   ASSERT_NOK(GetBlockBasedTableOptionsFromString(table_opt,
-             "cache_index_and_filter_blocks=1;"
              "filter_policy=bloomfilter:4",
              &new_opt));
-  ASSERT_EQ(table_opt.cache_index_and_filter_blocks,
-            new_opt.cache_index_and_filter_blocks);
+  ASSERT_EQ(table_opt.filter_policy, new_opt.filter_policy);
+
+  ASSERT_NOK(GetBlockBasedTableOptionsFromString(
+      table_opt, "filter_policy=fastlocalbloom:4:true", &new_opt));
   ASSERT_EQ(table_opt.filter_policy, new_opt.filter_policy);
 
   // Check block cache options are overwritten when specified

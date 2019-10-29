@@ -502,20 +502,35 @@ std::string ParseBlockBasedTableOption(const std::string& name,
     } else if (name == "filter_policy") {
       // Expect the following format
       // bloomfilter:int:bool
-      const std::string kName = "bloomfilter:";
-      if (value.compare(0, kName.size(), kName) != 0) {
-        return "Invalid filter policy name";
-      }
-      size_t pos = value.find(':', kName.size());
-      if (pos == std::string::npos) {
+      // or
+      // fastlocalbloom:int
+      size_t first_colon = value.find(':');
+      if (first_colon == std::string::npos) {
         return "Invalid filter policy config, missing bits_per_key";
       }
+      std::string policy_name = value.substr(0, first_colon);
+
+      size_t second_colon = value.find(':', first_colon + 1);
       int bits_per_key =
-          ParseInt(trim(value.substr(kName.size(), pos - kName.size())));
-      bool use_block_based_builder =
-          ParseBoolean("use_block_based_builder", trim(value.substr(pos + 1)));
-      new_options->filter_policy.reset(
-          NewBloomFilterPolicy(bits_per_key, use_block_based_builder));
+          ParseInt(trim(value.substr(first_colon + 1, second_colon)));
+
+      if (policy_name == "bloomfilter") {
+        if (second_colon == std::string::npos) {
+          return "Invalid filter policy config, missing bool";
+        }
+        bool use_block_based_builder = ParseBoolean(
+            "use_block_based_builder", trim(value.substr(second_colon + 1)));
+        new_options->filter_policy.reset(
+            NewBloomFilterPolicy(bits_per_key, use_block_based_builder));
+      } else if (policy_name == "fastlocalbloom") {
+        if (second_colon != std::string::npos) {
+          return "Invalid filter policy config, extra argument";
+        }
+        new_options->filter_policy.reset(
+            NewFastLocalBloomFilterPolicy(bits_per_key));
+      } else {
+        return "Invalid filter policy name";
+      }
       return "";
     }
   }

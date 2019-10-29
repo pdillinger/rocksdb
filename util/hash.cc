@@ -15,7 +15,9 @@
 namespace rocksdb {
 
 uint32_t Hash(const char* data, size_t n, uint32_t seed) {
-  // Similar to murmur hash
+  // MurmurHash1 - fast but mediocre quality
+  // https://github.com/aappleby/smhasher/wiki/MurmurHash1
+  //
   const uint32_t m = 0xc6a4a793;
   const uint32_t r = 24;
   const char* limit = data + n;

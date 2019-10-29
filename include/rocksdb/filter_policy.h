@@ -131,6 +131,11 @@ class FilterPolicy {
       const Slice& /*contents*/) const {
     return nullptr;
   }
+
+  // For built-in filter policy, this generates an option string
+  // understood by GetBlockBasedTableOptionsFromString, or empty
+  // string if this is not a built-in filter policy.
+  virtual std::string AsOptionString() const { return std::string(); }
 };
 
 // Return a new filter policy that uses a bloom filter with approximately
@@ -153,4 +158,13 @@ class FilterPolicy {
 // trailing spaces in keys.
 extern const FilterPolicy* NewBloomFilterPolicy(
     int bits_per_key, bool use_block_based_builder = false);
+
+// Like NewBloomFilterPolicy but uses a newer Bloom filter
+// implementation that is almost universally faster and more accurate.
+// Compatible with full or partitioned filters.
+//
+// Higher peak memory use during filter construction is possible due to
+// using 64-bit hashes rather than 32-bit. (64-bit hashes enable
+// accurate scaling to millions of keys in a single filter.)
+extern const FilterPolicy* NewFastLocalBloomFilterPolicy(int bits_per_key);
 }  // namespace rocksdb

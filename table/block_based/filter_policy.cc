@@ -186,6 +186,113 @@ inline void FullFilterBitsBuilder::AddHash(uint32_t h, char* data,
                                 folly::constexpr_log2(CACHE_LINE_SIZE));
 }
 
+// See description in FastLocalBloomImpl
+class FastLocalBloomBitsBuilder : public FilterBitsBuilder {
+ public:
+  FastLocalBloomBitsBuilder(const int bits_per_key, const int num_probes)
+      : bits_per_key_(bits_per_key), num_probes_(num_probes) {
+    assert(bits_per_key_);
+  }
+
+  // No Copy allowed
+  FastLocalBloomBitsBuilder(const FastLocalBloomBitsBuilder&) = delete;
+  void operator=(const FastLocalBloomBitsBuilder&) = delete;
+
+  ~FastLocalBloomBitsBuilder() {}
+
+  virtual void AddKey(const Slice& key) override {
+    uint64_t hash = GetSliceHash64(key);
+    if (hash_entries_.size() == 0 || hash != hash_entries_.back()) {
+      hash_entries_.push_back(hash);
+    }
+  }
+
+  virtual Slice Finish(std::unique_ptr<const char[]>* buf) override {
+    uint32_t num_cache_lines = 0;
+    if (bits_per_key_ > 0 && hash_entries_.size() > 0) {
+      num_cache_lines = static_cast<uint32_t>(
+          (uint64_t{1} * hash_entries_.size() * bits_per_key_ + 511) / 512);
+    }
+    uint32_t len = num_cache_lines * 64;
+    uint32_t len_with_metadata = len + 5;
+    char* data = new char[len_with_metadata];
+    memset(data, 0, len_with_metadata);
+    assert(data);
+
+    if (len > 0) {
+      for (auto h : hash_entries_) {
+        FastLocalBloomImpl::AddHash(Lower32of64(h), Upper32of64(h), len,
+                                    num_probes_, data);
+      }
+    }
+
+    // -1 = Marker for newer Bloom implementations
+    data[len] = static_cast<char>(-1);
+    // 0 = Marker for this sub-implementation
+    data[len + 1] = static_cast<char>(0);
+    // num_probes (and 0 in upper bits for 64-byte block size)
+    data[len + 2] = static_cast<char>(num_probes_);
+    // rest of metadata stays zero
+
+    const char* const_data = data;
+    buf->reset(const_data);
+    hash_entries_.clear();
+
+    return Slice(data, len_with_metadata);
+  }
+
+  int CalculateNumEntry(const uint32_t bytes) override {
+    return static_cast<int>(uint64_t(8) * bytes / bits_per_key_);
+  }
+
+ private:
+  int bits_per_key_;
+  int num_probes_;
+  std::vector<uint64_t> hash_entries_;
+};
+
+// See description in FastLocalBloomImpl
+class FastLocalBloomBitsReader : public FilterBitsReader {
+ public:
+  FastLocalBloomBitsReader(const char* data, int num_probes, uint32_t len_bytes)
+      : data_(data), num_probes_(num_probes), len_bytes_(len_bytes) {}
+
+  // No Copy allowed
+  FastLocalBloomBitsReader(const FastLocalBloomBitsReader&) = delete;
+  void operator=(const FastLocalBloomBitsReader&) = delete;
+
+  ~FastLocalBloomBitsReader() override {}
+
+  bool MayMatch(const Slice& key) override {
+    uint64_t h = GetSliceHash64(key);
+    uint32_t byte_offset;
+    FastLocalBloomImpl::PrepareHashMayMatch(Lower32of64(h), len_bytes_, data_,
+                                            /*out*/ &byte_offset);
+    return FastLocalBloomImpl::HashMayMatchPrepared(Upper32of64(h), num_probes_,
+                                                    data_ + byte_offset);
+  }
+
+  virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
+    uint32_t hashes[MultiGetContext::MAX_BATCH_SIZE];
+    uint32_t byte_offsets[MultiGetContext::MAX_BATCH_SIZE];
+    for (int i = 0; i < num_keys; ++i) {
+      uint64_t h = GetSliceHash64(*keys[i]);
+      FastLocalBloomImpl::PrepareHashMayMatch(Lower32of64(h), len_bytes_, data_,
+                                              /*out*/ &byte_offsets[i]);
+      hashes[i] = Upper32of64(h);
+    }
+    for (int i = 0; i < num_keys; ++i) {
+      may_match[i] = FastLocalBloomImpl::HashMayMatchPrepared(
+          hashes[i], num_probes_, data_ + byte_offsets[i]);
+    }
+  }
+
+ private:
+  const char* data_;
+  const int num_probes_;
+  const uint32_t len_bytes_;
+};
+
 class AlwaysTrueFilter : public FilterBitsReader {
  public:
   bool MayMatch(const Slice&) override { return true; }
@@ -255,6 +362,7 @@ class FullFilterBitsReader : public FilterBitsReader {
 const std::vector<BloomFilterPolicy::Impl> BloomFilterPolicy::kAllImpls = {
     kFull,
     kBlock,
+    kFastLocalBloom,
 };
 
 BloomFilterPolicy::BloomFilterPolicy(int bits_per_key, Impl impl)
@@ -321,11 +429,14 @@ bool BloomFilterPolicy::KeyMayMatch(const Slice& key,
 }
 
 FilterBitsBuilder* BloomFilterPolicy::GetFilterBitsBuilder() const {
-  if (impl_ == kBlock) {
-    return nullptr;
-  } else {
-    return new FullFilterBitsBuilder(bits_per_key_, num_probes_);
+  switch (impl_) {
+    case kBlock:
+      return nullptr;
+    case kFastLocalBloom:
+      return new FastLocalBloomBitsBuilder(bits_per_key_, num_probes_);
+    case kFull:;  // default / fall through
   }
+  return new FullFilterBitsBuilder(bits_per_key_, num_probes_);
 }
 
 // Read metadata to determine what kind of FilterBitsReader is needed
@@ -345,8 +456,14 @@ FilterBitsReader* BloomFilterPolicy::GetFilterBitsReader(
   // limbo with FullFilterBitsReader for now.
 
   if (raw_num_probes < 1) {
+    // Note: < 0 (or unsigned > 127) indicate special new implementations
+    // (or reserved for future use)
+    if (raw_num_probes == -1) {
+      // Marker for newer Bloom implementations
+      return GetBloomBitsReader(contents);
+    }
+    // otherwise
     // Treat as zero probes (always FP) for now.
-    // NB: < 0 (or unsigned > 127) effectively reserved for future use.
     return new AlwaysTrueFilter();
   }
   // else attempt decode for FullFilterBitsReader
@@ -385,6 +502,69 @@ FilterBitsReader* BloomFilterPolicy::GetFilterBitsReader(
                                   log2_cache_line_size);
 }
 
+// For newer Bloom filter implementations
+FilterBitsReader* BloomFilterPolicy::GetBloomBitsReader(
+    const Slice& contents) const {
+  uint32_t len_with_meta = static_cast<uint32_t>(contents.size());
+  uint32_t len = len_with_meta - 5;
+
+  assert(len > 0);  // precondition
+
+  // Read more metadata
+  char sub_impl_val = contents.data()[len_with_meta - 4];
+  // 0: FastLocalBloom
+  // other: reserved
+
+  char block_and_probes = contents.data()[len_with_meta - 3];
+  int log2_block_bytes = ((block_and_probes >> 5) & 7) + 6;
+  // 0 in top 3 bits -> 6 -> 64-byte (Intel cache line)
+  // reserved:
+  // 1 in top 3 bits -> 7 -> 128-byte
+  // 2 in top 3 bits -> 8 -> 256-byte
+  // ...
+
+  int num_probes = (block_and_probes & 31);
+  // num_probes in bottom 5 bits, except 0 and 31 reserved
+
+  if (num_probes < 1 || num_probes > 30) {
+    // Reserved / future safe
+    return new AlwaysTrueFilter();
+  }
+
+  uint16_t rest = DecodeFixed16(contents.data() + len_with_meta - 2);
+  if (rest != 0) {
+    // Reserved, possibly for hash seed
+    // Future safe
+    return new AlwaysTrueFilter();
+  }
+
+  if (sub_impl_val == 0) {        // FastLocalBloom
+    if (log2_block_bytes == 6) {  // Only block size supported for now
+      return new FastLocalBloomBitsReader(contents.data(), num_probes, len);
+    }
+  }
+  // otherwise
+  // Reserved / future safe
+  return new AlwaysTrueFilter();
+}
+
+std::string BloomFilterPolicy::AsOptionString() const {
+  std::string rv;
+  if (impl_ == kFastLocalBloom) {
+    rv.append("fastlocalbloom");
+  } else {
+    rv.append("bloomfilter");
+  }
+  rv.append(":");
+  rv.append(std::to_string(bits_per_key_));
+  if (impl_ == kBlock) {
+    rv.append(":true");
+  } else if (impl_ == kFull) {
+    rv.append(":false");
+  }
+  return rv;
+}
+
 const FilterPolicy* NewBloomFilterPolicy(int bits_per_key,
                                          bool use_block_based_builder) {
   if (use_block_based_builder) {
@@ -392,6 +572,11 @@ const FilterPolicy* NewBloomFilterPolicy(int bits_per_key,
   } else {
     return new BloomFilterPolicy(bits_per_key, BloomFilterPolicy::kFull);
   }
+}
+
+const FilterPolicy* NewFastLocalBloomFilterPolicy(int bits_per_key) {
+  return new BloomFilterPolicy(bits_per_key,
+                               BloomFilterPolicy::kFastLocalBloom);
 }
 
 FilterPolicy::~FilterPolicy() { }

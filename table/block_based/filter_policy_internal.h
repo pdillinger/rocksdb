@@ -45,6 +45,9 @@ class BloomFilterPolicy : public FilterPolicy {
     // Deprecated block-based Bloom filter implementation.
     // Set to 1 in case of value confusion with bool use_block_based_builder
     kBlock = 1,
+    // A fast, cache-local Bloom filter implementation. See description in
+    // FastLocalBloomImpl.
+    kFastLocalBloom = 2,
   };
   static const std::vector<Impl> kAllImpls;
 
@@ -68,11 +71,16 @@ class BloomFilterPolicy : public FilterPolicy {
   // chosen for this BloomFilterPolicy. Not compatible with CreateFilter.
   FilterBitsReader* GetFilterBitsReader(const Slice& contents) const override;
 
+  std::string AsOptionString() const override;
+
  private:
   int bits_per_key_;
   int num_probes_;
   // Selected implementation for building new SST filters
   Impl impl_;
+
+  // For newer Bloom filter implementation(s)
+  FilterBitsReader* GetBloomBitsReader(const Slice& contents) const;
 };
 
 }  // namespace rocksdb
