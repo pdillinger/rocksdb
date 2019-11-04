@@ -20,6 +20,14 @@
 #include "util/coding.h"
 #include "util/hash.h"
 
+#ifdef HAVE_POPCNT
+#include <x86intrin.h>
+#endif
+#if defined(HAVE_AVX2) || defined(HAVE_BMI2)
+#include <immintrin.h>
+#endif
+// git diff 1d4b2632ee7a8b36383ef9b3b814d722c203022b..new-filters
+
 namespace rocksdb {
 
 namespace {
