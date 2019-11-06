@@ -353,6 +353,7 @@ class FullBloomTest : public testing::TestWithParam<BloomFilterPolicy::Mode> {
     switch (GetParam()) {
       case BloomFilterPolicy::kLegacyBloom:
         return for_legacy_bloom;
+      case BloomFilterPolicy::kLocalHybrid: // TODO
       case BloomFilterPolicy::kFastLocalBloom:
         return for_fast_local_bloom;
       case BloomFilterPolicy::kDeprecatedBlock:
