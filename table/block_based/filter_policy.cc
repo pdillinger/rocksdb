@@ -357,6 +357,9 @@ class FastLocalBloomBitsReader : public FilterBitsReader {
 
 class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
  public:
+  static constexpr uint32_t kCacheLineBits = 1024;
+  static constexpr uint32_t kCacheLineBytes = kCacheLineBits / 8;
+
   LocalHybridBitsBuilder(const int bits_per_key)
       : bits_per_key_(bits_per_key) {
     assert(bits_per_key_);
@@ -411,9 +414,9 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
     uint32_t num_cache_lines = 0;
     if (bits_per_key_ > 0 && num_entry > 0) {
       num_cache_lines = static_cast<uint32_t>(
-          (int64_t{num_entry} * bits_per_key_ + 511) / 512);
+          (static_cast<uint64_t>(int64_t{num_entry} * bits_per_key_) + kCacheLineBits - 1) / kCacheLineBits);
     }
-    return num_cache_lines * 64 + /*metadata*/ 5;
+    return num_cache_lines * kCacheLineBytes + /*metadata*/ 5;
   }
 
  private:
@@ -421,7 +424,7 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
     // Too slow:
     //std::sort(hash_entries_.begin(), hash_entries_.end());
 
-    const uint32_t num_cache_lines = len / 64;
+    const uint32_t num_cache_lines = len / kCacheLineBytes;
 
     // Partition into buckets with temporary allocation
     // (Fast enough for now; could save temp space with counting sort)
@@ -433,18 +436,16 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
     }
     double fp_rate_sum = 0;
     for (uint32_t i = 0; i < num_cache_lines; ++i) {
-      BuildCacheLine(data + (i << 6), buckets[i].begin(), buckets[i].end(), &fp_rate_sum);
+      BuildCacheLine(data + (i * kCacheLineBytes), buckets[i].begin(), buckets[i].end(), &fp_rate_sum);
     }
     fprintf(stderr, "Filter FP rate: %g\n", fp_rate_sum / num_cache_lines);
   }
 
   void BuildCacheLine(char *data_at_cache_line, std::vector<uint32_t>::iterator begin, std::vector<uint32_t>::iterator end, double *fp_rate_sum) const {
     const uint32_t count = static_cast<uint32_t>(end - begin);
-    double fp_rate = std::pow(1.0 - exp(-4.0 * count / 512), 4.0); // bloom rate
+    double fp_rate = std::pow(1.0 - exp(-4.0 * count / kCacheLineBits), 4.0); // bloom rate
 
-    // Support encoded count 19..82
-    // This also means min entry size is ?
-    if (count > 82) {
+    if (count * 6u > (kCacheLineBits - 8u)) {
       *fp_rate_sum += fp_rate;
       fprintf(stderr, "Cache line FP rate: %g (bloom %u)\n", fp_rate, count);
       BuildBloomCacheLine(data_at_cache_line, begin, end);
@@ -453,54 +454,43 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
 
     std::sort(begin, end);
 
-    double rcount = std::min(count, 19u);
+    uint32_t range = static_cast<uint32_t>((uint64_t{std::max(count, (kCacheLineBits - 8u + 25u) / 26u)} << 25) * 0.75);
     std::vector<uint32_t> vals;
-    uint32_t range;
-    int entry_bits;
-    //uint32_t mask;
+    uint32_t unary_bits = 0;
 
-    for (;;) {
-      range = static_cast<uint32_t>(std::pow(2.0, 504.0 / rcount - 1.2) * rcount);
-      entry_bits = static_cast<uint32_t>(504.0 / rcount - 1.2);
-      //mask = (uint32_t{1} << entry_bits) - 1;
-
-      uint32_t unary_bits = 0;
-
-      vals.clear();
-      uint32_t prev = 0;
-      for (auto it = begin; it != end; ++it) {
-        uint32_t val = fastrange32(*it, range);
-        if (val != prev) {
-          assert(val > prev);
-          uint32_t diff = val - prev;
-          vals.push_back(val);
-
-          unary_bits += 1 + (diff >> entry_bits);
-          prev = val;
-        }
-      }
-
-      if (count /*vs. vals.size()*/ * entry_bits + unary_bits <= 504) {
-        // We can encode
-        fp_rate = 1.0 * count / range;
-        *fp_rate_sum += fp_rate;
-        fprintf(stderr, "Cache line FP rate: %g (rice %u, %lu uniq, %g rcount, %d entry_bit, %g avg unary, %u bits waste)\n", fp_rate, count, vals.size(), rcount, entry_bits, 1.0 * unary_bits / count, 504u - static_cast<uint32_t>(vals.size()) * entry_bits - unary_bits);
-        break;
-      }
-      // else
-      rcount += 0.25;
-      if (rcount > 82) {
-        // No more tries; fall back on Bloom
-        *fp_rate_sum += fp_rate;
-        fprintf(stderr, "Cache line FP rate: %g (bloom %u)\n", fp_rate, count);
-        BuildBloomCacheLine(data_at_cache_line, begin, end);
-        return;
-      }
-      // else try again
+    uint32_t prev = 0;
+    for (auto it = begin; it != end; ++it) {
+      uint32_t val = fastrange32(*it, range);
+      assert(val >= prev);
+      vals.push_back(val);
+      uint32_t diff = (val >> 20) - (prev >> 20);
+      unary_bits += 1u + (diff >> 4);
+      prev = val;
     }
 
-    // TODO/FIXME
+    fprintf(stderr, "Rice count %u, unary_bits/count %g\n", count, (double)unary_bits / vals.size());
+
+    uint32_t rem_bits = (kCacheLineBits - 8u) - ((unary_bits + 1u) & ~1u);
+    uint32_t base_entry_bits = rem_bits / count;
+    uint32_t extra_entry_bits;
+    if (base_entry_bits >= 24u) {
+      base_entry_bits = 24u;
+      extra_entry_bits = 0;
+      fp_rate = 0;
+    } else {
+      extra_entry_bits = rem_bits % count;
+      fp_rate = 1.0 * extra_entry_bits / (range >> (24u - base_entry_bits - 1u));
+    }
+    fp_rate += 1.0 * (count - extra_entry_bits) / (range >> (24u - base_entry_bits));
+    *fp_rate_sum += fp_rate;
+    fprintf(stderr, "Cache line FP rate: %g\n", fp_rate);
+    /*
+    // No more tries; fall back on Bloom
+    *fp_rate_sum += fp_rate;
+    fprintf(stderr, "Cache line FP rate: %g (bloom %u)\n", fp_rate, count);
+    */
     BuildBloomCacheLine(data_at_cache_line, begin, end);
+    // TODO/FIXME
     /*
     // A "before" bit index (append after)
     int unary_bit_ptr = 0;
