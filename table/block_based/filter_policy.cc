@@ -355,6 +355,230 @@ class FastLocalBloomBitsReader : public FilterBitsReader {
   const uint32_t len_bytes_;
 };
 
+class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
+ public:
+  LocalHybridBitsBuilder(const int bits_per_key)
+      : bits_per_key_(bits_per_key) {
+    assert(bits_per_key_);
+  }
+
+  // No Copy allowed
+  LocalHybridBitsBuilder(const LocalHybridBitsBuilder&) = delete;
+  void operator=(const LocalHybridBitsBuilder&) = delete;
+
+  ~LocalHybridBitsBuilder() override {}
+
+  virtual void AddKey(const Slice& key) override {
+    uint64_t hash = GetSliceHash64(key);
+    if (hash_entries_.size() == 0 || hash != hash_entries_.back()) {
+      hash_entries_.push_back(hash);
+    }
+  }
+
+  virtual Slice Finish(std::unique_ptr<const char[]>* buf) override {
+    uint32_t len_with_metadata =
+        CalculateSpace(static_cast<uint32_t>(hash_entries_.size()));
+    char* data = new char[len_with_metadata];
+    memset(data, 0, len_with_metadata);
+
+    assert(data);
+    assert(len_with_metadata >= 5);
+
+    uint32_t len = len_with_metadata - 5;
+    if (len > 0) {
+      AddAllEntries(data, len);
+    }
+
+    // -2 = Marker for local hybrid filter implementation
+    data[len] = static_cast<char>(-2);
+    // 0 = Marker for this sub-implementation
+    data[len + 1] = static_cast<char>(0);
+    // rest of metadata stays zero (TODO: use for seed)
+
+    const char* const_data = data;
+    buf->reset(const_data);
+    hash_entries_.clear();
+
+    return Slice(data, len_with_metadata);
+  }
+
+  int CalculateNumEntry(const uint32_t bytes) override {
+    uint32_t bytes_no_meta = bytes >= 5u ? bytes - 5u : 0;
+    return static_cast<int>(uint64_t{8} * bytes_no_meta / bits_per_key_);
+  }
+
+  uint32_t CalculateSpace(const int num_entry) override {
+    uint32_t num_cache_lines = 0;
+    if (bits_per_key_ > 0 && num_entry > 0) {
+      num_cache_lines = static_cast<uint32_t>(
+          (int64_t{num_entry} * bits_per_key_ + 511) / 512);
+    }
+    return num_cache_lines * 64 + /*metadata*/ 5;
+  }
+
+ private:
+  void AddAllEntries(char* data, uint32_t len) const {
+    // Too slow:
+    //std::sort(hash_entries_.begin(), hash_entries_.end());
+
+    const uint32_t num_cache_lines = len / 64;
+
+    // Partition into buckets with temporary allocation
+    // (Fast enough for now; could save temp space with counting sort)
+    std::unique_ptr<std::vector<uint32_t>[]> buckets(new std::vector<uint32_t>[num_cache_lines]);
+    for (size_t i = 0; i < hash_entries_.size(); ++i) {
+      uint32_t cache_line = fastrange32(Lower32of64(hash_entries_[i]), num_cache_lines);
+      //fprintf(stderr, "Preparing hash %x on cache line %d\n", hash_entries_[i], cache_line);
+      buckets[cache_line].push_back(Upper32of64(hash_entries_[i]));
+    }
+    double fp_rate_sum = 0;
+    for (uint32_t i = 0; i < num_cache_lines; ++i) {
+      BuildCacheLine(data + (i << 6), buckets[i].begin(), buckets[i].end(), &fp_rate_sum);
+    }
+    fprintf(stderr, "Filter FP rate: %g\n", fp_rate_sum / num_cache_lines);
+  }
+
+  void BuildCacheLine(char *data_at_cache_line, std::vector<uint32_t>::iterator begin, std::vector<uint32_t>::iterator end, double *fp_rate_sum) const {
+    const uint32_t count = static_cast<uint32_t>(end - begin);
+    double fp_rate = std::pow(1.0 - exp(-4.0 * count / 512), 4.0); // bloom rate
+
+    // Support encoded count 19..82
+    // This also means min entry size is ?
+    if (count > 82) {
+      *fp_rate_sum += fp_rate;
+      fprintf(stderr, "Cache line FP rate: %g (bloom %u)\n", fp_rate, count);
+      BuildBloomCacheLine(data_at_cache_line, begin, end);
+      return;
+    }
+
+    std::sort(begin, end);
+
+    double rcount = std::min(count, 19u);
+    std::vector<uint32_t> vals;
+    uint32_t range;
+    int entry_bits;
+    //uint32_t mask;
+
+    for (;;) {
+      range = static_cast<uint32_t>(std::pow(2.0, 504.0 / rcount - 1.2) * rcount);
+      entry_bits = static_cast<uint32_t>(504.0 / rcount - 1.2);
+      //mask = (uint32_t{1} << entry_bits) - 1;
+
+      uint32_t unary_bits = 0;
+
+      vals.clear();
+      uint32_t prev = 0;
+      for (auto it = begin; it != end; ++it) {
+        uint32_t val = fastrange32(*it, range);
+        if (val != prev) {
+          assert(val > prev);
+          uint32_t diff = val - prev;
+          vals.push_back(val);
+
+          unary_bits += 1 + (diff >> entry_bits);
+          prev = val;
+        }
+      }
+
+      if (count /*vs. vals.size()*/ * entry_bits + unary_bits <= 504) {
+        // We can encode
+        fp_rate = 1.0 * count / range;
+        *fp_rate_sum += fp_rate;
+        fprintf(stderr, "Cache line FP rate: %g (rice %u, %lu uniq, %g rcount, %d entry_bit, %g avg unary, %u bits waste)\n", fp_rate, count, vals.size(), rcount, entry_bits, 1.0 * unary_bits / count, 504u - static_cast<uint32_t>(vals.size()) * entry_bits - unary_bits);
+        break;
+      }
+      // else
+      rcount += 0.25;
+      if (rcount > 82) {
+        // No more tries; fall back on Bloom
+        *fp_rate_sum += fp_rate;
+        fprintf(stderr, "Cache line FP rate: %g (bloom %u)\n", fp_rate, count);
+        BuildBloomCacheLine(data_at_cache_line, begin, end);
+        return;
+      }
+      // else try again
+    }
+
+    // TODO/FIXME
+    BuildBloomCacheLine(data_at_cache_line, begin, end);
+    /*
+    // A "before" bit index (append after)
+    int unary_bit_ptr = 0;
+    // An "after" bit index (append before)
+    int entry_bit_ptr = 504;
+
+    uint32_t prev = 0;
+    for (uint32_t val : vals) {
+      uint32_t diff = val - prev;
+      unary_bit_ptr += (diff >> entry_bits);
+      data_at_cache_line[unary_bit_ptr >> 3] |= char{1} << (unary_bit_ptr & 7);
+      unary_bit_ptr++;
+
+
+      prev = val;
+    }
+    assert (unary_bit_ptr <= entry_bit_ptr);
+    */
+  }
+
+  void BuildBloomCacheLine(char *data_at_cache_line, std::vector<uint32_t>::iterator begin, std::vector<uint32_t>::iterator end) const {
+    for (auto it = begin; it != end; ++it) {
+      FastLocalBloomImpl::AddHashPrepared(*it, /*num_probes*/4, data_at_cache_line);
+    }
+    if ((data_at_cache_line[63] & char(0xc0)) == 0) {
+      // set one bit to make one of the top two bits non-zero
+      data_at_cache_line[63] |= char(0x80);
+    }
+    //fprintf(stderr, "Built bloom\n");
+  }
+
+  int bits_per_key_;
+  std::vector<uint64_t> hash_entries_;
+};
+
+// See description in LocalHybridImpl
+class LocalHybridBitsReader : public FilterBitsReader {
+ public:
+  LocalHybridBitsReader(const char* data, int num_probes, uint32_t len_bytes)
+      : data_(data), num_probes_(num_probes), len_bytes_(len_bytes) {}
+
+  // No Copy allowed
+  LocalHybridBitsReader(const LocalHybridBitsReader&) = delete;
+  void operator=(const LocalHybridBitsReader&) = delete;
+
+  ~LocalHybridBitsReader() override {}
+
+  bool MayMatch(const Slice& key) override {
+    uint64_t h = GetSliceHash64(key);
+    uint32_t byte_offset;
+    FastLocalBloomImpl::PrepareHash(Lower32of64(h), len_bytes_, data_,
+                                    /*out*/ &byte_offset);
+    return FastLocalBloomImpl::HashMayMatchPrepared(Upper32of64(h), num_probes_,
+                                                    data_ + byte_offset);
+  }
+
+  virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
+    std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> hashes;
+    std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> byte_offsets;
+    for (int i = 0; i < num_keys; ++i) {
+      uint64_t h = GetSliceHash64(*keys[i]);
+      FastLocalBloomImpl::PrepareHash(Lower32of64(h), len_bytes_, data_,
+                                      /*out*/ &byte_offsets[i]);
+      hashes[i] = Upper32of64(h);
+    }
+    for (int i = 0; i < num_keys; ++i) {
+      may_match[i] = FastLocalBloomImpl::HashMayMatchPrepared(
+          hashes[i], num_probes_, data_ + byte_offsets[i]);
+    }
+  }
+
+ private:
+  const char* data_;
+  const int num_probes_;
+  const uint32_t len_bytes_;
+};
+
+
 class AlwaysTrueFilter : public FilterBitsReader {
  public:
   bool MayMatch(const Slice&) override { return true; }
@@ -425,6 +649,7 @@ const std::vector<BloomFilterPolicy::Mode> BloomFilterPolicy::kAllFixedImpls = {
     kLegacyBloom,
     kDeprecatedBlock,
     kFastLocalBloom,
+    kLocalHybrid,
 };
 
 const std::vector<BloomFilterPolicy::Mode> BloomFilterPolicy::kAllUserModes = {
@@ -518,13 +743,15 @@ FilterBitsBuilder* BloomFilterPolicy::GetFilterBitsBuilderInternal(
         if (context.table_options_.format_version < 5) {
           cur = kLegacyBloom;
         } else {
-          cur = kFastLocalBloom;
+          cur = kLocalHybrid;
         }
         break;
       case kDeprecatedBlock:
         return nullptr;
       case kFastLocalBloom:
         return new FastLocalBloomBitsBuilder(bits_per_key_, num_probes_);
+      case kLocalHybrid:
+        return new LocalHybridBitsBuilder(bits_per_key_);
       case kLegacyBloom:
         return new LegacyBloomBitsBuilder(bits_per_key_, num_probes_);
     }

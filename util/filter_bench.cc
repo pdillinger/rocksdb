@@ -272,9 +272,9 @@ void FilterBench::Go() {
       throw std::runtime_error(
           "Block-based filter not currently supported by filter_bench");
     }
-    if (FLAGS_impl > 2) {
+    if (FLAGS_impl > 3) {
       throw std::runtime_error(
-          "-impl must currently be 0 or 2 for Block-based table");
+          "-impl must currently be 0, 2, or 3 for Block-based table");
     }
   }
 
