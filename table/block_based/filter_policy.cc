@@ -482,13 +482,30 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
       fp_rate = 1.0 * extra_entry_bits / (range >> (24u - base_entry_bits - 1u));
     }
     fp_rate += 1.0 * (count - extra_entry_bits) / (range >> (24u - base_entry_bits));
-    *fp_rate_sum += fp_rate;
+    //*fp_rate_sum += fp_rate;
     fprintf(stderr, "Cache line FP rate: %g\n", fp_rate);
     /*
     // No more tries; fall back on Bloom
     *fp_rate_sum += fp_rate;
     fprintf(stderr, "Cache line FP rate: %g (bloom %u)\n", fp_rate, count);
     */
+
+    // Simulate orderly filter
+    rem_bits = (kCacheLineBits - 8u);
+    base_entry_bits = rem_bits / count;
+    if (base_entry_bits >= 24u) {
+      base_entry_bits = 24u;
+      extra_entry_bits = 0;
+      fp_rate = 0;
+    } else {
+      extra_entry_bits = rem_bits % count;
+      fp_rate = 4.0 * extra_entry_bits / (1 << (base_entry_bits + 1));
+    }
+    fp_rate += 4.0 * (count - extra_entry_bits) / (1 << base_entry_bits);
+    fprintf(stderr, "Cache line FP rate (orderly): %g\n", fp_rate);
+    *fp_rate_sum += fp_rate;
+
+
     BuildBloomCacheLine(data_at_cache_line, begin, end);
     // TODO/FIXME
     /*
