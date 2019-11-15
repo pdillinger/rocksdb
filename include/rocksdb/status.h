@@ -306,6 +306,11 @@ class Status {
   // Returns the string "OK" for success.
   std::string ToString() const;
 
+  // Potentially replace this status by combining it with another status,
+  // keeping the earliest (left-to-right) non-OK status. If both statuses
+  // are OK, this status remains unchanged.
+  void CombineEarliestNonOk(const Status& other);
+
  private:
   // A nullptr state_ (which is always the case for OK) means the message
   // is empty.
@@ -381,6 +386,12 @@ inline bool Status::operator==(const Status& rhs) const {
 
 inline bool Status::operator!=(const Status& rhs) const {
   return !(*this == rhs);
+}
+
+inline void Status::CombineEarliestNonOk(const Status& other) {
+  if (ok() && !other.ok()) {
+    *this = other;
+  }
 }
 
 }  // namespace rocksdb

@@ -971,7 +971,7 @@ Status BackupEngineImpl::PurgeOldBackups(uint32_t num_backups_to_keep) {
   assert(initialized_);
   assert(!read_only_);
 
-  // Best effort deletion even with errors
+  // Best effort deletion even with errors, but report any error
   Status overall_status = Status::OK();
 
   ROCKS_LOG_INFO(options_.info_log, "Purging old backups, keeping %u",
@@ -983,37 +983,23 @@ Status BackupEngineImpl::PurgeOldBackups(uint32_t num_backups_to_keep) {
     itr++;
   }
   for (auto backup_id : to_delete) {
-    auto s = DeleteBackupInternal(backup_id);
-    if (!s.ok()) {
-      overall_status = s;
-    }
+    overall_status.CombineEarliestNonOk(DeleteBackupInternal(backup_id));
   }
   // Clean up after any incomplete backup deletion, potentially from
   // earlier session.
-  if (might_need_garbage_collect_) {
-    auto s = GarbageCollect();
-    if (!s.ok() && overall_status.ok()) {
-      overall_status = s;
-    }
-  }
+  might_need_garbage_collect_ |= !overall_status.ok();
+  overall_status.CombineEarliestNonOk(GarbageCollect());
   return overall_status;
 }
 
 Status BackupEngineImpl::DeleteBackup(BackupID backup_id) {
-  auto s1 = DeleteBackupInternal(backup_id);
-  auto s2 = Status::OK();
+  auto overall_status = DeleteBackupInternal(backup_id);
 
   // Clean up after any incomplete backup deletion, potentially from
   // earlier session.
-  if (might_need_garbage_collect_) {
-    s2 = GarbageCollect();
-  }
-
-  if (!s1.ok()) {
-    return s1;
-  } else {
-    return s2;
-  }
+  might_need_garbage_collect_ |= !s.ok();
+  overall_status.CombineEarliestNonOk(GarbageCollect());
+  return overall_status;
 }
 
 // Does not auto-GarbageCollect
@@ -1044,6 +1030,7 @@ Status BackupEngineImpl::DeleteBackupInternal(BackupID backup_id) {
   // After removing meta file, best effort deletion even with errors.
   // (Don't delete other files if we can't delete the meta file right
   // now.)
+  Status overall_status = Status::OK();
 
   if (options_.max_valid_backups_to_open == port::kMaxInt32) {
     std::vector<std::string> to_delete;
@@ -1053,10 +1040,7 @@ Status BackupEngineImpl::DeleteBackupInternal(BackupID backup_id) {
         ROCKS_LOG_INFO(options_.info_log, "Deleting %s -- %s",
                        itr.first.c_str(), s.ToString().c_str());
         to_delete.push_back(itr.first);
-        if (!s.ok()) {
-          // Trying again later might work
-          might_need_garbage_collect_ = true;
-        }
+        overall_status.CombineEarliestNonOk(s);
       }
     }
     for (auto& td : to_delete) {
@@ -1075,11 +1059,8 @@ Status BackupEngineImpl::DeleteBackupInternal(BackupID backup_id) {
   Status s = backup_env_->DeleteDir(GetAbsolutePath(private_dir));
   ROCKS_LOG_INFO(options_.info_log, "Deleting private dir %s -- %s",
                  private_dir.c_str(), s.ToString().c_str());
-  if (!s.ok()) {
-    // Full gc or trying again later might work
-    might_need_garbage_collect_ = true;
-  }
-  return Status::OK();
+  overall_status.CombineEarliestNonOk(s);
+  return overall_status;
 }
 
 void BackupEngineImpl::GetBackupInfo(std::vector<BackupInfo>* backup_info) {
@@ -1562,11 +1543,13 @@ Status BackupEngineImpl::InsertPathnameToSizeBytes(
 Status BackupEngineImpl::GarbageCollect() {
   assert(!read_only_);
 
-  // We will make a best effort to remove all garbage even in the presence
-  // of inconsistencies or I/O failures that inhibit finding garbage.
+  // Skip if everything's been OK since last known GarbageCollect
+  if (!might_need_garbage_collect_) {
+    return Status::OK();
+  }
+
+  // Best effort deletion even with errors, but report any error
   Status overall_status = Status::OK();
-  // If all goes well, we don't need another auto-GC this session
-  might_need_garbage_collect_ = false;
 
   ROCKS_LOG_INFO(options_.info_log, "Starting garbage collection");
   if (options_.max_valid_backups_to_open != port::kMaxInt32) {
@@ -1589,17 +1572,13 @@ Status BackupEngineImpl::GarbageCollect() {
         } else {
           shared_path = GetAbsolutePath(GetSharedFileRel());
         }
-        auto s = backup_env_->FileExists(shared_path);
+        Status s = backup_env_->FileExists(shared_path);
         if (s.ok()) {
           s = backup_env_->GetChildren(shared_path, &shared_children);
         } else if (s.IsNotFound()) {
           s = Status::OK();
         }
-        if (!s.ok()) {
-          overall_status = s;
-          // Trying again later might work
-          might_need_garbage_collect_ = true;
-        }
+        overall_status.CombineEarliestNonOk(s);
       }
       for (auto& child : shared_children) {
         if (child == "." || child == "..") {
@@ -1615,16 +1594,12 @@ Status BackupEngineImpl::GarbageCollect() {
         // if it's not refcounted, delete it
         if (child_itr == backuped_file_infos_.end() ||
             child_itr->second->refs == 0) {
-          // this might be a directory, but DeleteFile will just fail in that
-          // case, so we're good
+          // if this is a directory, it doesn't belong here -> fail
           Status s = backup_env_->DeleteFile(GetAbsolutePath(rel_fname));
           ROCKS_LOG_INFO(options_.info_log, "Deleting %s -- %s",
                          rel_fname.c_str(), s.ToString().c_str());
           backuped_file_infos_.erase(rel_fname);
-          if (!s.ok()) {
-            // Trying again later might work
-            might_need_garbage_collect_ = true;
-          }
+          overall_status.CombineEarliestNonOk(s);
         }
       }
     }
@@ -1633,13 +1608,9 @@ Status BackupEngineImpl::GarbageCollect() {
   // delete obsolete private files
   std::vector<std::string> private_children;
   {
-    auto s = backup_env_->GetChildren(GetAbsolutePath(GetPrivateDirRel()),
+    Status s = backup_env_->GetChildren(GetAbsolutePath(GetPrivateDirRel()),
                                       &private_children);
-    if (!s.ok()) {
-      overall_status = s;
-      // Trying again later might work
-      might_need_garbage_collect_ = true;
-    }
+    overall_status.CombineEarliestNonOk(s);
   }
   for (auto& child : private_children) {
     if (child == "." || child == "..") {
@@ -1683,6 +1654,8 @@ Status BackupEngineImpl::GarbageCollect() {
     }
   }
 
+  // If all goes well, we don't need another auto-GC this session
+  might_need_garbage_collect_ = false;
   assert(overall_status.ok() || might_need_garbage_collect_);
   return overall_status;
 }
