@@ -284,32 +284,48 @@ inline uint32_t nbits_popcnt(const char *data, uint32_t nbits) {
 
 inline uint32_t general_tzcnt(const char *data, uint32_t from) {
   uint32_t rv = 0;
+#if defined(HAVE_POPCNT) && defined(HAVE_BMI2)
+  for (;;) {
+    uint64_t v = *reinterpret_cast<const uint64_t*>(data + (from / 8));
+    v >>= from % 8;
+    if (v != 0) {
+      rv += _tzcnt_u64(v);
+      return rv;
+    }
+    from += (64 - (from % 8));
+  }
+#else
   while (bit_table_get_bit(data, from + rv) == false) {
     ++rv;
   }
   return rv;
+#endif
 }
 
 // Returns 1-based index, or zero if n = 0.
-inline uint32_t nth_set_bit_index1(const char *data, uint32_t n) {
-#if defined(HAVE_POPCNT) && defined(HAVE_BMI2)
-  assert(n < 128);
-  const uint64_t *data64 = reinterpret_cast<const uint64_t*>(data);
+inline uint32_t nth_set_bit_index1(const char *data, uint32_t from, uint32_t n) {
   if (n == 0) {
     return 0;
   }
+#if defined(HAVE_POPCNT) && defined(HAVE_BMI2)
+  assert(n < 64);
+  const uint64_t *data64 = reinterpret_cast<const uint64_t*>(data + (from / 8));
   uint32_t rv = 1; // 1-based return
-  while (n > 64) {
-    n -= _popcnt64(*data64);
-    ++data64;
-    rv += 64;
+  uint64_t v = *data64 >> (from % 8);
+  uint64_t p = _pdep_u64(uint64_t(1) << (n - 1), v);
+  if (p != 0) {
+    rv += _tzcnt_u64(p);
+    return rv;
   }
+  // else not in that uint64
+  n -= _popcnt64(v);
+  ++data64;
+  rv += 64 - (from % 8);
   for (;;) {
-    assert(n <= 64);
-    assert(n > 0);
-    uint64_t val = _pdep_u64(uint64_t(1) << (n - 1), *data64);
-    if (val != 0) {
-      rv += _tzcnt_u64(val);
+    assert(n < 64);
+    p = _pdep_u64(uint64_t(1) << (n - 1), *data64);
+    if (p != 0) {
+      rv += _tzcnt_u64(p);
       return rv;
     }
     // else not in that uint64
@@ -318,13 +334,12 @@ inline uint32_t nth_set_bit_index1(const char *data, uint32_t n) {
     rv += 64;
   }
 #else
-  uint32_t count = 0;
-  uint32_t i = 0;
-  while (count < n) {
-    count += bit_table_get_bit(data, i);
-    ++i;
-  }
-  return i;
+  uint32_t to = from;
+  do {
+    n -= bit_table_get_bit(data, to);
+    ++to;
+  } while (n > 0);
+  return to - from;
 #endif
 }
 
@@ -398,8 +413,10 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
   }
 
   static uint32_t GetRange(uint32_t count) {
+    // Range roughly 0.65 - 0.80 depending on count
+    double f = 0.80 - (count * count * 2 / 100000.0);
     uint64_t corrected = std::max(count, (kCacheLineBits - kCacheLineMetaBits + 25u) / 26u);
-    return static_cast<uint32_t>((corrected << 25) * 0.75);
+    return static_cast<uint32_t>((corrected << 25) * f);
   }
  private:
   void AddAllEntries(char* data, uint32_t len) const {
@@ -570,10 +587,52 @@ class LocalHybridBitsReader : public FilterBitsReader {
     const uint32_t rem_entry_to_find = (val_to_find & 0xfffffu) >> (20u - base_rem_entry_bits);
 
     uint32_t unary_cur = 0;
-    uint32_t nibble_bwd_idx = (LocalHybridBitsBuilder::kCacheLineBits - LocalHybridBitsBuilder::kCacheLineMetaBits) / 4u;
+    const char *nibble_bwd_ptr = data_at_cache_line + (LocalHybridBitsBuilder::kCacheLineBits - LocalHybridBitsBuilder::kCacheLineMetaBits) / 8u;
     uint32_t cur_partial_val = 0;
 
-    for (uint32_t i = 0; i < count; ++i) {
+    uint32_t i = 0;
+    //*
+    while (i + 8 <= count && cur_partial_val + 60 < partial_val_to_find) {
+      // Try skipping ahead
+      uint32_t nibbles_sum = 0;
+#if defined(HAVE_POPCNT) && defined(HAVE_BMI2)
+      {
+        uint32_t nibbles = reinterpret_cast<const uint32_t*>(nibble_bwd_ptr)[-1];
+        nibbles_sum += (nibbles & 15);
+        nibbles_sum += ((nibbles >> 4) & 15);
+        nibbles_sum += ((nibbles >> 8) & 15);
+        nibbles_sum += ((nibbles >> 12) & 15);
+        nibbles_sum += ((nibbles >> 16) & 15);
+        nibbles_sum += ((nibbles >> 20) & 15);
+        nibbles_sum += ((nibbles >> 24) & 15);
+        nibbles_sum += ((nibbles >> 28) & 15);
+      }
+#else
+      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 1);
+      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 2);
+      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 3);
+      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 4);
+      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 5);
+      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 6);
+      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 7);
+      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 8);
+#endif
+      uint32_t nth1 = nth_set_bit_index1(data_at_cache_line, unary_cur, 8);
+      uint32_t skip_partial_val = cur_partial_val + nibbles_sum + ((nth1 - 8) << 4);
+      // TODO: optimize == case, or not because potentially earlier == cases
+      if (skip_partial_val < partial_val_to_find) {
+        cur_partial_val = skip_partial_val;
+        i += 8;
+        nibble_bwd_ptr -= 4;
+        unary_cur += nth1;
+      } else {
+        break;
+      }
+    }
+    //*/
+    uint32_t nibble_bwd_idx = (nibble_bwd_ptr - data_at_cache_line) * 2;
+
+    for (; i < count; ++i) {
       uint32_t tz = general_tzcnt(data_at_cache_line, unary_cur);
       unary_cur += tz + 1;
       cur_partial_val += tz << 4;
