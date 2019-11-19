@@ -287,12 +287,14 @@ inline uint32_t general_tzcnt(const char *data, uint32_t from) {
 #if defined(HAVE_POPCNT) && defined(HAVE_BMI2)
   for (;;) {
     uint64_t v = *reinterpret_cast<const uint64_t*>(data + (from / 8));
-    v >>= from % 8;
+    uint32_t bit_shift = from % 8;
+    v >>= bit_shift;
     if (v != 0) {
       rv += _tzcnt_u64(v);
       return rv;
     }
-    from += (64 - (from % 8));
+    from += (64 - bit_shift);
+    rv += (64 - bit_shift);
   }
 #else
   while (bit_table_get_bit(data, from + rv) == false) {
@@ -554,9 +556,10 @@ class LocalHybridBitsReader : public FilterBitsReader {
     const uint64_t h64 = GetSliceHash64(key);
     const uint32_t cache_line = fastrange32(Lower32of64(h64), num_cache_lines_);
     const char *data_at_cache_line = data_ + LocalHybridBitsBuilder::kCacheLineBytes * cache_line;
+    return HashMayMatchPrepared(Upper32of64(h64), data_at_cache_line);
+  }
 
-    const uint32_t h = Upper32of64(h64);
-
+  bool HashMayMatchPrepared(const uint32_t h, const char *data_at_cache_line) {
     const uint32_t meta = static_cast<uint8_t>(data_at_cache_line[LocalHybridBitsBuilder::kCacheLineBytes - 1]);
     if ((meta & 0xc0u) != 0) {
       return FastLocalBloomImpl::HashMayMatchPrepared(h, 4,
@@ -591,35 +594,26 @@ class LocalHybridBitsReader : public FilterBitsReader {
     uint32_t cur_partial_val = 0;
 
     uint32_t i = 0;
-    //*
-    while (i + 8 <= count && cur_partial_val + 60 < partial_val_to_find) {
-      // Try skipping ahead
+    // Try skipping ahead by 8 nibbles at a time
+    // Didn't seem to help: skipping by 16 and by 4 also
+    while (i + 8 <= count && cur_partial_val + 30 < partial_val_to_find) {
       uint32_t nibbles_sum = 0;
 #if defined(HAVE_POPCNT) && defined(HAVE_BMI2)
       {
         uint32_t nibbles = reinterpret_cast<const uint32_t*>(nibble_bwd_ptr)[-1];
-        nibbles_sum += (nibbles & 15);
-        nibbles_sum += ((nibbles >> 4) & 15);
-        nibbles_sum += ((nibbles >> 8) & 15);
-        nibbles_sum += ((nibbles >> 12) & 15);
-        nibbles_sum += ((nibbles >> 16) & 15);
-        nibbles_sum += ((nibbles >> 20) & 15);
-        nibbles_sum += ((nibbles >> 24) & 15);
-        nibbles_sum += ((nibbles >> 28) & 15);
+        nibbles = (nibbles & uint32_t{0xf0f0f0f}) + ((nibbles & uint32_t{0xf0f0f0f0}) >> 4);
+        nibbles = (nibbles & uint32_t{0xff00ff}) + ((nibbles & uint32_t{0xff00ff00}) >> 8);
+        nibbles = (nibbles & uint32_t{0xffff}) + ((nibbles & uint32_t{0xffff0000}) >> 16);
+        nibbles_sum += nibbles;
       }
 #else
-      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 1);
-      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 2);
-      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 3);
-      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 4);
-      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 5);
-      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 6);
-      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 7);
-      nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - 8);
+      for (uint32_t i = 1; i <= 8; i++) {
+        nibbles_sum += get_nibble(data_at_cache_line, nibble_bwd_idx - i);
+      }
 #endif
       uint32_t nth1 = nth_set_bit_index1(data_at_cache_line, unary_cur, 8);
       uint32_t skip_partial_val = cur_partial_val + nibbles_sum + ((nth1 - 8) << 4);
-      // TODO: optimize == case, or not because potentially earlier == cases
+      // NB: not easy to accept == case, because potentially earlier == cases
       if (skip_partial_val < partial_val_to_find) {
         cur_partial_val = skip_partial_val;
         i += 8;
@@ -629,7 +623,7 @@ class LocalHybridBitsReader : public FilterBitsReader {
         break;
       }
     }
-    //*/
+
     uint32_t nibble_bwd_idx = (nibble_bwd_ptr - data_at_cache_line) * 2;
 
     for (; i < count; ++i) {
@@ -660,23 +654,22 @@ class LocalHybridBitsReader : public FilterBitsReader {
     return false;
   }
 
-  using FilterBitsReader::MayMatch;
-  /*
   virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
     std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> hashes;
     std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> byte_offsets;
     for (int i = 0; i < num_keys; ++i) {
-      uint64_t h = GetSliceHash64(*keys[i]);
-      FastLocalBloomImpl::PrepareHash(Lower32of64(h), len_bytes_, data_,
-                                      &byte_offsets[i]);
-      hashes[i] = Upper32of64(h);
+      const uint64_t h64 = GetSliceHash64(*keys[i]);
+      const uint32_t cache_line = fastrange32(Lower32of64(h64), num_cache_lines_);
+      const uint32_t offset = LocalHybridBitsBuilder::kCacheLineBytes * cache_line;
+      PREFETCH(data_ + offset, 0 /* rw */, 1 /* locality */);
+      PREFETCH(data_ + offset + 63, 0 /* rw */, 1 /* locality */);
+      byte_offsets[i] = offset;
+      hashes[i] = Upper32of64(h64);
     }
     for (int i = 0; i < num_keys; ++i) {
-      may_match[i] = FastLocalBloomImpl::HashMayMatchPrepared(
-          hashes[i], num_probes_, data_ + byte_offsets[i]);
+      may_match[i] = HashMayMatchPrepared(hashes[i], data_ + byte_offsets[i]);
     }
   }
-  */
  private:
   const char* data_;
   const uint32_t num_cache_lines_;
