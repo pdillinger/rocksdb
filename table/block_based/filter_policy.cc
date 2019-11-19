@@ -191,10 +191,152 @@ class FastLocalBloomBitsReader : public FilterBitsReader {
   const uint32_t len_bytes_;
 };
 
+inline void bit_table_set_bit(char *data, uint32_t bit_offset) {
+  data[bit_offset >> 3] |= char{1} << (bit_offset & 7);
+}
+
+inline bool bit_table_get_bit(const char *data, uint32_t bit_offset) {
+  return (data[bit_offset >> 3] >> (bit_offset & 7)) & 1;
+}
+
+inline void or_put_nibble(char *data, uint32_t nibble_offset, uint32_t val) {
+  assert(val < 16);
+  data[nibble_offset >> 1] |= val << ((nibble_offset & 1) * 4);
+}
+
+inline uint32_t get_nibble(const char *data, uint32_t nibble_offset) {
+  return static_cast<uint32_t>(data[nibble_offset >> 1] >> ((nibble_offset & 1) * 4)) & uint32_t{15};
+}
+
+// Might access 5 bytes from starting address
+inline uint32_t bit_table_get(const char *data, uint32_t bit_offset, uint32_t mask) {
+  //fprintf(stderr, "--> Getting val at offset %d\n", bit_offset);
+  data += bit_offset >> 3;
+  bit_offset &= 7;
+  const uint8_t *udata = reinterpret_cast<const uint8_t*>(data);
+  //fprintf(stderr, "--> Bytes: %02x%02x%02x%02x%02x\n", udata[4], udata[3], udata[2], udata[1], udata[0]);
+  uint64_t rv = static_cast<uint64_t>(udata[0]) + (static_cast<uint64_t>(udata[1]) << 8) + (static_cast<uint64_t>(udata[2]) << 16) + (static_cast<uint64_t>(udata[3]) << 24) + (static_cast<uint64_t>(udata[4]) << 32);
+  //fprintf(stderr, "--> Raw:   %010lx\n", rv);
+  return static_cast<uint32_t>(rv >> bit_offset) & mask;
+}
+
+// Might access 5 bytes from starting address, or extra aligned 32 bits
+inline void bit_table_or_put(char *data, uint32_t bit_offset, uint32_t val) {
+  //fprintf(stderr, "--> Putting val %x at offset %d\n", val, bit_offset);
+#ifdef HAVE_SSE42 // XXX: stand-in for endianness
+  uint32_t *data32 = reinterpret_cast<uint32_t*>(data);
+  assert((bit_offset >> 5) < 15); // make sure we don't write beyond cache line
+  data32 += bit_offset >> 5;
+  bit_offset &= 31;
+  data32[0] |= val << bit_offset;
+  data32[1] |= val >> 1 >> (31 - bit_offset);
+#else
+  data += bit_offset >> 3;
+  bit_offset &= 7;
+  uint8_t *udata = reinterpret_cast<uint8_t*>(data);
+  //fprintf(stderr, "--> Before: %02x%02x%02x%02x%02x\n", udata[4], udata[3], udata[2], udata[1], udata[0]);
+  udata[0] |= static_cast<uint8_t>(val << bit_offset);
+  udata[1] |= static_cast<uint8_t>(val >> (8 - bit_offset));
+  udata[2] |= static_cast<uint8_t>(val >> (16 - bit_offset));
+  udata[3] |= static_cast<uint8_t>(val >> (24 - bit_offset));
+  udata[4] |= static_cast<uint8_t>(uint64_t(val) >> (32 - bit_offset));
+  //fprintf(stderr, "--> After:  %02x%02x%02x%02x%02x\n", udata[4], udata[3], udata[2], udata[1], udata[0]);
+#endif
+}
+
+inline uint32_t popcnt_char(char v) {
+  uint32_t a = v & 0x55U;
+  uint32_t b = a + ((v & 0xaaU) >> 1);
+  a = b & 0x33;
+  b = a + ((b & 0xcc) >> 2);
+  a = b & 0xf;
+  b = a + ((b & 0xf0) >> 4);
+  return b;
+}
+
+inline uint32_t nbits_popcnt(const char *data, uint32_t nbits) {
+  uint32_t rv = 0;
+#ifdef HAVE_POPCNT
+  while (nbits > 0) {
+    uint64_t tmp;
+    memcpy(&tmp, data, sizeof(tmp));
+    if (nbits < 64) {
+      tmp <<= (64 - nbits);
+      rv += _popcnt64(tmp);
+      nbits = 0;
+      break;
+    }
+    rv += _popcnt64(tmp);
+    nbits -= 64;
+    data += sizeof(tmp);
+  }
+#else
+  while (nbits >= 8) {
+    rv += popcnt_char(*(data++));
+    nbits -= 8;
+  }
+  if (nbits > 0) {
+    rv += popcnt_char(static_cast<char>(static_cast<uint8_t>(*data) << (8 - nbits)));
+  }
+#endif
+  return rv;
+}
+
+inline uint32_t general_tzcnt(const char *data, uint32_t from) {
+  uint32_t rv = 0;
+  while (bit_table_get_bit(data, from + rv) == false) {
+    ++rv;
+  }
+  return rv;
+}
+
+// Returns 1-based index, or zero if n = 0.
+inline uint32_t nth_set_bit_index1(const char *data, uint32_t n) {
+#if defined(HAVE_POPCNT) && defined(HAVE_BMI2)
+  assert(n < 128);
+  const uint64_t *data64 = reinterpret_cast<const uint64_t*>(data);
+  if (n == 0) {
+    return 0;
+  }
+  uint32_t rv = 1; // 1-based return
+  while (n > 64) {
+    n -= _popcnt64(*data64);
+    ++data64;
+    rv += 64;
+  }
+  for (;;) {
+    assert(n <= 64);
+    assert(n > 0);
+    uint64_t val = _pdep_u64(uint64_t(1) << (n - 1), *data64);
+    if (val != 0) {
+      rv += _tzcnt_u64(val);
+      return rv;
+    }
+    // else not in that uint64
+    n -= _popcnt64(*data64);
+    ++data64;
+    rv += 64;
+  }
+#else
+  uint32_t count = 0;
+  uint32_t i = 0;
+  while (count < n) {
+    count += bit_table_get_bit(data, i);
+    ++i;
+  }
+  return i;
+#endif
+}
+
 class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
  public:
-  static constexpr uint32_t kCacheLineBits = 1024;
-  static constexpr uint32_t kCacheLineBytes = kCacheLineBits / 8;
+  static constexpr uint32_t kCacheLineLog2Bytes = 6u;
+  static constexpr uint32_t kCacheLineLog2Bits = kCacheLineLog2Bytes + 3u;
+  static constexpr uint32_t kCacheLineBits = uint32_t{1} << kCacheLineLog2Bits;
+  static constexpr uint32_t kCacheLineBytes = uint32_t{1} << kCacheLineLog2Bytes;
+  static constexpr uint32_t kCacheLineMetaBits = 8u;
+  static constexpr uint32_t kUnaryBitBlockSize = kCacheLineBits / 256;
+  static constexpr uint32_t kMaxUnaryBits = (((kCacheLineBits - kCacheLineMetaBits) / 3) & ~uint32_t{kUnaryBitBlockSize - 1}) + 4;
 
   LocalHybridBitsBuilder(const int bits_per_key)
       : bits_per_key_(bits_per_key) {
@@ -255,6 +397,10 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
     return num_cache_lines * kCacheLineBytes + /*metadata*/ 5;
   }
 
+  static uint32_t GetRange(uint32_t count) {
+    uint64_t corrected = std::max(count, (kCacheLineBits - kCacheLineMetaBits + 25u) / 26u);
+    return static_cast<uint32_t>((corrected << 25) * 0.75);
+  }
  private:
   void AddAllEntries(char* data, uint32_t len) const {
     // Too slow:
@@ -272,88 +418,101 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
     }
     double fp_rate_sum = 0;
     for (uint32_t i = 0; i < num_cache_lines; ++i) {
+    //fprintf(stderr, "Building cache line %u\n", i);
       BuildCacheLine(data + (i * kCacheLineBytes), buckets[i].begin(), buckets[i].end(), &fp_rate_sum);
     }
-    fprintf(stderr, "Filter FP rate: %g\n", fp_rate_sum / num_cache_lines);
+  //fprintf(stderr, "Filter FP rate: %g\n", fp_rate_sum / num_cache_lines);
   }
 
   void BuildCacheLine(char *data_at_cache_line, std::vector<uint32_t>::iterator begin, std::vector<uint32_t>::iterator end, double *fp_rate_sum) const {
     const uint32_t count = static_cast<uint32_t>(end - begin);
     double fp_rate = std::pow(1.0 - exp(-4.0 * count / kCacheLineBits), 4.0); // bloom rate
 
-    if (count * 6u > (kCacheLineBits - 8u)) {
+    // TODO: pivot point closer to 5? But then we don't have min. 4 entry bits?
+    if (count * 6u > (kCacheLineBits - kCacheLineMetaBits)) {
       *fp_rate_sum += fp_rate;
-      fprintf(stderr, "Cache line FP rate: %g (bloom %u)\n", fp_rate, count);
+    //fprintf(stderr, "Cache line FP rate: %g (bloom1 %u)\n", fp_rate, count);
       BuildBloomCacheLine(data_at_cache_line, begin, end);
       return;
     }
 
     std::sort(begin, end);
 
-    uint32_t range = static_cast<uint32_t>((uint64_t{std::max(count, (kCacheLineBits - 8u + 25u) / 26u)} << 25) * 0.75);
-    std::vector<uint32_t> vals;
+    uint32_t range = GetRange(count);
+    std::vector<uint32_t> rem_vals;
     uint32_t unary_bits = 0;
+    uint32_t nibble_bwd_idx = (kCacheLineBits - kCacheLineMetaBits) / 4;
 
     uint32_t prev = 0;
     for (auto it = begin; it != end; ++it) {
       uint32_t val = fastrange32(*it, range);
+    //fprintf(stderr, "Preparing hash %x (val %x)\n", *it, val);
       assert(val >= prev);
-      vals.push_back(val);
       uint32_t diff = (val >> 20) - (prev >> 20);
-      unary_bits += 1u + (diff >> 4);
+      unary_bits += (diff >> 4);
+      bit_table_set_bit(data_at_cache_line, unary_bits);
+      unary_bits++;
+      nibble_bwd_idx--;
+      if (unary_bits > kMaxUnaryBits || nibble_bwd_idx * 4 < unary_bits) {
+        *fp_rate_sum += fp_rate;
+      //fprintf(stderr, "Cache line FP rate: %g (bloom2 %u)\n", fp_rate, count);
+        BuildBloomCacheLine(data_at_cache_line, begin, end);
+        return;
+      }
+      or_put_nibble(data_at_cache_line, nibble_bwd_idx, diff & uint32_t{0xf});
+      // Use (TBD part of) bottom 20 bits soon
+      rem_vals.push_back(val & uint32_t{0xfffff});
       prev = val;
     }
 
-    fprintf(stderr, "Rice count %u, unary_bits/count %g\n", count, (double)unary_bits / vals.size());
+    unary_bits = std::max(kMaxUnaryBits - 63, (unary_bits + kUnaryBitBlockSize - 1) & ~(kUnaryBitBlockSize - 1));
 
-    uint32_t rem_bits = (kCacheLineBits - 8u) - ((unary_bits + 1u) & ~1u);
-    uint32_t base_entry_bits = rem_bits / count;
-    uint32_t extra_entry_bits;
-    if (base_entry_bits >= 24u) {
-      base_entry_bits = 24u;
-      extra_entry_bits = 0;
+    uint32_t rem_bits = nibble_bwd_idx * 4 - unary_bits;
+
+  //fprintf(stderr, "Rice count %u, unary_bits/count %g\n", count, (double)unary_bits / rem_vals.size());
+
+    uint32_t base_rem_entry_bits = rem_bits / count;
+    uint32_t entries_with_extra_bit;
+    if (base_rem_entry_bits >= 20u) {
+      base_rem_entry_bits = 20u;
+      entries_with_extra_bit = 0;
       fp_rate = 0;
     } else {
-      extra_entry_bits = rem_bits % count;
-      fp_rate = 1.0 * extra_entry_bits / (range >> (24u - base_entry_bits - 1u));
+      entries_with_extra_bit = rem_bits % count;
+      fp_rate = 1.0 * entries_with_extra_bit / (range >> (20u - base_rem_entry_bits - 1u));
     }
-    fp_rate += 1.0 * (count - extra_entry_bits) / (range >> (24u - base_entry_bits));
+    fp_rate += 1.0 * (count - entries_with_extra_bit) / (range >> (20u - base_rem_entry_bits));
     *fp_rate_sum += fp_rate;
-    fprintf(stderr, "Cache line FP rate: %g\n", fp_rate);
-    /*
-    // No more tries; fall back on Bloom
-    *fp_rate_sum += fp_rate;
-    fprintf(stderr, "Cache line FP rate: %g (bloom %u)\n", fp_rate, count);
-    */
-    BuildBloomCacheLine(data_at_cache_line, begin, end);
-    // TODO/FIXME
-    /*
-    // A "before" bit index (append after)
-    int unary_bit_ptr = 0;
-    // An "after" bit index (append before)
-    int entry_bit_ptr = 504;
+  //fprintf(stderr, "Cache line FP rate: %g\n", fp_rate);
 
-    uint32_t prev = 0;
-    for (uint32_t val : vals) {
-      uint32_t diff = val - prev;
-      unary_bit_ptr += (diff >> entry_bits);
-      data_at_cache_line[unary_bit_ptr >> 3] |= char{1} << (unary_bit_ptr & 7);
-      unary_bit_ptr++;
-
-
-      prev = val;
+    uint32_t cur_bit_ptr = unary_bits;
+    for (uint32_t rem_val : rem_vals) {
+    //fprintf(stderr, "Putting %x at %u\n", rem_val >> (20 - base_rem_entry_bits), cur_bit_ptr);
+      bit_table_or_put(data_at_cache_line, cur_bit_ptr, rem_val >> (20 - base_rem_entry_bits));
+      cur_bit_ptr += base_rem_entry_bits;
     }
-    assert (unary_bit_ptr <= entry_bit_ptr);
-    */
+    if (base_rem_entry_bits == 20u) {
+      assert(cur_bit_ptr + entries_with_extra_bit <= nibble_bwd_idx * 4);
+    } else {
+      assert(cur_bit_ptr + entries_with_extra_bit == nibble_bwd_idx * 4);
+    }
+    for (uint32_t i = 0; i < entries_with_extra_bit; ++i) {
+      if ((rem_vals[i] >> (20 - base_rem_entry_bits - 1)) & uint32_t{1}) {
+        bit_table_set_bit(data_at_cache_line, cur_bit_ptr + i);
+      }
+    }
+
+    // Set metadata
+    data_at_cache_line[kCacheLineBytes - 1] = static_cast<char>(unary_bits - (kMaxUnaryBits - 63));
   }
 
   void BuildBloomCacheLine(char *data_at_cache_line, std::vector<uint32_t>::iterator begin, std::vector<uint32_t>::iterator end) const {
     for (auto it = begin; it != end; ++it) {
       FastLocalBloomImpl::AddHashPrepared(*it, /*num_probes*/4, data_at_cache_line);
     }
-    if ((data_at_cache_line[63] & char(0xc0)) == 0) {
+    if ((data_at_cache_line[kCacheLineBytes - 1] & static_cast<char>(0xc0)) == 0) {
       // set one bit to make one of the top two bits non-zero
-      data_at_cache_line[63] |= char(0x80);
+      data_at_cache_line[kCacheLineBytes - 1] |= static_cast<char>(0x80);
     }
     //fprintf(stderr, "Built bloom\n");
   }
@@ -365,8 +524,8 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
 // See description in LocalHybridImpl
 class LocalHybridBitsReader : public FilterBitsReader {
  public:
-  LocalHybridBitsReader(const char* data, int num_probes, uint32_t len_bytes)
-      : data_(data), num_probes_(num_probes), len_bytes_(len_bytes) {}
+  LocalHybridBitsReader(const char* data, uint32_t len_bytes)
+      : data_(data), num_cache_lines_(len_bytes / LocalHybridBitsBuilder::kCacheLineBytes) {}
 
   // No Copy allowed
   LocalHybridBitsReader(const LocalHybridBitsReader&) = delete;
@@ -375,21 +534,82 @@ class LocalHybridBitsReader : public FilterBitsReader {
   ~LocalHybridBitsReader() override {}
 
   bool MayMatch(const Slice& key) override {
-    uint64_t h = GetSliceHash64(key);
-    uint32_t byte_offset;
-    FastLocalBloomImpl::PrepareHash(Lower32of64(h), len_bytes_, data_,
-                                    /*out*/ &byte_offset);
-    return FastLocalBloomImpl::HashMayMatchPrepared(Upper32of64(h), num_probes_,
-                                                    data_ + byte_offset);
+    const uint64_t h64 = GetSliceHash64(key);
+    const uint32_t cache_line = fastrange32(Lower32of64(h64), num_cache_lines_);
+    const char *data_at_cache_line = data_ + LocalHybridBitsBuilder::kCacheLineBytes * cache_line;
+
+    const uint32_t h = Upper32of64(h64);
+
+    const uint32_t meta = static_cast<uint8_t>(data_at_cache_line[LocalHybridBitsBuilder::kCacheLineBytes - 1]);
+    if ((meta & 0xc0u) != 0) {
+      return FastLocalBloomImpl::HashMayMatchPrepared(h, 4,
+                                                      data_at_cache_line);
+    }
+
+    const uint32_t unary_bits = meta + (LocalHybridBitsBuilder::kMaxUnaryBits - 63);
+    const uint32_t count = nbits_popcnt(data_at_cache_line, unary_bits);
+
+    const uint32_t val_to_find = fastrange32(h, LocalHybridBitsBuilder::GetRange(count));
+  //fprintf(stderr, "Preparing hash %x (val %x) on cache line %u\n", h, val_to_find, cache_line);
+    const uint32_t partial_val_to_find = val_to_find >> 20;
+
+    const uint32_t rem_bits = LocalHybridBitsBuilder::kCacheLineBits - LocalHybridBitsBuilder::kCacheLineMetaBits - count * 4 - unary_bits;
+
+  //fprintf(stderr, "Rice count %u, unary_bits/count %g\n", count, (double)unary_bits / count);
+
+    uint32_t base_rem_entry_bits = rem_bits / count;
+    uint32_t entries_with_extra_bit;
+    if (base_rem_entry_bits >= 20u) {
+      base_rem_entry_bits = 20u;
+      entries_with_extra_bit = 0;
+    } else {
+      entries_with_extra_bit = rem_bits % count;
+    }
+
+    const uint32_t base_rem_entry_mask = (uint32_t{1} << base_rem_entry_bits) - 1u;
+    const uint32_t rem_entry_to_find = (val_to_find & 0xfffffu) >> (20u - base_rem_entry_bits);
+
+    uint32_t unary_cur = 0;
+    uint32_t nibble_bwd_idx = (LocalHybridBitsBuilder::kCacheLineBits - LocalHybridBitsBuilder::kCacheLineMetaBits) / 4u;
+    uint32_t cur_partial_val = 0;
+
+    for (uint32_t i = 0; i < count; ++i) {
+      uint32_t tz = general_tzcnt(data_at_cache_line, unary_cur);
+      unary_cur += tz + 1;
+      cur_partial_val += tz << 4;
+      cur_partial_val += get_nibble(data_at_cache_line, --nibble_bwd_idx);
+    //fprintf(stderr, "Vs. partial val %x\n", cur_partial_val);
+      if (cur_partial_val > partial_val_to_find) {
+        return false;
+      } else if (cur_partial_val == partial_val_to_find) {
+        if (base_rem_entry_bits > 0) {
+          uint32_t rem_entry = bit_table_get(data_at_cache_line, unary_bits + i * base_rem_entry_bits, base_rem_entry_mask);
+        //fprintf(stderr, "Looking for %x at %u, found %x\n", rem_entry_to_find, unary_bits + i * base_rem_entry_bits, rem_entry);
+          if (rem_entry_to_find != rem_entry) {
+            continue;
+          }
+        }
+        if (i < entries_with_extra_bit) {
+          bool extra = bit_table_get_bit(data_at_cache_line, unary_bits + count * base_rem_entry_bits + i);
+          if (extra != (1u & (val_to_find >> (20u - base_rem_entry_bits - 1u)))) {
+            continue;
+          }
+        }
+        return true;
+      }
+    }
+    return false;
   }
 
+  using FilterBitsReader::MayMatch;
+  /*
   virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
     std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> hashes;
     std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> byte_offsets;
     for (int i = 0; i < num_keys; ++i) {
       uint64_t h = GetSliceHash64(*keys[i]);
       FastLocalBloomImpl::PrepareHash(Lower32of64(h), len_bytes_, data_,
-                                      /*out*/ &byte_offsets[i]);
+                                      &byte_offsets[i]);
       hashes[i] = Upper32of64(h);
     }
     for (int i = 0; i < num_keys; ++i) {
@@ -397,11 +617,10 @@ class LocalHybridBitsReader : public FilterBitsReader {
           hashes[i], num_probes_, data_ + byte_offsets[i]);
     }
   }
-
+  */
  private:
   const char* data_;
-  const int num_probes_;
-  const uint32_t len_bytes_;
+  const uint32_t num_cache_lines_;
 };
 
 using LegacyBloomImpl = LegacyLocalityBloomImpl</*ExtraRotates*/ false>;
@@ -772,6 +991,9 @@ FilterBitsReader* BloomFilterPolicy::GetFilterBitsReader(
     if (raw_num_probes == -1) {
       // Marker for newer Bloom implementations
       return GetBloomBitsReader(contents);
+    } else if (raw_num_probes == -2) {
+      // Marker for local hybrid filter implementation
+      return new LocalHybridBitsReader(contents.data(), len_with_meta - 5);
     }
     // otherwise
     // Treat as zero probes (always FP) for now.
