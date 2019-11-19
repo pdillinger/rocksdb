@@ -484,7 +484,7 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
       prev = val;
     }
 
-    unary_bits = std::max(kMaxUnaryBits - 63, (unary_bits + kUnaryBitBlockSize - 1) & ~(kUnaryBitBlockSize - 1));
+    unary_bits = std::max(kMaxUnaryBits - 63 * kUnaryBitBlockSize, (unary_bits + kUnaryBitBlockSize - 1) & ~(kUnaryBitBlockSize - 1));
 
     uint32_t rem_bits = nibble_bwd_idx * 4 - unary_bits;
 
@@ -522,7 +522,7 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
     }
 
     // Set metadata
-    data_at_cache_line[kCacheLineBytes - 1] = static_cast<char>(unary_bits - (kMaxUnaryBits - 63));
+    data_at_cache_line[kCacheLineBytes - 1] = static_cast<char>(unary_bits / kUnaryBitBlockSize - (kMaxUnaryBits / kUnaryBitBlockSize - 63));
   }
 
   void BuildBloomCacheLine(char *data_at_cache_line, std::vector<uint32_t>::iterator begin, std::vector<uint32_t>::iterator end) const {
@@ -566,7 +566,7 @@ class LocalHybridBitsReader : public FilterBitsReader {
                                                       data_at_cache_line);
     }
 
-    const uint32_t unary_bits = meta + (LocalHybridBitsBuilder::kMaxUnaryBits - 63);
+    const uint32_t unary_bits = meta * LocalHybridBitsBuilder::kUnaryBitBlockSize + (LocalHybridBitsBuilder::kMaxUnaryBits - 63 * LocalHybridBitsBuilder::kUnaryBitBlockSize);
     const uint32_t count = nbits_popcnt(data_at_cache_line, unary_bits);
 
     const uint32_t val_to_find = fastrange32(h, LocalHybridBitsBuilder::GetRange(count));
@@ -588,6 +588,13 @@ class LocalHybridBitsReader : public FilterBitsReader {
 
     const uint32_t base_rem_entry_mask = (uint32_t{1} << base_rem_entry_bits) - 1u;
     const uint32_t rem_entry_to_find = (val_to_find & 0xfffffu) >> (20u - base_rem_entry_bits);
+
+    /* A timing test hook */
+    /*
+    if ((entries_with_extra_bit+rem_entry_to_find+partial_val_to_find) & 1) {
+      return true;
+    }
+    */
 
     uint32_t unary_cur = 0;
     const char *nibble_bwd_ptr = data_at_cache_line + (LocalHybridBitsBuilder::kCacheLineBits - LocalHybridBitsBuilder::kCacheLineMetaBits) / 8u;
@@ -623,6 +630,13 @@ class LocalHybridBitsReader : public FilterBitsReader {
         break;
       }
     }
+
+    /* A timing test hook */
+    /*
+    if ((entries_with_extra_bit+rem_entry_to_find+partial_val_to_find+unary_cur) & 1) {
+      return true;
+    }
+    */
 
     uint32_t nibble_bwd_idx = (nibble_bwd_ptr - data_at_cache_line) * 2;
 
