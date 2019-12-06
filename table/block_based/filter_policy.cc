@@ -357,9 +357,9 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
   static constexpr uint32_t kUnaryBitBlockSize = kCacheLineBits / 256;
   static constexpr uint32_t kMaxUnaryBits = (((kCacheLineBits - kCacheLineMetaBits) / 3) & ~uint32_t{kUnaryBitBlockSize - 1}) + 4;
 
-  LocalHybridBitsBuilder(const int bits_per_key)
-      : bits_per_key_(bits_per_key) {
-    assert(bits_per_key_);
+  LocalHybridBitsBuilder(const int millibits_per_key)
+      : millibits_per_key_(millibits_per_key) {
+    assert(millibits_per_key >= 1000);
   }
 
   // No Copy allowed
@@ -404,16 +404,17 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
 
   int CalculateNumEntry(const uint32_t bytes) override {
     uint32_t bytes_no_meta = bytes >= 5u ? bytes - 5u : 0;
-    return static_cast<int>(uint64_t{8} * bytes_no_meta / bits_per_key_);
+    return static_cast<int>(uint64_t{8000} * bytes_no_meta /
+                            millibits_per_key_);
   }
 
   uint32_t CalculateSpace(const int num_entry) override {
     uint32_t num_cache_lines = 0;
-    if (bits_per_key_ > 0 && num_entry > 0) {
+    if (millibits_per_key_ > 0 && num_entry > 0) {
       num_cache_lines = static_cast<uint32_t>(
-          (static_cast<uint64_t>(int64_t{num_entry} * bits_per_key_) + kCacheLineBits - 1) / kCacheLineBits);
+          (int64_t{num_entry} * millibits_per_key_ + 511999) / 512000);
     }
-    return num_cache_lines * kCacheLineBytes + /*metadata*/ 5;
+    return num_cache_lines * 64 + /*metadata*/ 5;
   }
 
   static uint32_t GetRange(uint32_t count) {
@@ -538,11 +539,10 @@ class LocalHybridBitsBuilder : public BuiltinFilterBitsBuilder {
     //fprintf(stderr, "Built bloom\n");
   }
 
-  int bits_per_key_;
+  int millibits_per_key_;
   std::vector<uint64_t> hash_entries_;
 };
 
-// See description in LocalHybridImpl
 class LocalHybridBitsReader : public FilterBitsReader {
  public:
   LocalHybridBitsReader(const char* data, uint32_t len_bytes)
@@ -690,6 +690,502 @@ class LocalHybridBitsReader : public FilterBitsReader {
   const char* data_;
   const uint32_t num_cache_lines_;
 };
+
+
+
+
+// Extracts all unique ranged hash vals from sorted raw hashes
+struct RangedHashExtractor {
+  uint64_t current_hash = 0;
+  uint64_t current_val = 0;
+  uint64_t prev_val = 0;
+  size_t cur_idx = 0;
+  uint64_t covered_portion_of_keys = 0;
+
+  bool Load() {
+    for(;;) {
+      if (cur_idx >= hashes_size) {
+        return false;
+      }
+      current_hash = hashes[next_idx];
+      current_val = fastrange64(current_hash, range);
+      if (cur_idx == 0) {
+        return true;
+      }
+      if (current_val != prev_val) {
+        assert(current_val > prev_val);
+        return true;
+      }
+      Advance();
+    }
+  }
+
+  void Advance() {
+    prev_val = current_val;
+    ++cur_idx;
+    covered_portion_of_keys += covered_portion_per_key;
+  }
+
+  RangedHashExtractor(const std::vector<uint64_t>& hashes_, uint64_t range_)
+  : range(range_), hashes_size(hashes_.size()), covered_portion_per_key(std::numeric_limits<uint64_t>::max() / hashes_size), hashes(hashes_)
+  {}
+
+private:
+  const uint64_t range;
+  const size_t hashes_size;
+  const uint64_t covered_portion_per_key;
+  const std::vector<uint64_t>& hashes;
+};
+
+class LinearProbeRiceBitsBuilder : public BuiltinFilterBitsBuilder {
+ public:
+  static constexpr uint32_t kBlockLog2Bytes = 6u;
+  static constexpr uint32_t kBlockLog2Bits = kBlockLog2Bytes + 3u;
+  static constexpr uint32_t kBlockMilliBits = uint32_t{1000} << kBlockLog2Bits;
+  static constexpr uint32_t kBlockBits = uint32_t{1} << kBlockLog2Bits;
+  static constexpr uint32_t kBlockBytes = uint32_t{1} << kBlockLog2Bytes;
+
+  LinearProbeRiceBitsBuilder(const int millibits_per_key)
+      : millibits_per_key_(millibits_per_key) {
+    assert(millibits_per_key >= 1000);
+  }
+
+  // No Copy allowed
+  LinearProbeRiceBitsBuilder(const LinearProbeRiceBitsBuilder&) = delete;
+  void operator=(const LinearProbeRiceBitsBuilder&) = delete;
+
+  ~LinearProbeRiceBitsBuilder() override {}
+
+  virtual void AddKey(const Slice& key) override {
+    uint64_t hash = GetSliceHash64(key);
+    if (hash_entries_.size() == 0 || hash != hash_entries_.back()) {
+      hash_entries_.push_back(hash);
+    }
+  }
+
+  virtual Slice Finish(std::unique_ptr<const char[]>* buf) override {
+    uint32_t len_with_metadata =
+        CalculateSpace(static_cast<uint32_t>(hash_entries_.size()));
+    char* data = new char[len_with_metadata];
+    memset(data, 0, len_with_metadata);
+
+    assert(data);
+    assert(len_with_metadata >= 5);
+
+    uint32_t len = len_with_metadata - 5;
+    if (len > 0) {
+      AddAllEntries(data, len);
+    }
+
+    // -3 = Marker for linear probe rice filter implementation
+    data[len] = static_cast<char>(-2);
+    // FIXME: store value range setting
+    // FIXME: store bloom trailer setting
+
+    const char* const_data = data;
+    buf->reset(const_data);
+    hash_entries_.clear();
+
+    return Slice(data, len_with_metadata);
+  }
+
+  int CalculateNumEntry(const uint32_t bytes) override {
+    uint32_t bytes_no_meta = bytes >= 5u ? bytes - 5u : 0;
+    return static_cast<int>(uint64_t{8000} * bytes_no_meta /
+                            millibits_per_key_);
+  }
+
+  uint32_t CalculateSpace(const int num_entry) override {
+    uint32_t num_blocks = 0;
+    if (millibits_per_key_ > 0 && num_entry > 0) {
+      num_blocks = static_cast<uint32_t>(
+          (int64_t{num_entry} * millibits_per_key_ + kBlockMilliBits - 1) / kBlockMilliBits);
+    }
+    return num_blocks * 64 + /*metadata*/ 5;
+  }
+
+  static uint64_t GetRange(size_t num_keys, uint32_t fp_rate_times_two32) {
+    uint64_t keys = num_keys;
+    // Computes #keys divided by fp rate without floating point.
+    if ((keys >> 32) >= fp_rate_times_two32) {
+      // Would overflow (including 0 == fp_rate_times_two32)
+      return std::numeric_limits<uint64_t>::max();
+    }
+    // FIXME: portable clzll
+    int shift = std::min(__builtin_clzll(keys), 32);
+    return ((keys << shift) / fp_rate_times_two32) << (32 - shift);
+  }
+
+  static uint32_t EstFpRateTimesTwo32(double bpk) {
+    double est_info_bpk = (double{kBlockBits} - 12 - bpk / 2.0) / double{kBlockBits} * bpk - 1.5;
+    double est_fp_rate = std::pow(0.5, est_info_bpk);
+    return static_cast<uint32_t>(est_fp_rate << 32);
+  }
+ private:
+  void AddAllEntries(char* data, size_t len) {
+    const size_t num_keys = hash_entries_.size();
+    assert(num_keys > 0);
+    const size_t num_blocks = len / kBlockBytes;
+    assert(len == num_blocks * kBlockBytes);
+    const uint64_t total_bits = double{num_blocks} * kBlockBits;
+    const uint32_t fp_rate_times_two32 = EstFpRateTimesTwo32(double{total_bits} / num_keys);
+    const uint64_t orig_range = GetRange(num_keys, fp_rate_times_two32);
+    assert(orig_range > 0);
+    const uint64_t rangish_per_key = (orig_range - (orig_range / 32)) / num_keys;
+    // Floor log2, minimum 4, maximum 63
+    int entry_bits = 4;
+    while (entry_bits < 63 && (uint64_t{1} << (entry_bits + 1)) <= rangish_per_key) {
+      ++entry_bits;
+    }
+    const uint64_t entry_mask = (uint64_t{1} << entry_bits) - 1;
+
+    int range_shift = 0;
+    while ((orig_range << range_shift) < (uint64_t{1} << 63)) {
+      ++range_shift;
+    }
+    assert(((orig_range << range_shift) >> 63) == 1);
+    assert(orig_range == (orig_range << range_shift >> range_shift));
+
+    // 10 bits, not including leading 1
+    // along with 6 bits range_shift, this makes 16 bits in metadata.
+    const uint64_t range_mantissa = (((orig_range << range_shift) >> (63 - 10)) & uint64_t{1023});
+    const uint64_t range = ((uint64_t{1024} + range_mantissa) << (63 - 10)) >> range_shift;
+
+    const uint64_t covered_portion_per_block = std::numeric_limits<uint64_t>::max() / (num_blocks - 1);
+    uint64_t covered_portion_of_blocks = 0;
+
+    // TODO faster full sort, after ranged?
+    std::sort(hash_entries_.begin(), hash_entries_.end());
+    RangedHashExtractor rhe(hash_entries_, range);
+
+    size_t rem_blocks = num_blocks;
+    char* data_at_block = data;
+    char* const data_end = data + len;
+
+    std::vector<uint64_t> entries_this_block;
+
+    while (rhe.Load()) {
+      // Check for going to Bloom preemptively. (In the last block we might
+      // need to backtrack to go to Bloom.)
+      size_t rem_keys = num_keys - rhe.cur_idx;
+      // We only use power-of-two number of blocks for tail Bloom
+      if ((rem_blocks & (rem_blocks - 1)) == 0) {
+        if (uint64_t{rem_blocks} * kBlockBits < static_cast<uint64_t>(entry_bits + 1) * rem_keys) {
+          // TODO: bloom
+        }
+      }
+
+      // Encode sync point ranged hash.
+      // Uses varint encoding of difference from expectation for position
+      // in table.
+      const uint64_t expected = fastrange64(covered_portion_of_blocks, range);
+      uint64_t enc_diff;
+      bool throttle = false;
+      // TODO: consider encoding more expensive for negative; less for positive
+      if (expected > rhe.current_val) {
+        // essentially negative. use bottom bit as sign bit
+        enc_diff = (expected - rhe.current_val) * 2 + 1;
+        // See if throttling is appropriate for improving random access times
+        if (rhe.covered_portion_of_keys >= covered_portion_of_blocks - covered_portion_per_block &&
+            (enc_diff >> entry_bits) > kBlockBits &&
+            rem_blocks >= 4) {
+          // Don't get too far ahead in encoding efficiency
+          throttle = true;
+        }
+      } else {
+        // non-negative, marked with zero bottom bit
+        enc_diff = (val - expected) * 2;
+      }
+      char * const data_after_sync = EncodeVarint64(data_at_block, enc_diff);
+      rhe.Advance();
+
+      // Encode as many more keys in block as able (unless throttling)
+      uint32_t rice_bits = static_cast<uint32_t>(data_end - data_after_sync) * 8;
+      if (throttle) {
+        rice_bits -= rice_bits / 4;
+      }
+
+      // Digest them while encoding unary part, saving entry parts, to
+      // determine how many to store.
+      assert(entries_this_block.empty());
+      uint32_t unary_next_bit_ptr = 0;
+      uint32_t committed_entry_bits = 0;
+      while (unary_next_bit_ptr + committed_entry_bits + entry_bits < rice_bits && rhe.Load()) {
+        uint64_t val_diff = rhe.current_val - rhe.prev_val;
+        if ((unary_next_bit_ptr + (val_diff >> entry_bits) + 1) + (committed_entry_bits + entry_bits) > rice_bits) {
+          // Doesn't actually fit
+          break;
+        }
+        assert((val_diff >> entry_bits) < std::numeric_limits<uint32_t>::max());
+        unary_next_bit_ptr += static_cast<uint32_t>(val_diff >> entry_bits);
+        bit_table_set_bit(data_after_sync, unary_next_bit_ptr);
+        ++unary_next_bit_ptr;
+        entries_this_block.push_back(val_diff & entry_mask);
+        committed_entry_bits += entry_bits;
+        assert(unary_next_bit_ptr + committed_entry_bits <= rice_bits);
+      }
+
+      // Encode entries
+      uint32_t num_entries = static_cast<uint32_t>(entries_this_block.size());
+      IAMHERE
+
+      entries_this_block.clear();
+
+      --rem_blocks;
+      data_at_block += kBlockBytes;
+      covered_portion_of_blocks += covered_portion_per_block;
+      covered_portion_of_keys += covered_portion_per_key;
+    }
+  }
+
+  void BuildCacheLine(char *data_at_block, std::vector<uint32_t>::iterator begin, std::vector<uint32_t>::iterator end, double *fp_rate_sum) const {
+    const uint32_t count = static_cast<uint32_t>(end - begin);
+    double fp_rate = std::pow(1.0 - exp(-4.0 * count / kCacheLineBits), 4.0); // bloom rate
+
+    // TODO: pivot point closer to 5? But then we don't have min. 4 entry bits?
+    if (count * 6u > (kCacheLineBits - kCacheLineMetaBits)) {
+      *fp_rate_sum += fp_rate;
+    //fprintf(stderr, "Cache line FP rate: %g (bloom1 %u)\n", fp_rate, count);
+      BuildBloomCacheLine(data_at_block, begin, end);
+      return;
+    }
+
+    std::sort(begin, end);
+
+    uint32_t range = GetRange(count);
+    std::vector<uint32_t> rem_vals;
+    uint32_t unary_bits = 0;
+    uint32_t nibble_bwd_idx = (kCacheLineBits - kCacheLineMetaBits) / 4;
+
+    uint32_t prev = 0;
+    for (auto it = begin; it != end; ++it) {
+      uint32_t val = fastrange32(*it, range);
+    //fprintf(stderr, "Preparing hash %x (val %x)\n", *it, val);
+      assert(val >= prev);
+      uint32_t diff = (val >> 20) - (prev >> 20);
+      unary_bits += (diff >> 4);
+      bit_table_set_bit(data_at_block, unary_bits);
+      unary_bits++;
+      nibble_bwd_idx--;
+      if (unary_bits > kMaxUnaryBits || nibble_bwd_idx * 4 < unary_bits) {
+        *fp_rate_sum += fp_rate;
+      //fprintf(stderr, "Cache line FP rate: %g (bloom2 %u)\n", fp_rate, count);
+        BuildBloomCacheLine(data_at_block, begin, end);
+        return;
+      }
+      or_put_nibble(data_at_block, nibble_bwd_idx, diff & uint32_t{0xf});
+      // Use (TBD part of) bottom 20 bits soon
+      rem_vals.push_back(val & uint32_t{0xfffff});
+      prev = val;
+    }
+
+    unary_bits = std::max(kMaxUnaryBits - 63 * kUnaryBitBlockSize, (unary_bits + kUnaryBitBlockSize - 1) & ~(kUnaryBitBlockSize - 1));
+
+    uint32_t rem_bits = nibble_bwd_idx * 4 - unary_bits;
+
+  //fprintf(stderr, "Rice count %u, unary_bits/count %g\n", count, (double)unary_bits / rem_vals.size());
+
+    uint32_t base_rem_entry_bits = rem_bits / count;
+    uint32_t entries_with_extra_bit;
+    if (base_rem_entry_bits >= 20u) {
+      base_rem_entry_bits = 20u;
+      entries_with_extra_bit = 0;
+      fp_rate = 0;
+    } else {
+      entries_with_extra_bit = rem_bits % count;
+      fp_rate = 1.0 * entries_with_extra_bit / (range >> (20u - base_rem_entry_bits - 1u));
+    }
+    fp_rate += 1.0 * (count - entries_with_extra_bit) / (range >> (20u - base_rem_entry_bits));
+    *fp_rate_sum += fp_rate;
+  //fprintf(stderr, "Cache line FP rate: %g\n", fp_rate);
+
+    uint32_t cur_bit_ptr = unary_bits;
+    for (uint32_t rem_val : rem_vals) {
+    //fprintf(stderr, "Putting %x at %u\n", rem_val >> (20 - base_rem_entry_bits), cur_bit_ptr);
+      bit_table_or_put(data_at_block, cur_bit_ptr, rem_val >> (20 - base_rem_entry_bits));
+      cur_bit_ptr += base_rem_entry_bits;
+    }
+    if (base_rem_entry_bits == 20u) {
+      assert(cur_bit_ptr + entries_with_extra_bit <= nibble_bwd_idx * 4);
+    } else {
+      assert(cur_bit_ptr + entries_with_extra_bit == nibble_bwd_idx * 4);
+    }
+    for (uint32_t i = 0; i < entries_with_extra_bit; ++i) {
+      if ((rem_vals[i] >> (20 - base_rem_entry_bits - 1)) & uint32_t{1}) {
+        bit_table_set_bit(data_at_block, cur_bit_ptr + i);
+      }
+    }
+
+    // Set metadata
+    data_at_block[kCacheLineBytes - 1] = static_cast<char>(unary_bits / kUnaryBitBlockSize - (kMaxUnaryBits / kUnaryBitBlockSize - 63));
+  }
+
+  void BuildBloomCacheLine(char *data_at_block, std::vector<uint32_t>::iterator begin, std::vector<uint32_t>::iterator end) const {
+    for (auto it = begin; it != end; ++it) {
+      FastLocalBloomImpl::AddHashPrepared(*it, /*num_probes*/4, data_at_block);
+    }
+    if ((data_at_block[kCacheLineBytes - 1] & static_cast<char>(0xc0)) == 0) {
+      // set one bit to make one of the top two bits non-zero
+      data_at_block[kCacheLineBytes - 1] |= static_cast<char>(0x80);
+    }
+    //fprintf(stderr, "Built bloom\n");
+  }
+
+  int millibits_per_key_;
+  std::vector<uint64_t> hash_entries_;
+};
+
+class LinearProbeRiceBitsReader : public FilterBitsReader {
+ public:
+  LinearProbeRiceBitsReader(const char* data, uint32_t len_bytes)
+      : data_(data), num_blocks_(len_bytes / LinearProbeRiceBitsBuilder::kCacheLineBytes) {}
+
+  // No Copy allowed
+  LinearProbeRiceBitsReader(const LinearProbeRiceBitsReader&) = delete;
+  void operator=(const LinearProbeRiceBitsReader&) = delete;
+
+  ~LinearProbeRiceBitsReader() override {}
+
+  bool MayMatch(const Slice& key) override {
+    const uint64_t h64 = GetSliceHash64(key);
+    const uint32_t block = fastrange32(Lower32of64(h64), num_blocks_);
+    const char *data_at_block = data_ + LinearProbeRiceBitsBuilder::kCacheLineBytes * block;
+    return HashMayMatchPrepared(Upper32of64(h64), data_at_block);
+  }
+
+  bool HashMayMatchPrepared(const uint32_t h, const char *data_at_block) {
+    const uint32_t meta = static_cast<uint8_t>(data_at_block[LinearProbeRiceBitsBuilder::kCacheLineBytes - 1]);
+    if ((meta & 0xc0u) != 0) {
+      return FastLocalBloomImpl::HashMayMatchPrepared(h, 4,
+                                                      data_at_block);
+    }
+
+    const uint32_t unary_bits = meta * LinearProbeRiceBitsBuilder::kUnaryBitBlockSize + (LinearProbeRiceBitsBuilder::kMaxUnaryBits - 63 * LinearProbeRiceBitsBuilder::kUnaryBitBlockSize);
+    const uint32_t count = nbits_popcnt(data_at_block, unary_bits);
+
+    const uint32_t val_to_find = fastrange32(h, LinearProbeRiceBitsBuilder::GetRange(count));
+  //fprintf(stderr, "Preparing hash %x (val %x) on cache line %u\n", h, val_to_find, block);
+    const uint32_t partial_val_to_find = val_to_find >> 20;
+
+    const uint32_t rem_bits = LinearProbeRiceBitsBuilder::kCacheLineBits - LinearProbeRiceBitsBuilder::kCacheLineMetaBits - count * 4 - unary_bits;
+
+  //fprintf(stderr, "Rice count %u, unary_bits/count %g\n", count, (double)unary_bits / count);
+
+    uint32_t base_rem_entry_bits = rem_bits / count;
+    uint32_t entries_with_extra_bit;
+    if (base_rem_entry_bits >= 20u) {
+      base_rem_entry_bits = 20u;
+      entries_with_extra_bit = 0;
+    } else {
+      entries_with_extra_bit = rem_bits % count;
+    }
+
+    const uint32_t base_rem_entry_mask = (uint32_t{1} << base_rem_entry_bits) - 1u;
+    const uint32_t rem_entry_to_find = (val_to_find & 0xfffffu) >> (20u - base_rem_entry_bits);
+
+    /* A timing test hook */
+    /*
+    if ((entries_with_extra_bit+rem_entry_to_find+partial_val_to_find) & 1) {
+      return true;
+    }
+    */
+
+    uint32_t unary_cur = 0;
+    const char *nibble_bwd_ptr = data_at_block + (LinearProbeRiceBitsBuilder::kCacheLineBits - LinearProbeRiceBitsBuilder::kCacheLineMetaBits) / 8u;
+    uint32_t cur_partial_val = 0;
+
+    uint32_t i = 0;
+    // Try skipping ahead by 8 nibbles at a time
+    // Didn't seem to help: skipping by 16 and by 4 also
+    while (i + 8 <= count && cur_partial_val + 30 < partial_val_to_find) {
+      uint32_t nibbles_sum = 0;
+#if defined(HAVE_POPCNT) && defined(HAVE_BMI2)
+      {
+        uint32_t nibbles = reinterpret_cast<const uint32_t*>(nibble_bwd_ptr)[-1];
+        nibbles = (nibbles & uint32_t{0xf0f0f0f}) + ((nibbles & uint32_t{0xf0f0f0f0}) >> 4);
+        nibbles = (nibbles & uint32_t{0xff00ff}) + ((nibbles & uint32_t{0xff00ff00}) >> 8);
+        nibbles = (nibbles & uint32_t{0xffff}) + ((nibbles & uint32_t{0xffff0000}) >> 16);
+        nibbles_sum += nibbles;
+      }
+#else
+      for (uint32_t i = 1; i <= 8; i++) {
+        nibbles_sum += get_nibble(data_at_block, nibble_bwd_idx - i);
+      }
+#endif
+      uint32_t nth1 = nth_set_bit_index1(data_at_block, unary_cur, 8);
+      uint32_t skip_partial_val = cur_partial_val + nibbles_sum + ((nth1 - 8) << 4);
+      // NB: not easy to accept == case, because potentially earlier == cases
+      if (skip_partial_val < partial_val_to_find) {
+        cur_partial_val = skip_partial_val;
+        i += 8;
+        nibble_bwd_ptr -= 4;
+        unary_cur += nth1;
+      } else {
+        break;
+      }
+    }
+
+    /* A timing test hook */
+    /*
+    if ((entries_with_extra_bit+rem_entry_to_find+partial_val_to_find+unary_cur) & 1) {
+      return true;
+    }
+    */
+
+    uint32_t nibble_bwd_idx = (nibble_bwd_ptr - data_at_block) * 2;
+
+    for (; i < count; ++i) {
+      uint32_t tz = general_tzcnt(data_at_block, unary_cur);
+      unary_cur += tz + 1;
+      cur_partial_val += tz << 4;
+      cur_partial_val += get_nibble(data_at_block, --nibble_bwd_idx);
+    //fprintf(stderr, "Vs. partial val %x\n", cur_partial_val);
+      if (cur_partial_val > partial_val_to_find) {
+        return false;
+      } else if (cur_partial_val == partial_val_to_find) {
+        if (base_rem_entry_bits > 0) {
+          uint32_t rem_entry = bit_table_get(data_at_block, unary_bits + i * base_rem_entry_bits, base_rem_entry_mask);
+        //fprintf(stderr, "Looking for %x at %u, found %x\n", rem_entry_to_find, unary_bits + i * base_rem_entry_bits, rem_entry);
+          if (rem_entry_to_find != rem_entry) {
+            continue;
+          }
+        }
+        if (i < entries_with_extra_bit) {
+          bool extra = bit_table_get_bit(data_at_block, unary_bits + count * base_rem_entry_bits + i);
+          if (extra != (1u & (val_to_find >> (20u - base_rem_entry_bits - 1u)))) {
+            continue;
+          }
+        }
+        return true;
+      }
+    }
+    return false;
+  }
+
+  virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
+    std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> hashes;
+    std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> byte_offsets;
+    for (int i = 0; i < num_keys; ++i) {
+      const uint64_t h64 = GetSliceHash64(*keys[i]);
+      const uint32_t block = fastrange32(Lower32of64(h64), num_blocks_);
+      const uint32_t offset = LinearProbeRiceBitsBuilder::kCacheLineBytes * block;
+      PREFETCH(data_ + offset, 0 /* rw */, 1 /* locality */);
+      PREFETCH(data_ + offset + 63, 0 /* rw */, 1 /* locality */);
+      byte_offsets[i] = offset;
+      hashes[i] = Upper32of64(h64);
+    }
+    for (int i = 0; i < num_keys; ++i) {
+      may_match[i] = HashMayMatchPrepared(hashes[i], data_ + byte_offsets[i]);
+    }
+  }
+ private:
+  const char* data_;
+  const uint32_t num_blocks_;
+};
+
+
+
+
 
 using LegacyBloomImpl = LegacyLocalityBloomImpl</*ExtraRotates*/ false>;
 
@@ -913,6 +1409,7 @@ const std::vector<BloomFilterPolicy::Mode> BloomFilterPolicy::kAllFixedImpls = {
     kDeprecatedBlock,
     kFastLocalBloom,
     kLocalHybrid,
+    kLinearProbeRice,
 };
 
 const std::vector<BloomFilterPolicy::Mode> BloomFilterPolicy::kAllUserModes = {
@@ -1021,7 +1518,7 @@ FilterBitsBuilder* BloomFilterPolicy::GetBuilderWithContext(
         if (context.table_options.format_version < 5) {
           cur = kLegacyBloom;
         } else {
-          cur = kLocalHybrid;
+          cur = kFastLocalBloom;
         }
         break;
       case kDeprecatedBlock:
@@ -1030,6 +1527,8 @@ FilterBitsBuilder* BloomFilterPolicy::GetBuilderWithContext(
         return new FastLocalBloomBitsBuilder(millibits_per_key_);
       case kLocalHybrid:
         return new LocalHybridBitsBuilder(millibits_per_key_);
+      case kLinearProbeRice:
+        return new LinearProbeRiceBitsBuilder(millibits_per_key_);
       case kLegacyBloom:
         return new LegacyBloomBitsBuilder(whole_bits_per_key_);
     }
@@ -1085,6 +1584,9 @@ FilterBitsReader* BloomFilterPolicy::GetFilterBitsReader(
     } else if (raw_num_probes == -2) {
       // Marker for local hybrid filter implementation
       return new LocalHybridBitsReader(contents.data(), len_with_meta - 5);
+    } else if (raw_num_probes == -3) {
+      // Marker for linear probe rice implementation
+      return new LinearProbeRiceBitsReader(contents.data(), len_with_meta - 5);
     }
     // otherwise
     // Treat as zero probes (always FP) for now.
