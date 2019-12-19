@@ -11,6 +11,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <atomic>
 
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/table.h"
@@ -27,6 +28,58 @@ class BuiltinFilterBitsBuilder : public FilterBitsBuilder {
   // metadata. Passing the result to CalculateNumEntry should
   // return >= the num_entry passed in.
   virtual uint32_t CalculateSpace(const int num_entry) = 0;
+};
+
+// EXPERIMENTAL/SUBJECT TO CHANGE: This setting hasn't been integrated into
+// the options because we are expecting bigger changes to the options around
+// SST filters, and it will be easier to integrate then. For now, it is
+// externally controlled by an environment variable,
+// ROCKSDB_EXPERIMENTAL_FSP=0, 1, or 2 (recommended), or by calling
+// SetFilterSizePolicy on BloomFilterPolicy.
+//
+// Different ways of tweaking filter sizes for better performance.
+// This currently only has an effect with format_version>=5.
+enum class FilterSizePolicy : char {
+  // Each filter should use the number of bytes that is most consistent
+  // with the filter_policy's bits_per_key setting that is supported by
+  // the implementation. This is the "old" behavior.
+  //
+  // This setting also optimizes the size of filters on disk (without
+  // regard to filesystem internal fragmentation on the SST file) for a
+  // given accuracy (false positive rate).
+  kOptimizeRawSize = 0x00,
+
+  // kOptimizeForMemory*: Chooses filter sizes that optimize runtime memory
+  // footprint by minimizing internal fragmentation in the memory allocator
+  // for the block cache, which is jemalloc by default.
+  //
+  // For example, if using 8 bits_per_key (for simplicity; also 8 bits per
+  // byte), then 9*1024 keys in a filter would use 9KB with
+  // kOptimizeRawSize. But the nearest allocation sizes used by Jemalloc
+  // are 8KB and 10KB, so this size filter would leave 10% of the memory
+  // allocated for it unused.
+  //
+  // The simplest way to reclaim this unused memory would simply be to
+  // "round up" the filter size to just fit in the memory allocation size
+  // that would be used for it anyway. This approach is not recommended
+  // and not implemented because it is expected to produce too much
+  // variance in behavior depending on filter sizes.
+
+  // Optimizes filter sizes for memory footprint (0 - 20% savings) while
+  // maintaining the same *average* size in SST files as kOptimizeRawSize,
+  // by mixing rounding up and down to the nearest allocation sizes. Because
+  // of non-linearity of false positive rates with respect to filter bits
+  // per key, this increases FP rate by TODO
+  kOptimizeForMemorySameAvgDiskSize = 0x01,
+
+  // RECOMMENDED
+  // Optimizes filter sizes for memory footprint (0 - TODO% savings) while
+  // maintaining roughly the same *average* false positive rate in filters
+  // (weighted by number of keys) as kOptimizeRawSize, by mixing rounding
+  // up and down to the nearest allocation sizes. Because of non-linearity
+  // of false positive rates with respect to filter bits per key, this
+  // increases filter size in SST files by TODO
+  kOptimizeForMemorySameAvgFpRate = 0x02,
 };
 
 // RocksDB built-in filter policy for Bloom or Bloom-like filters.
@@ -110,6 +163,9 @@ class BloomFilterPolicy : public FilterPolicy {
   // Essentially for testing only: legacy whole bits/key
   int GetWholeBitsPerKey() const { return whole_bits_per_key_; }
 
+  // EXPERIMENTAL
+  void SetFilterSizePolicy(FilterSizePolicy fsp) { filter_size_policy_ = fsp; }
+
  private:
   // Newer filters support fractional bits per key. For predictable behavior
   // of 0.001-precision values across floating point implementations, we
@@ -124,6 +180,15 @@ class BloomFilterPolicy : public FilterPolicy {
   // Selected mode (a specific implementation or way of selecting an
   // implementation) for building new SST filters.
   Mode mode_;
+
+  // The sizing policy in effect (see FilterSizePolicy)
+  FilterSizePolicy filter_size_policy_;
+
+  // State for implementing a FilterSizePolicy. Essentially, this tracks a
+  // surplus or deficit of filter bytes stored to SST files, due to "rounding"
+  // up or down to memory allocation sizes, vs. what would have been used
+  // otherwise (kOptimizeRawSize).
+  mutable std::atomic<int64_t> rounding_balance_bytes_;
 
   // For newer Bloom filter implementation(s)
   FilterBitsReader* GetBloomBitsReader(const Slice& contents) const;
