@@ -35,10 +35,15 @@ using GFLAGS_NAMESPACE::SetUsageMessage;
 DEFINE_uint32(seed, 0, "Seed for random number generators");
 
 DEFINE_double(working_mem_size_mb, 200,
-              "MB of memory to get up to among all filters");
+              "MB of memory to get up to among all filters, unless "
+              "m_keys_total_max is specified.");
 
 DEFINE_uint32(average_keys_per_filter, 10000,
               "Average number of keys per filter");
+
+DEFINE_double(vary_key_count_ratio, 0.4,
+              "Vary number of keys by up to +/- vary_key_count_ratio * "
+              "average_keys_per_filter.");
 
 DEFINE_uint32(key_size, 24, "Average number of bytes for each key");
 
@@ -55,6 +60,11 @@ DEFINE_uint32(batch_size, 8, "Number of keys to group in each batch");
 DEFINE_double(bits_per_key, 10.0, "Bits per key setting for filters");
 
 DEFINE_double(m_queries, 200, "Millions of queries for each test mode");
+
+DEFINE_double(m_keys_total_max, 0,
+              "Maximum total keys added to filters, in millions. "
+              "0 (default) disables. Non-zero overrides working_mem_size_mb "
+              "option.");
 
 DEFINE_bool(use_full_block_reader, false,
             "Use FullFilterBlockReader interface rather than FilterBitsReader");
@@ -281,10 +291,17 @@ void FilterBench::Go() {
     }
   }
 
-  uint32_t variance_mask = 1;
-  while (variance_mask * variance_mask * 4 < FLAGS_average_keys_per_filter) {
-    variance_mask = variance_mask * 2 + 1;
+  if (FLAGS_vary_key_count_ratio < 0.0 || FLAGS_vary_key_count_ratio > 1.0) {
+    throw std::runtime_error("-vary_key_count_ratio must be >= 0.0 and <= 1.0");
   }
+
+  // For example, average_keys_per_filter = 100, vary_key_count_ratio = 0.1.
+  // Varys up to +/- 10 keys. variance_range = 21 (generating value 0..20).
+  // variance_offset = 10, so value - offset average value is always 0.
+  const uint32_t variance_range =
+      1 + 2 * static_cast<uint32_t>(FLAGS_vary_key_count_ratio *
+                                    FLAGS_average_keys_per_filter);
+  const uint32_t variance_offset = variance_range / 2;
 
   const std::vector<TestMode> &testModes =
       FLAGS_best_case ? bestCaseTestModes
@@ -302,14 +319,27 @@ void FilterBench::Go() {
 
   size_t total_memory_used = 0;
   size_t total_keys_added = 0;
+  size_t max_total_keys;
+  size_t max_mem;
+  if (FLAGS_m_keys_total_max > 0) {
+    max_total_keys = size_t{1000000} * FLAGS_m_keys_total_max;
+    max_mem = SIZE_MAX;
+  } else {
+    max_total_keys = SIZE_MAX;
+    max_mem = static_cast<size_t>(1024 * 1024 * FLAGS_working_mem_size_mb);
+  }
 
   rocksdb::StopWatchNano timer(rocksdb::Env::Default(), true);
 
-  while (total_memory_used < 1024 * 1024 * FLAGS_working_mem_size_mb) {
+  while ((FLAGS_working_mem_size_mb == 0 || total_memory_used < max_mem) &&
+         total_keys_added < max_total_keys) {
     uint32_t filter_id = random_.Next();
     uint32_t keys_to_add = FLAGS_average_keys_per_filter +
-                           (random_.Next() & variance_mask) -
-                           (variance_mask / 2);
+                           fastrange32(random_.Next(), variance_range) -
+                           variance_offset;
+    if (max_total_keys - total_keys_added < keys_to_add) {
+      keys_to_add = static_cast<uint32_t>(max_total_keys - total_keys_added);
+    }
     infos_.emplace_back();
     FilterInfo &info = infos_.back();
     info.filter_id_ = filter_id;

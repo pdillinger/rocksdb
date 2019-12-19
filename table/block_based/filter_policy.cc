@@ -28,9 +28,12 @@ namespace {
 // See description in FastLocalBloomImpl
 class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
  public:
-  explicit FastLocalBloomBitsBuilder(const int millibits_per_key)
+  explicit FastLocalBloomBitsBuilder(
+      const int millibits_per_key, std::atomic<int64_t>* rounding_balance_bytes,
+      FilterSizePolicy filter_size_policy)
       : millibits_per_key_(millibits_per_key),
-        num_probes_(FastLocalBloomImpl::ChooseNumProbes(millibits_per_key_)) {
+        rounding_balance_bytes_(rounding_balance_bytes),
+        filter_size_policy_(filter_size_policy) {
     assert(millibits_per_key >= 1000);
   }
 
@@ -48,8 +51,10 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
   }
 
   virtual Slice Finish(std::unique_ptr<const char[]>* buf) override {
-    uint32_t len_with_metadata =
-        CalculateSpace(static_cast<uint32_t>(hash_entries_.size()));
+    uint32_t num_entry = static_cast<uint32_t>(hash_entries_.size());
+    uint32_t orig_len_with_metadata = CalculateSpace(num_entry);
+    uint32_t len_with_metadata = AdjustSizeForPolicy(orig_len_with_metadata);
+
     char* data = new char[len_with_metadata];
     memset(data, 0, len_with_metadata);
 
@@ -57,8 +62,20 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
     assert(len_with_metadata >= 5);
 
     uint32_t len = len_with_metadata - 5;
+    // Compute num_probes after any rounding / adjustments
+    int actual_millibits_per_key =
+        static_cast<int>(uint64_t{len} * 8000 / std::max(num_entry, 1U));
+    // BEGIN XXX/TODO(peterd): preserving old/default behavior for now to
+    // minimize unit test churn. Remove this some time.
+    if (filter_size_policy_ == FilterSizePolicy::kOptimizeRawSize) {
+      actual_millibits_per_key = millibits_per_key_;
+    }
+    // END XXX/TODO
+    int num_probes =
+        FastLocalBloomImpl::ChooseNumProbes(actual_millibits_per_key);
+
     if (len > 0) {
-      AddAllEntries(data, len);
+      AddAllEntries(data, len, num_probes);
     }
 
     // See BloomFilterPolicy::GetBloomBitsReader re: metadata
@@ -67,7 +84,7 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
     // 0 = Marker for this sub-implementation
     data[len + 1] = static_cast<char>(0);
     // num_probes (and 0 in upper bits for 64-byte block size)
-    data[len + 2] = static_cast<char>(num_probes_);
+    data[len + 2] = static_cast<char>(num_probes);
     // rest of metadata stays zero
 
     const char* const_data = data;
@@ -93,7 +110,110 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
   }
 
  private:
-  void AddAllEntries(char* data, uint32_t len) {
+  uint32_t AdjustSizeForPolicy(uint32_t orig_len_with_metadata) {
+    if (filter_size_policy_ == FilterSizePolicy::kOptimizeRawSize) {
+      // Use as is ("old" way)
+      return orig_len_with_metadata;
+    }
+    // else must be kOptimizeForMemory*
+
+    if (orig_len_with_metadata < 128) {
+      // Too small to consider
+      return orig_len_with_metadata;
+    }
+
+    uint32_t num_entry = static_cast<uint32_t>(hash_entries_.size());
+
+    // If not for cache line blocks in the filter, what would the ideal
+    // length in bytes be?
+    // NB: the BuiltinFilterBitsBuilder API presumes len fits in uint32_t.
+    uint32_t ideal_len = static_cast<uint32_t>(
+        (int64_t{num_entry} * millibits_per_key_ + 7999) / 8000);
+
+    // Include 64 bytes overhead, because we can only use filter data
+    // in memory allocation size minus 64 bytes (because we have to reserve
+    // 5 bytes for filter metadata and 5 bytes for block cache metadata, and
+    // the minimum we can reserve is on 64 byte block.
+    uint32_t ideal_len_with_overhead = ideal_len + 64;
+
+    // Find the spacing between the nearest allocation sizes used by
+    // jemalloc.
+    uint32_t alloc_size_spacing = 0x10000000U;
+    while (alloc_size_spacing * 8 > ideal_len_with_overhead) {
+      alloc_size_spacing /= 2;
+    }
+    assert(alloc_size_spacing > 0);
+
+    // Nearest memory allocation size <= ideal size
+    uint32_t lower = ideal_len_with_overhead & ~(alloc_size_spacing - 1);
+    assert(lower <= ideal_len_with_overhead);
+    // Nearest memory allocation size > ideal size
+    uint32_t upper = lower + alloc_size_spacing;
+    assert(ideal_len_with_overhead < upper);
+
+    // Absolute differences
+    uint32_t lower_diff = ideal_len_with_overhead - lower;
+    uint32_t upper_diff = upper - ideal_len_with_overhead;
+
+    // Load byte balance to inform rounding up vs. down. (OK if this
+    // goes stale, because a data race can only have temporary impact,
+    // assuming bounded #threads.)
+    int64_t balance = rounding_balance_bytes_->load();
+    uint32_t choice;
+    if (lower_diff < upper_diff) {
+      // Natural inclination to round down.
+      // OK if we don't go too negative.
+      if (balance - int64_t{lower_diff} > -int64_t{ideal_len_with_overhead}) {
+        choice = lower;
+      } else {
+        choice = upper;
+      }
+    } else {
+      // Natural inclination to round up.
+      // OK if we don't go too positive
+      if (balance + int64_t{upper_diff} < int64_t{ideal_len_with_overhead}) {
+        choice = upper;
+      } else {
+        choice = lower;
+      }
+    }
+
+    uint32_t forgiveness;
+    if (filter_size_policy_ ==
+        FilterSizePolicy::kOptimizeForMemorySameAvgFpRate) {
+      // "Forgive" enough extra bytes to keep the FP rate reasonably
+      // consistent. When exactly between alloc sizes, about 0.5% more memory
+      // overall seems about enough to make up for FP rate penalty of using
+      // different bits-per-key ratios.
+      constexpr double peak_forgiveness_ratio = 0.005;
+      // 0 -> at alloc size, 1 -> farthest from alloc size
+      double badness_ratio =
+          2.0 * std::min(lower_diff, upper_diff) / (upper - lower);
+      // We need non-linearity, with rapid forgiveness when veering away
+      // from alloc size.
+      double forgiveness_ratio =
+          peak_forgiveness_ratio * std::pow(badness_ratio, 0.4);
+      forgiveness =
+          static_cast<uint32_t>(ideal_len_with_overhead * forgiveness_ratio);
+    } else {
+      assert(filter_size_policy_ ==
+             FilterSizePolicy::kOptimizeForMemorySameAvgDiskSize);
+      // No adjustment for FP rate
+      forgiveness = 0;
+    }
+
+    uint32_t adjusted_len_with_metadata = choice - 64 + 5;
+
+    // Atomically update the byte balance for rounding up vs. down.
+    // Note: considered using `choice - ideal_len_with_overhead` but
+    // instead used the practical balance, adjusted - orig.
+    *rounding_balance_bytes_ += int64_t{adjusted_len_with_metadata} -
+                                orig_len_with_metadata - forgiveness;
+
+    return adjusted_len_with_metadata;
+  }
+
+  void AddAllEntries(char* data, uint32_t len, int num_probes) {
     // Simple version without prefetching:
     //
     // for (auto h : hash_entries_) {
@@ -124,7 +244,7 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
       uint32_t& hash_ref = hashes[i & kBufferMask];
       uint32_t& byte_offset_ref = byte_offsets[i & kBufferMask];
       // Process (add)
-      FastLocalBloomImpl::AddHashPrepared(hash_ref, num_probes_,
+      FastLocalBloomImpl::AddHashPrepared(hash_ref, num_probes,
                                           data + byte_offset_ref);
       // And buffer
       uint64_t h = hash_entries_.front();
@@ -136,16 +256,19 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
 
     // Finish processing
     for (i = 0; i <= kBufferMask && i < num_entries; ++i) {
-      FastLocalBloomImpl::AddHashPrepared(hashes[i], num_probes_,
+      FastLocalBloomImpl::AddHashPrepared(hashes[i], num_probes,
                                           data + byte_offsets[i]);
     }
   }
 
   int millibits_per_key_;
-  int num_probes_;
   // A deque avoids unnecessary copying of already-saved values
   // and has near-minimal peak memory use.
   std::deque<uint64_t> hash_entries_;
+  // See BloomFilterPolicy::rounding_balance_bytes_
+  std::atomic<int64_t>* rounding_balance_bytes_;
+  // The sizing policy in effect (see FilterSizePolicy)
+  FilterSizePolicy filter_size_policy_;
 };
 
 // See description in FastLocalBloomImpl
@@ -419,7 +542,7 @@ const std::vector<BloomFilterPolicy::Mode> BloomFilterPolicy::kAllUserModes = {
 };
 
 BloomFilterPolicy::BloomFilterPolicy(double bits_per_key, Mode mode)
-    : mode_(mode) {
+    : mode_(mode), rounding_balance_bytes_(0) {
   // Sanitize bits_per_key
   if (bits_per_key < 1.0) {
     bits_per_key = 1.0;
@@ -436,6 +559,17 @@ BloomFilterPolicy::BloomFilterPolicy(double bits_per_key, Mode mode)
   // e.g. 7.4999999999999 will round up to 8, but that provides more
   // predictability against small arithmetic errors in floating point.
   whole_bits_per_key_ = (millibits_per_key_ + 500) / 1000;
+
+  // EXPERIMENTAL
+  const char* v = getenv("ROCKSDB_EXPERIMENTAL_FSP");
+  if (v && std::string("1") == v) {
+    filter_size_policy_ = FilterSizePolicy::kOptimizeForMemorySameAvgDiskSize;
+  } else if (v && std::string("2") == v) {
+    filter_size_policy_ = FilterSizePolicy::kOptimizeForMemorySameAvgFpRate;
+  } else {
+    // old / default for now
+    filter_size_policy_ = FilterSizePolicy::kOptimizeRawSize;
+  }
 }
 
 BloomFilterPolicy::~BloomFilterPolicy() {}
@@ -525,7 +659,8 @@ FilterBitsBuilder* BloomFilterPolicy::GetBuilderWithContext(
       case kDeprecatedBlock:
         return nullptr;
       case kFastLocalBloom:
-        return new FastLocalBloomBitsBuilder(millibits_per_key_);
+        return new FastLocalBloomBitsBuilder(
+            millibits_per_key_, &rounding_balance_bytes_, filter_size_policy_);
       case kLegacyBloom:
         return new LegacyBloomBitsBuilder(whole_bits_per_key_);
     }
