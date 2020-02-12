@@ -20,6 +20,7 @@
 #include "util/bloom_impl.h"
 #include "util/coding.h"
 #include "util/hash.h"
+#include "util/util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -193,6 +194,385 @@ class FastLocalBloomBitsReader : public FilterBitsReader {
   const char* data_;
   const int num_probes_;
   const uint32_t len_bytes_;
+};
+
+struct GaussData {
+  // Contents of this row in the coefficient matrix, starting at `start`
+  // (rest implicitly 0)
+  // Originally based on hash, but updated in gaussian elimination.
+  uint64_t coeff_row = 0;
+  // Full contents of (corresponding) this row in the match matrix.
+  // Originally based on hash, but updated in gaussian elimination.
+  uint32_t match_row = 0;
+  // The index of the first non-zero column in coeff for this row.
+  // Equivalently, the starting index of output rows to be used in
+  // query. Based on hash.
+  uint32_t start = 0;
+  // A row in output, or a column in coeff.
+  // Computed during gaussian elimination.
+  uint32_t pivot = 0;
+
+  static constexpr uint32_t front_smash = 20;
+  static constexpr uint32_t back_smash = 20;
+
+  static inline uint32_t HashToStart(uint64_t h, uint32_t num_output_rows) {
+    const uint32_t addrs = num_output_rows - 63 + front_smash + back_smash;
+    uint32_t start = fastrange32(static_cast<uint32_t>(h >> 32), addrs);
+    start = std::max(start, front_smash);
+    start -= front_smash;
+    start = std::min(start, num_output_rows - 64);
+    assert(start < num_output_rows - 63);
+    return start;
+  }
+
+  static inline uint64_t HashToCoeffRow(uint64_t h) {
+    uint64_t row = (h + (h >> 32)) * 0x9e3779b97f4a7c13;
+    row |= uint64_t{1} << 63;
+    return row;
+  }
+
+  static inline uint32_t HashToMatchRow(uint64_t h) {
+    return static_cast<uint32_t>(h);
+  }
+
+  inline void Reset(uint64_t h, uint32_t num_output_rows, uint32_t match_row_mask) {
+    start = HashToStart(h, num_output_rows);
+    coeff_row = HashToCoeffRow(h);
+    match_row = HashToMatchRow(h) & match_row_mask;
+    pivot = 0;
+  }
+
+  static inline bool DotCoeffRowWithOutputColumn(uint32_t start, uint64_t coeff_row, const uint64_t *output_data, uint32_t match_bits, uint32_t selected_match_bit) {
+    uint32_t start_word = (start / 64) * match_bits + selected_match_bit;
+    uint32_t start_bit = start % 64;
+    // TODO: endianness
+    uint64_t output_column = output_data[start_word] >> start_bit;
+    if (start_bit > 0) {
+      output_column |= output_data[start_word + match_bits] << (64 - start_bit);
+    }
+    return __builtin_parityl(output_column & coeff_row) != 0;
+  }
+
+  static inline void StoreOutputVal(bool val, uint64_t *output_data, uint32_t match_bits, uint32_t start, uint32_t selected_match_bit) {
+    uint32_t selected_word = (start / 64) * match_bits + selected_match_bit;
+    uint64_t bit_selector = uint64_t{1} << (start % 64);
+
+    // TODO: endianness
+    if (val) {
+      output_data[selected_word] |= bit_selector;
+    } else {
+      output_data[selected_word] &= ~bit_selector;
+    }
+  }
+};
+
+class SimpleGaussBitsBuilder : public BuiltinFilterBitsBuilder {
+ public:
+  explicit SimpleGaussBitsBuilder(const int millibits_per_key)
+      : millibits_per_key_(millibits_per_key) {
+    assert(millibits_per_key >= 1000);
+  }
+
+  // No Copy allowed
+  SimpleGaussBitsBuilder(const SimpleGaussBitsBuilder&) = delete;
+  void operator=(const SimpleGaussBitsBuilder&) = delete;
+
+  ~SimpleGaussBitsBuilder() override {}
+
+  virtual void AddKey(const Slice& key) override {
+    uint64_t hash = GetSliceHash64(key);
+    if (hash_entries_.empty() || hash != hash_entries_.back()) {
+      hash_entries_.push_back(hash);
+    }
+  }
+
+  virtual Slice Finish(std::unique_ptr<const char[]>* buf) override {
+    size_t len;
+    uint32_t num_output_rows;
+    uint32_t match_bits;
+    CalculateSpaceInternal(static_cast<uint32_t>(hash_entries_.size()), &len, &num_output_rows, &match_bits);
+    size_t len_with_metadata = len + 5;
+    char* data = new char[len_with_metadata];
+    memset(data, 0, len_with_metadata);
+
+    //printf("nkeys: %d len: %d nor: %d mb: %d\n", (int)hash_entries_.size(), (int)len, (int)num_output_rows, (int)match_bits);
+    assert(data);
+    assert(len_with_metadata >= 5);
+
+    int reseed_count = 0;
+    if (len > 0) {
+      AddAllEntries(data, len, num_output_rows, match_bits, &reseed_count);
+    }
+    hash_entries_.clear();
+
+    // See BloomFilterPolicy::GetSimpleGaussBitsReader re: metadata
+    // -2 = Marker for Simple Gauss
+    data[len] = static_cast<char>(-2);
+    // 0 = Marker for this sub-implementation
+    data[len + 1] = static_cast<char>(0);
+    // Bits to match against, FP rate 2^-match_bits
+    assert(match_bits > 0 && match_bits <= 32);
+    data[len + 2] = static_cast<char>(match_bits);
+    // "Reseed" count gives us a way of remixing hashes for the effect
+    // of different seeds.
+    assert(reseed_count >= 0 && reseed_count < 256);
+    data[len + 3] = static_cast<char>(reseed_count);
+    // rest of metadata stays zero
+
+    //printf("reseed_count: %d\n", reseed_count);
+
+    const char* const_data = data;
+    buf->reset(const_data);
+
+    return Slice(data, len_with_metadata);
+  }
+
+  int CalculateNumEntry(const uint32_t bytes) override {
+    uint32_t bytes_no_meta = bytes >= 5u ? bytes - 5u : 0;
+    return static_cast<int>(uint64_t{8000} * bytes_no_meta /
+                            millibits_per_key_);
+  }
+
+  uint32_t CalculateSpace(const int num_entry) override {
+    size_t bytes;
+    uint32_t num_output_rows;
+    uint32_t match_bits;
+    CalculateSpaceInternal(static_cast<uint32_t>(num_entry), &bytes, &num_output_rows, &match_bits);
+    return static_cast<uint32_t>(bytes) + /*metadata*/5;
+  }
+
+  double EstimatedFpRate(size_t keys, size_t bytes) override {
+    (void)keys;
+    (void)bytes;
+    return /*FIXME*/0.01;
+  }
+
+ private:
+  void CalculateSpaceInternal(uint32_t num_coeff_rows, size_t *bytes, uint32_t *num_output_rows, uint32_t *match_bits) {
+    *num_output_rows = GetPreferredNumOutputRows(static_cast<uint32_t>(num_coeff_rows));
+    assert((*num_output_rows & 63) == 0);
+    // FIXME
+    *match_bits = millibits_per_key_ / 1000;
+    //*match_bits = static_cast<uint32_t>(((int64_t{num_coeff_rows} * millibits_per_key_ + *num_output_rows - 1) / *num_output_rows + 999) / 1000);
+    *match_bits = std::max(uint32_t{1}, std::min(uint32_t{32}, *match_bits));
+    *bytes = size_t{*num_output_rows / 8} * *match_bits;
+  }
+
+  void ResetGaussData(GaussData *gauss, uint32_t num_output_rows, uint32_t match_row_mask) {
+    size_t nkeys = static_cast<uint32_t>(hash_entries_.size());
+    for (size_t i = 0; i < nkeys; ++i) {
+      gauss[i].Reset(hash_entries_[i], num_output_rows, match_row_mask);
+    }
+  }
+
+  void NextReseed(int *reseed_count) {
+    for (uint64_t &h : hash_entries_) {
+      h *= 0x9e3779b97f4a7c13;
+    }
+    std::sort(hash_entries_.begin(), hash_entries_.end());
+    ++*reseed_count;
+  }
+
+  uint32_t GetPreferredNumOutputRows(uint32_t num_coeff_rows) {
+    // Seems to be roughly 80% chance encoding success with this formula
+    //double overhead = std::min(1.1, 1.0 + std::max(1.5, std::log2(num_coeff_rows) - 8) / 100.0);
+    // More compact
+    double overhead = std::min(1.1, 1.0 + std::max(0.8, std::log2(num_coeff_rows) - 9) / 100.0);
+    return static_cast<uint32_t>(num_coeff_rows * overhead + 63) / 64 * 64;
+  }
+
+  void AddAllEntries(char* data, uint32_t len, uint32_t num_output_rows, uint32_t match_bits, int *reseed_count) {
+    std::sort(hash_entries_.begin(), hash_entries_.end());
+
+    // FIXME: bounds check
+    uint32_t num_coeff_rows = static_cast<uint32_t>(hash_entries_.size());
+
+    assert(uint64_t{num_output_rows} * match_bits <= uint64_t{len} * 8);
+    assert(num_output_rows > num_coeff_rows);
+
+    uint32_t match_row_mask = (uint32_t{1} << match_bits) - 1;
+
+    std::unique_ptr<GaussData[]> gauss{new GaussData[num_coeff_rows]};
+
+    *reseed_count = 0;
+    ResetGaussData(gauss.get(), num_output_rows, match_row_mask);
+
+    for (uint32_t i = 0; i < num_coeff_rows;) {
+      GaussData &di = gauss[i];
+      if (di.coeff_row == 0) {
+        // Might be a total duplicate or lucky coincidence in generating
+        // desired output. For plain (over-approximate) sets, that's just
+        // fine. Pivot of 0 is a safe fake here, because if a real row uses
+        // pivot 0, it has to be the first row and will be back-propagated
+        // last.
+        if (false && di.match_row == 0) { // FIXME: doesn't work
+          assert(di.pivot == 0);
+        } else {
+          // Re-seed and start over
+          NextReseed(reseed_count);
+          // FIXME: limit
+          assert(*reseed_count < 256);
+          ResetGaussData(gauss.get(), num_output_rows, match_row_mask);
+          i = 0;
+          continue;
+        }
+      }
+      int tz = __builtin_ctzl(di.coeff_row);
+      di.pivot = di.start + tz;
+      for (uint32_t j = i + 1; j < num_coeff_rows; ++j) {
+          GaussData &dj = gauss[j];
+          assert(dj.start >= di.start);
+          if (di.pivot < dj.start) {
+              break;
+          }
+          if ((dj.coeff_row >> (di.pivot - dj.start)) & 1) {
+              dj.coeff_row ^= (di.coeff_row >> (dj.start - di.start));
+              dj.match_row ^= di.match_row;
+          }
+      }
+      ++i;
+    }
+
+    uint64_t *word_data = reinterpret_cast<uint64_t *>(data);
+
+    // back propagation
+    for (uint32_t i = num_coeff_rows; i > 0;) {
+      --i;
+      GaussData &di = gauss[i];
+      const uint32_t start = di.start;
+      const uint64_t coeff_row = di.coeff_row;
+      const uint32_t match_row = di.match_row;
+      const uint32_t pivot = di.pivot;
+      for (uint32_t j = 0; j < match_bits; ++j) {
+        bool val = GaussData::DotCoeffRowWithOutputColumn(start, coeff_row, word_data, match_bits, j);
+        val ^= ((match_row >> j) & 1);
+        GaussData::StoreOutputVal(val, word_data, match_bits, pivot, j);
+      }
+    }
+  }
+
+  int millibits_per_key_;
+  // TODO: A deque avoids unnecessary copying of already-saved values
+  // and has near-minimal peak memory use.
+  std::vector<uint64_t> hash_entries_;
+};
+
+class SimpleGaussBitsReader : public FilterBitsReader {
+ public:
+  SimpleGaussBitsReader(const char* data, uint32_t len_bytes, uint32_t match_bits, int reseed_count)
+  : data_(data), num_output_rows_(len_bytes / match_bits * 8), match_bits_(match_bits) {
+    reseed_ = 1;
+    for (int i = 0; i < reseed_count; ++i) {
+      reseed_ *= 0x9e3779b97f4a7c13;
+    }
+  }
+
+  // No Copy allowed
+  SimpleGaussBitsReader(const SimpleGaussBitsReader&) = delete;
+  void operator=(const SimpleGaussBitsReader&) = delete;
+
+  ~SimpleGaussBitsReader() override {}
+
+  bool MayMatch(const Slice& key) override {
+    const uint64_t h = reseed_ * GetSliceHash64(key);
+    const uint32_t start = GaussData::HashToStart(h, num_output_rows_);
+
+    const uint64_t *word_data = reinterpret_cast<const uint64_t *>(data_);
+    word_data += (start / 64) * match_bits_;
+    const uint32_t start_bit = start % 64;
+    PREFETCH(word_data, 0 /* rw */, 1 /* locality */);
+    const uint32_t maybe_offset = (start_bit != 0) * match_bits_;
+    PREFETCH(word_data + maybe_offset + match_bits_ - 1, 0 /* rw */, 1 /* locality */);
+
+    const uint64_t coeff_row = GaussData::HashToCoeffRow(h);
+    const uint32_t match_row = GaussData::HashToMatchRow(h);
+    uint32_t versus_row = 0;
+    uint64_t column;
+
+    // TODO: endianness
+    switch (match_bits_) {
+      default:
+      case 10:
+        column = (word_data[9] >> start_bit) | (word_data[9 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 9;
+        FALLTHROUGH_INTENDED;
+      case 9:
+        column = (word_data[8] >> start_bit) | (word_data[8 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 8;
+        FALLTHROUGH_INTENDED;
+      case 8:
+        column = (word_data[7] >> start_bit) | (word_data[7 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 7;
+        FALLTHROUGH_INTENDED;
+      case 7:
+        column = (word_data[6] >> start_bit) | (word_data[6 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 6;
+        FALLTHROUGH_INTENDED;
+      case 6:
+        column = (word_data[5] >> start_bit) | (word_data[5 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 5;
+        FALLTHROUGH_INTENDED;
+      case 5:
+        column = (word_data[4] >> start_bit) | (word_data[4 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 4;
+        FALLTHROUGH_INTENDED;
+      case 4:
+        column = (word_data[3] >> start_bit) | (word_data[3 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 3;
+        FALLTHROUGH_INTENDED;
+      case 3:
+        column = (word_data[2] >> start_bit) | (word_data[2 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 2;
+        FALLTHROUGH_INTENDED;
+      case 2:
+        column = (word_data[1] >> start_bit) | (word_data[1 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 1;
+        FALLTHROUGH_INTENDED;
+      case 1:
+        column = (word_data[0] >> start_bit) | (word_data[0 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 0;
+        FALLTHROUGH_INTENDED;
+    }
+    return versus_row == (match_row & ((uint32_t{1} << match_bits_) - 1));
+
+    // Old, not as efficient?
+    /*
+    for (uint32_t i = 0; i < match_bits_; ++i) {
+      bool v = GaussData::DotCoeffRowWithOutputColumn(start, coeff_row, word_data, match_bits_, i);
+      if (v != (match_row & 1)) {
+        return false;
+      }
+      match_row >>= 1;
+    }
+    return true;
+    */
+  }
+
+  virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
+    (void)num_keys;
+    (void)keys;
+    (void)may_match;
+/*
+    std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> hashes;
+    std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> byte_offsets;
+    for (int i = 0; i < num_keys; ++i) {
+      uint64_t h = GetSliceHash64(*keys[i]);
+      SimpleGaussImpl::PrepareHash(Lower32of64(h), len_bytes_, data_,
+                                      &byte_offsets[i]);
+      hashes[i] = Upper32of64(h);
+    }
+    for (int i = 0; i < num_keys; ++i) {
+      may_match[i] = SimpleGaussImpl::HashMayMatchPrepared(
+          hashes[i], num_probes_, data_ + byte_offsets[i]);
+    }
+*/
+  }
+
+ private:
+  const char* data_;
+  const uint32_t num_output_rows_;
+  const uint32_t match_bits_;
+  uint64_t reseed_;
 };
 
 using LegacyBloomImpl = LegacyLocalityBloomImpl</*ExtraRotates*/ false>;
@@ -449,6 +829,7 @@ const std::vector<BloomFilterPolicy::Mode> BloomFilterPolicy::kAllFixedImpls = {
     kLegacyBloom,
     kDeprecatedBlock,
     kFastLocalBloom,
+    kSimpleGauss,
 };
 
 const std::vector<BloomFilterPolicy::Mode> BloomFilterPolicy::kAllUserModes = {
@@ -562,6 +943,8 @@ FilterBitsBuilder* BloomFilterPolicy::GetBuilderWithContext(
         break;
       case kDeprecatedBlock:
         return nullptr;
+      case kSimpleGauss:
+        return new SimpleGaussBitsBuilder(millibits_per_key_);
       case kFastLocalBloom:
         return new FastLocalBloomBitsBuilder(millibits_per_key_);
       case kLegacyBloom:
@@ -635,6 +1018,10 @@ FilterBitsReader* BloomFilterPolicy::GetFilterBitsReader(
     if (raw_num_probes == -1) {
       // Marker for newer Bloom implementations
       return GetBloomBitsReader(contents);
+    }
+    if (raw_num_probes == -2) {
+      // Marker for simple gauss filter
+      return GetSimpleGaussBitsReader(contents);
     }
     // otherwise
     // Treat as zero probes (always FP) for now.
@@ -733,6 +1120,61 @@ FilterBitsReader* BloomFilterPolicy::GetBloomBitsReader(
   }
   // otherwise
   // Reserved / future safe
+  return new AlwaysTrueFilter();
+}
+
+FilterBitsReader* BloomFilterPolicy::GetSimpleGaussBitsReader(
+    const Slice& contents) const {
+  uint32_t len_with_meta = static_cast<uint32_t>(contents.size());
+  uint32_t len = len_with_meta - 5;
+
+  assert(len > 0);  // precondition
+
+  // FIXME
+  // New Bloom filter data:
+  //             0 +-----------------------------------+
+  //               | Raw Bloom filter data             |
+  //               | ...                               |
+  //           len +-----------------------------------+
+  //               | char{-1} byte -> new Bloom filter |
+  //         len+1 +-----------------------------------+
+  //               | byte for subimplementation        |
+  //               |   0: FastLocalBloom               |
+  //               |   other: reserved                 |
+  //         len+2 +-----------------------------------+
+  //               | byte for block_and_probes         |
+  //               |   0 in top 3 bits -> 6 -> 64-byte |
+  //               |   reserved:                       |
+  //               |   1 in top 3 bits -> 7 -> 128-byte|
+  //               |   2 in top 3 bits -> 8 -> 256-byte|
+  //               |   ...                             |
+  //               |   num_probes in bottom 5 bits,    |
+  //               |     except 0 and 31 reserved      |
+  //         len+3 +-----------------------------------+
+  //               | two bytes reserved                |
+  //               |   possibly for hash seed          |
+  // len_with_meta +-----------------------------------+
+
+  // Read more metadata (see above)
+  char sub_impl_val = contents.data()[len_with_meta - 4];
+  uint8_t match_bits = static_cast<uint8_t>(contents.data()[len_with_meta - 3]);
+  uint8_t reseed = static_cast<uint8_t>(contents.data()[len_with_meta - 2]);
+  char rest = contents.data()[len_with_meta - 1];
+  if (rest != 0) {
+    // Reserved
+    // Future safe
+    assert(false);//FIXME
+    return new AlwaysTrueFilter();
+  }
+
+  if (sub_impl_val == 0) {        // FastLocalBloom
+    if (match_bits > 0 && match_bits <= 32) {
+      return new SimpleGaussBitsReader(contents.data(), len, match_bits, reseed);
+    }
+  }
+  // otherwise
+  // Reserved / future safe
+  assert(false);// FIXME
   return new AlwaysTrueFilter();
 }
 

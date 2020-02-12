@@ -64,6 +64,8 @@ class BloomFilterPolicy : public FilterPolicy {
     // FastLocalBloomImpl.
     // NOTE: TESTING ONLY as this mode does not check format_version
     kFastLocalBloom = 2,
+    // FIXME
+    kSimpleGauss = 3,
     // Automatically choose from the above (except kDeprecatedBlock) based on
     // context at build time, including compatibility with format_version.
     // NOTE: This is currently the only recommended mode that is user exposed.
@@ -137,6 +139,9 @@ class BloomFilterPolicy : public FilterPolicy {
 
   // For newer Bloom filter implementation(s)
   FilterBitsReader* GetBloomBitsReader(const Slice& contents) const;
+
+  // TODO
+  FilterBitsReader* GetSimpleGaussBitsReader(const Slice& contents) const;
 };
 
 }  // namespace ROCKSDB_NAMESPACE

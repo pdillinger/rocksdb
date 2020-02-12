@@ -378,6 +378,7 @@ class FullBloomTest : public testing::TestWithParam<BloomFilterPolicy::Mode> {
         return for_legacy_bloom;
       case BloomFilterPolicy::kFastLocalBloom:
         return for_fast_local_bloom;
+      case BloomFilterPolicy::kSimpleGauss:
       case BloomFilterPolicy::kDeprecatedBlock:
       case BloomFilterPolicy::kAuto:
           /* N/A */;
