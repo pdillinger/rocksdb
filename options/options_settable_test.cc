@@ -349,6 +349,8 @@ TEST_F(OptionsSettableTest, ColumnFamilyOptionsAllFieldsSettable) {
        sizeof(std::shared_ptr<MemTableRepFactory>)},
       {offset_of(&ColumnFamilyOptions::table_properties_collector_factories),
        sizeof(ColumnFamilyOptions::TablePropertiesCollectorFactories)},
+      {offset_of(&ColumnFamilyOptions::filter_opts),
+       sizeof(FilterOptions)}, // TODO/XXX(peterd): options support
       {offset_of(&ColumnFamilyOptions::comparator), sizeof(Comparator*)},
       {offset_of(&ColumnFamilyOptions::merge_operator),
        sizeof(std::shared_ptr<MergeOperator>)},

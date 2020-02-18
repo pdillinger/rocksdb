@@ -151,6 +151,61 @@ enum UpdateStatus {    // Return status For inplace update callback
   UPDATED         = 2, // No inplace update. Merged value set
 };
 
+// Options controlling generation of (Bloom) filters. In addition to being
+// part of ColumnFamilyOptions, this structure is accessible to a custom
+// FilterPolicy as part of FilterBuildingContext.
+struct FilterOptions {
+  // Specifies that filters should be sized to minimize internal fragmentation
+  // when loaded into memory, which on average gives better accuracy (lower
+  // false positive rate) for the same actual memory usage. When false (old
+  // behavior), filters are sized rather precisely to target a specific
+  // balance between disk footprint and accuracy, without regard to actual
+  // memory usage with a dynamic memory allocator.
+  //
+  // When this option is true, we assume that jemalloc or a similar allocator
+  // is used (with raw allocation sizes of 4, 5, 6, and 7 times a power of
+  // two). The filter size is first determined without consideration of raw
+  // allocation sizes (as if option is false), and then it must be decided
+  // whether to "round up" to the next raw memory allocation size or to
+  // "round down" to the previous. If tune_in_aggregate=false, we always
+  // round up, which will substantially improve the accuracy of some filters
+  // (maybe cut false positive rate in half) at the cost of increased disk
+  // usage for that filter (up to 25% higher, ~10% average). (Allocated
+  // memory size is the same.)
+  //
+  // Setting tune_in_aggregate=true is recommended with this option to
+  // balance rounding up and rounding down for a predictable weighted
+  // average accuracy (false positive rate) and disk usage very close to
+  // optimize_filters_for_memory_allocation=false, with almost-free memory
+  // savings around 10% of filter memory. (Note: there is roughly 3% higher
+  // disk usage for filters to compensate for rounding up/down being
+  // slightly less "payload" space efficient than uniform accuracy.)
+  //
+  // Only takes effect with format_version>=5 (newer Bloom implementation).
+  bool optimize_for_memory_allocation = false;
+
+  // When enabled, the accuracy target for Bloom filters is taken as an
+  // average target across many generated filters (true), rather than as a
+  // minimum target for each generated filter (false, old behavior). This
+  // distinction is mostly only significant with
+  // optimize_for_memory_allocation=true, because in that case always
+  // "rounding up" to the next "good" size (tune_in_aggregate=false)
+  // can increase accuracy (lower false positive rate) and increase disk
+  // footprint by a somewhat unpredictable amount in aggregate, even
+  // though memory usage is the same.
+  //
+  // Currently, the accuracy target for Bloom filters is implied by the
+  // bits per key setting used in creating the filter policy, with the
+  // format_version>=5 Bloom filter having better accuracy per bit (lower
+  // false positive rate) than the older implementation. Tuning filters
+  // in aggregate (currently) targets a consistent average false positive
+  // rate, weighted by number of keys in the filter, even if that means
+  // slightly higher disk payload when
+  // optimize_for_memory_allocation=true (see note on that option).
+  //
+  // Only takes effect with format_version>=5 (newer Bloom implementation).
+  bool tune_in_aggregate = false;
+};
 
 struct AdvancedColumnFamilyOptions {
   // The maximum number of write buffers that are built up in memory.
@@ -330,10 +385,9 @@ struct AdvancedColumnFamilyOptions {
   std::shared_ptr<const SliceTransform>
       memtable_insert_with_hint_prefix_extractor = nullptr;
 
-  // Control locality of bloom filter probes to improve cache miss rate.
-  // This option only applies to memtable prefix bloom and plaintable
-  // prefix bloom. It essentially limits every bloom checking to one cache line.
-  // This optimization is turned off when set to 0, and positive number to turn
+  // Control locality of bloom filter probes to improve CPU cache hit rate.
+  // This option now only applies to plaintable prefix bloom. This
+  // optimization is turned off when set to 0, and positive number to turn
   // it on.
   // Default: 0
   uint32_t bloom_locality = 0;
@@ -625,6 +679,10 @@ struct AdvancedColumnFamilyOptions {
   //
   // Default: false
   bool optimize_filters_for_hits = false;
+
+  // Options controlling generation of (Bloom) filters for this column family.
+  // (Does not include 'optimize_filters_for_hits' for historical reasons.)
+  FilterOptions filter_opts;
 
   // After writing every SST file, reopen it and read all the keys.
   //

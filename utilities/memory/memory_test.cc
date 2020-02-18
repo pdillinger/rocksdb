@@ -6,6 +6,7 @@
 #ifndef ROCKSDB_LITE
 
 #include "db/db_impl/db_impl.h"
+#include "memory/jemalloc_details.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/table.h"
 #include "rocksdb/utilities/memory_util.h"
@@ -255,6 +256,81 @@ TEST_F(MemoryTest, MemTableAndTableReadersTotal) {
       delete handle;
     }
     delete dbs[i];
+  }
+}
+
+TEST_F(MemoryTest, JemallocDetails) {
+  EXPECT_EQ(RoundUpToJemallocSize(size_t{1}), size_t{8});
+  EXPECT_EQ(RoundDownToJemallocSize(size_t{1}), size_t{0});
+  EXPECT_EQ(RoundUpToJemallocSize(size_t{6}), size_t{8});
+  EXPECT_EQ(RoundDownToJemallocSize(size_t{6}), size_t{0});
+  EXPECT_EQ(RoundUpToJemallocSize(size_t{7}), size_t{8});
+  EXPECT_EQ(RoundDownToJemallocSize(size_t{7}), size_t{0});
+  EXPECT_EQ(RoundUpToJemallocSize(size_t{8}), size_t{8});
+  EXPECT_EQ(RoundDownToJemallocSize(size_t{8}), size_t{8});
+
+  EXPECT_EQ(RoundUpToJemallocSize(size_t{9}), size_t{16});
+  EXPECT_EQ(RoundDownToJemallocSize(size_t{9}), size_t{8});
+  EXPECT_EQ(RoundUpToJemallocSize(size_t{10}), size_t{16});
+  EXPECT_EQ(RoundDownToJemallocSize(size_t{10}), size_t{8});
+  EXPECT_EQ(RoundUpToJemallocSize(size_t{15}), size_t{16});
+  EXPECT_EQ(RoundDownToJemallocSize(size_t{15}), size_t{8});
+
+  EXPECT_EQ(RoundUpToJemallocSize(size_t{16}), size_t{16});
+  EXPECT_EQ(RoundDownToJemallocSize(size_t{16}), size_t{16});
+
+  for (size_t s = 16; s < 128; s += 16) {
+    size_t sn = s + 16;
+    for (size_t i = 1; i <= 15; ++i) {
+      EXPECT_EQ(RoundUpToJemallocSize(s + i), sn);
+      EXPECT_EQ(RoundDownToJemallocSize(s + i), s);
+    }
+    EXPECT_EQ(RoundUpToJemallocSize(sn), sn);
+    EXPECT_EQ(RoundDownToJemallocSize(sn), sn);
+  }
+
+  for (size_t s = 32; s <= size_t{0x10000000}; s *= 2) {
+    size_t s4 = s * 4;
+    size_t s5 = s * 5;
+    size_t s6 = s * 6;
+    size_t s7 = s * 7;
+    size_t s8 = s * 8;
+
+    EXPECT_EQ(RoundUpToJemallocSize(s4), s4);
+    EXPECT_EQ(RoundDownToJemallocSize(s4), s4);
+
+    EXPECT_EQ(RoundUpToJemallocSize(s4 + 1), s5);
+    EXPECT_EQ(RoundDownToJemallocSize(s4 + 1), s4);
+
+    EXPECT_EQ(RoundUpToJemallocSize(s5 - 1), s5);
+    EXPECT_EQ(RoundDownToJemallocSize(s5 - 1), s4);
+
+    EXPECT_EQ(RoundUpToJemallocSize(s5), s5);
+    EXPECT_EQ(RoundDownToJemallocSize(s5), s5);
+
+    EXPECT_EQ(RoundUpToJemallocSize(s5 + 1), s6);
+    EXPECT_EQ(RoundDownToJemallocSize(s5 + 1), s5);
+
+    EXPECT_EQ(RoundUpToJemallocSize(s6 - 1), s6);
+    EXPECT_EQ(RoundDownToJemallocSize(s6 - 1), s5);
+
+    EXPECT_EQ(RoundUpToJemallocSize(s6), s6);
+    EXPECT_EQ(RoundDownToJemallocSize(s6), s6);
+
+    EXPECT_EQ(RoundUpToJemallocSize(s6 + 1), s7);
+    EXPECT_EQ(RoundDownToJemallocSize(s6 + 1), s6);
+
+    EXPECT_EQ(RoundUpToJemallocSize(s7 - 1), s7);
+    EXPECT_EQ(RoundDownToJemallocSize(s7 - 1), s6);
+
+    EXPECT_EQ(RoundUpToJemallocSize(s7), s7);
+    EXPECT_EQ(RoundDownToJemallocSize(s7), s7);
+
+    EXPECT_EQ(RoundUpToJemallocSize(s7 + 1), s8);
+    EXPECT_EQ(RoundDownToJemallocSize(s7 + 1), s7);
+
+    EXPECT_EQ(RoundUpToJemallocSize(s8 - 1), s8);
+    EXPECT_EQ(RoundDownToJemallocSize(s8 - 1), s7);
   }
 }
 }  // namespace rocksdb

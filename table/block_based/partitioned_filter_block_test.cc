@@ -62,6 +62,7 @@ class PartitionedFilterBlockTest
   ImmutableCFOptions ioptions_;
   EnvOptions env_options_;
   BlockBasedTableOptions table_options_;
+  FilterOptions filter_opts_;
   InternalKeyComparator icomp_;
   std::unique_ptr<BlockBasedTable> table_;
   std::shared_ptr<Cache> cache_;
@@ -127,7 +128,7 @@ class PartitionedFilterBlockTest
     return new PartitionedFilterBlockBuilder(
         prefix_extractor, table_options_.whole_key_filtering,
         BloomFilterPolicy::GetBuilderFromContext(
-            FilterBuildingContext(table_options_)),
+            FilterBuildingContext(table_options_, filter_opts_)),
         table_options_.index_block_restart_interval, !kValueDeltaEncoded,
         p_index_builder, partition_size);
   }

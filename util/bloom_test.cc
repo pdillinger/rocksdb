@@ -254,6 +254,7 @@ TEST_F(BlockBasedBloomTest, Schema) {
 class FullBloomTest : public testing::TestWithParam<BloomFilterPolicy::Mode> {
  private:
   BlockBasedTableOptions table_options_;
+  FilterOptions filter_opts_;
   std::shared_ptr<const FilterPolicy>& policy_;
   std::unique_ptr<FilterBitsBuilder> bits_builder_;
   std::unique_ptr<FilterBitsReader> bits_reader_;
@@ -277,7 +278,7 @@ class FullBloomTest : public testing::TestWithParam<BloomFilterPolicy::Mode> {
 
   void Reset() {
     bits_builder_.reset(BloomFilterPolicy::GetBuilderFromContext(
-        FilterBuildingContext(table_options_)));
+        FilterBuildingContext(table_options_, filter_opts_)));
     bits_reader_.reset(nullptr);
     buf_.reset(nullptr);
     filter_size_ = 0;

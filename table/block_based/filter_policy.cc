@@ -10,8 +10,8 @@
 #include <array>
 #include <deque>
 
+#include "memory/jemalloc_details.h"
 #include "rocksdb/filter_policy.h"
-
 #include "rocksdb/slice.h"
 #include "table/block_based/block_based_filter_block.h"
 #include "table/block_based/full_filter_block.h"
@@ -28,10 +28,14 @@ namespace {
 // See description in FastLocalBloomImpl
 class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
  public:
-  explicit FastLocalBloomBitsBuilder(const int millibits_per_key)
+  explicit FastLocalBloomBitsBuilder(
+      const int millibits_per_key, const FilterOptions &filter_opts,
+      std::atomic<int64_t>* aggregate_rounding_balance)
       : millibits_per_key_(millibits_per_key),
-        num_probes_(FastLocalBloomImpl::ChooseNumProbes(millibits_per_key_)) {
+        filter_opts_(filter_opts),
+        aggregate_rounding_balance_(aggregate_rounding_balance) {
     assert(millibits_per_key >= 1000);
+    assert(!filter_opts_.tune_in_aggregate || aggregate_rounding_balance_);
   }
 
   // No Copy allowed
@@ -48,17 +52,21 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
   }
 
   virtual Slice Finish(std::unique_ptr<const char[]>* buf) override {
-    uint32_t len_with_metadata =
-        CalculateSpace(static_cast<uint32_t>(hash_entries_.size()));
+    uint32_t num_entry = static_cast<uint32_t>(hash_entries_.size());
+    uint32_t len_with_metadata = CalculateSpace(num_entry);
+    assert(len_with_metadata >= 5);
+    uint32_t len = len_with_metadata - 5;
+
     char* data = new char[len_with_metadata];
     memset(data, 0, len_with_metadata);
 
     assert(data);
-    assert(len_with_metadata >= 5);
 
-    uint32_t len = len_with_metadata - 5;
+    // Compute num_probes after any rounding / adjustments
+    int num_probes = GetNumProbes(num_entry, len_with_metadata);
+
     if (len > 0) {
-      AddAllEntries(data, len);
+      AddAllEntries(data, len, num_probes);
     }
 
     // See BloomFilterPolicy::GetBloomBitsReader re: metadata
@@ -67,7 +75,7 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
     // 0 = Marker for this sub-implementation
     data[len + 1] = static_cast<char>(0);
     // num_probes (and 0 in upper bits for 64-byte block size)
-    data[len + 2] = static_cast<char>(num_probes_);
+    data[len + 2] = static_cast<char>(num_probes);
     // rest of metadata stays zero
 
     const char* const_data = data;
@@ -84,21 +92,125 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
   }
 
   uint32_t CalculateSpace(const int num_entry) override {
-    uint32_t num_cache_lines = 0;
-    if (millibits_per_key_ > 0 && num_entry > 0) {
-      num_cache_lines = static_cast<uint32_t>(
-          (int64_t{num_entry} * millibits_per_key_ + 511999) / 512000);
+    // If not for cache line blocks in the filter, what would the target
+    // length in bytes be?
+    // NB: the BuiltinFilterBitsBuilder API presumes len fits in uint32_t.
+    uint32_t target_len = static_cast<uint32_t>(
+        (int64_t{num_entry} * millibits_per_key_ + 7999) / 8000);
+
+    // Round up to nearest multiple of 64 (block size)
+    uint32_t upper_len = (target_len + 63) & ~63;
+
+    // Adjust if we are taking into consideration friendly memory allocation sizes
+    size_t upper_mem = 0;
+    if (filter_opts_.optimize_for_memory_allocation) {
+      upper_mem = RoundUpToJemallocSize(upper_len + 5);
+      // Back-port those to supported data structure lengths
+      upper_len = (upper_mem - 5) & ~63;
     }
-    return num_cache_lines * 64 + /*metadata*/ 5;
+    assert(upper_len >= target_len);
+
+    if (!filter_opts_.tune_in_aggregate || upper_len == 0) {
+      return upper_len + /*metadata*/ 5;
+    }
+    // Must consider rounding down vs. rounding up
+    assert(filter_opts_.tune_in_aggregate);
+
+    // Mostly analogous to above
+    uint32_t lower_len = target_len & ~63;
+    if (filter_opts_.optimize_for_memory_allocation) {
+      size_t lower_mem = RoundUpToJemallocSize(lower_len + 5);
+      if (lower_mem == upper_mem) {
+        // Rounding down by data structure block was not enough to get
+        // to the next smaller memory alloc size. Work backwards from
+        // next smaller memory alloc size instead.
+        lower_mem = RoundDownToJemallocSize(lower_len + 5 - 1);
+        assert(lower_mem < upper_mem);
+      }
+      lower_len = (lower_mem - 5) & ~63;
+    }
+    assert(lower_len <= target_len);
+
+    uint32_t choice_len;
+    if (lower_len == upper_len) {
+      // No decision to make
+      choice_len = lower_len;
+      assert(lower_len == target_len);
+    } else {
+      // Make a decision and record the impact
+
+      // FP rates for the choices and target
+      double lower_fp_rate = EstimatedFpRate(num_entry, lower_len + 5);
+      double target_fp_rate = EstimatedFpRate(num_entry, target_len + 5);
+      double upper_fp_rate = EstimatedFpRate(num_entry, upper_len + 5);
+
+      // Convert those to weighted expected values (times 2^32)
+      int64_t lower_fp_weight = static_cast<int64_t>(lower_fp_rate * num_entry * double{0x100000000});
+      int64_t target_fp_weight = static_cast<int64_t>(target_fp_rate * num_entry * double{0x100000000});
+      int64_t upper_fp_weight = static_cast<int64_t>(upper_fp_rate * num_entry * double{0x100000000});
+
+      // Rounding down -> more FPs
+      assert(lower_fp_weight >= target_fp_weight);
+      assert(target_fp_weight >= upper_fp_weight);
+
+      // Absolute differences in size
+      uint32_t lower_diff = target_len - lower_len;
+      uint32_t upper_diff = upper_len - target_len;
+
+      // Load the balance to inform rounding up vs. down. (OK if this goes
+      // stale, because a data race can only have temporary impact,
+      // assuming bounded #threads.)
+      // Positive balance means history of too high FP rate.
+      int64_t balance = aggregate_rounding_balance_->load();
+      if (lower_diff < upper_diff) {
+        // Natural inclination to round down (higher FP rate than target)
+        // Prefer that if we don't go too positive, with more leniancy for
+        // larger filters.
+        if (balance < target_fp_weight) {
+          choice_len = lower_len;
+        } else {
+          choice_len = upper_len;
+        }
+      } else {
+        // Natural inclination to round up (lower FP rate than target)
+        // Prefer that if we don't go too negative, with more leniancy for
+        // larger filters.
+        if (balance > -target_fp_weight) {
+          choice_len = upper_len;
+        } else {
+          choice_len = lower_len;
+        }
+      }
+      // Update balance
+      int64_t actual_fp_weight = (choice_len == lower_len) ? lower_fp_weight : upper_fp_weight;
+      *aggregate_rounding_balance_ += actual_fp_weight - target_fp_weight;
+    }
+
+    return choice_len + /*metadata*/ 5;
   }
 
-  double EstimatedFpRate(size_t keys, size_t bytes) override {
-    return FastLocalBloomImpl::EstimatedFpRate(keys, bytes - /*metadata*/ 5,
-                                               num_probes_, /*hash bits*/ 64);
+  double EstimatedFpRate(size_t keys, size_t len_with_metadata) override {
+    int num_probes = GetNumProbes(keys, len_with_metadata);
+    return FastLocalBloomImpl::EstimatedFpRate(keys, len_with_metadata - /*metadata*/ 5,
+                                               num_probes, /*hash bits*/ 64);
   }
 
  private:
-  void AddAllEntries(char* data, uint32_t len) {
+  // Compute num_probes after any rounding / adjustments
+  int GetNumProbes(size_t keys, size_t len_with_metadata) {
+    uint32_t len = len_with_metadata - 5;
+    int actual_millibits_per_key =
+        static_cast<int>(uint64_t{len} * 8000 / std::max(keys, size_t{1}));
+    // BEGIN XXX/TODO(peterd): preserving old/default behavior for now to
+    // minimize unit test churn. Remove this some time.
+    if (!filter_opts_.optimize_for_memory_allocation && !filter_opts_.tune_in_aggregate) {
+      actual_millibits_per_key = millibits_per_key_;
+    }
+    // END XXX/TODO
+    return FastLocalBloomImpl::ChooseNumProbes(actual_millibits_per_key);
+  }
+
+  void AddAllEntries(char* data, uint32_t len, int num_probes) {
     // Simple version without prefetching:
     //
     // for (auto h : hash_entries_) {
@@ -129,7 +241,7 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
       uint32_t& hash_ref = hashes[i & kBufferMask];
       uint32_t& byte_offset_ref = byte_offsets[i & kBufferMask];
       // Process (add)
-      FastLocalBloomImpl::AddHashPrepared(hash_ref, num_probes_,
+      FastLocalBloomImpl::AddHashPrepared(hash_ref, num_probes,
                                           data + byte_offset_ref);
       // And buffer
       uint64_t h = hash_entries_.front();
@@ -141,13 +253,17 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
 
     // Finish processing
     for (i = 0; i <= kBufferMask && i < num_entries; ++i) {
-      FastLocalBloomImpl::AddHashPrepared(hashes[i], num_probes_,
+      FastLocalBloomImpl::AddHashPrepared(hashes[i], num_probes,
                                           data + byte_offsets[i]);
     }
   }
 
+  // Target allocation per added key, in thousandths of a bit.
   int millibits_per_key_;
-  int num_probes_;
+  // Filter options in effect from column family.
+  const FilterOptions filter_opts_;
+  // See BloomFilterPolicy::aggregate_rounding_balance_
+  std::atomic<int64_t>* aggregate_rounding_balance_;
   // A deque avoids unnecessary copying of already-saved values
   // and has near-minimal peak memory use.
   std::deque<uint64_t> hash_entries_;
@@ -457,7 +573,7 @@ const std::vector<BloomFilterPolicy::Mode> BloomFilterPolicy::kAllUserModes = {
 };
 
 BloomFilterPolicy::BloomFilterPolicy(double bits_per_key, Mode mode)
-    : mode_(mode), warned_(false) {
+    : mode_(mode), warned_(false), aggregate_rounding_balance_(0) {
   // Sanitize bits_per_key
   if (bits_per_key < 1.0) {
     bits_per_key = 1.0;
@@ -543,7 +659,7 @@ FilterBitsBuilder* BloomFilterPolicy::GetFilterBitsBuilder() const {
   // been warned (HISTORY.md) that they can no longer call this on
   // the built-in BloomFilterPolicy (unlikely).
   assert(false);
-  return GetBuilderWithContext(FilterBuildingContext(BlockBasedTableOptions()));
+  return GetBuilderWithContext(FilterBuildingContext(BlockBasedTableOptions(), FilterOptions()));
 }
 
 FilterBitsBuilder* BloomFilterPolicy::GetBuilderWithContext(
@@ -563,7 +679,8 @@ FilterBitsBuilder* BloomFilterPolicy::GetBuilderWithContext(
       case kDeprecatedBlock:
         return nullptr;
       case kFastLocalBloom:
-        return new FastLocalBloomBitsBuilder(millibits_per_key_);
+        return new FastLocalBloomBitsBuilder(
+            millibits_per_key_, context.filter_opts, &aggregate_rounding_balance_);
       case kLegacyBloom:
         if (whole_bits_per_key_ >= 14 && context.info_log &&
             !warned_.load(std::memory_order_relaxed)) {
@@ -751,8 +868,9 @@ const FilterPolicy* NewBloomFilterPolicy(double bits_per_key,
 }
 
 FilterBuildingContext::FilterBuildingContext(
-    const BlockBasedTableOptions& _table_options)
-    : table_options(_table_options) {}
+    const BlockBasedTableOptions& _table_options,
+    const FilterOptions& _filter_opts)
+    : table_options(_table_options), filter_opts(_filter_opts) {}
 
 FilterPolicy::~FilterPolicy() { }
 
