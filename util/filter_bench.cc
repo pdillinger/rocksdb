@@ -97,10 +97,13 @@ DEFINE_bool(legend, false,
             "Print more information about interpreting results instead of "
             "running tests");
 
-DEFINE_bool(optimize_for_memory_allocation, false,
-            "Set optimize_for_memory_allocation option");
+DEFINE_uint32(
+    size_optimization_pref, 0,
+    "Set size_optimization_pref option (see enum SizeOptimizationPref)");
 
 DEFINE_bool(tune_in_aggregate, false, "Set tune_in_aggregate option");
+
+DEFINE_uint32(runs, 1, "Number of times to rebuild and run benchmark tests");
 
 void _always_assert_fail(int line, const char *file, const char *expr) {
   fprintf(stderr, "%s: %d: Assertion %s failed\n", file, line, expr);
@@ -133,6 +136,7 @@ using rocksdb::Lower32of64;
 using rocksdb::ParsedFullFilterBlock;
 using rocksdb::PlainTableBloomV1;
 using rocksdb::Random32;
+using rocksdb::SizeOptimizationPref;
 using rocksdb::Slice;
 using rocksdb::StderrLogger;
 using rocksdb::mock::MockBlockBasedTableTester;
@@ -267,12 +271,14 @@ struct FilterBench : public MockBlockBasedTableTester {
   std::ostringstream fp_rate_report_;
   Arena arena_;
   StderrLogger stderr_logger_;
+  uint32_t m_queries_;
 
   FilterBench()
       : MockBlockBasedTableTester(new BloomFilterPolicy(
             FLAGS_bits_per_key,
             static_cast<BloomFilterPolicy::Mode>(FLAGS_impl))),
-        random_(FLAGS_seed) {
+        random_(FLAGS_seed),
+        m_queries_(0) {
     for (uint32_t i = 0; i < FLAGS_batch_size; ++i) {
       kms_.emplace_back(FLAGS_key_size < 8 ? 8 : FLAGS_key_size);
     }
@@ -321,15 +327,18 @@ void FilterBench::Go() {
   const std::vector<TestMode> &testModes =
       FLAGS_best_case ? bestCaseTestModes
                       : FLAGS_quick ? quickTestModes : allTestModes;
+
+  m_queries_ = FLAGS_m_queries;
+  uint32_t working_mem_size_mb = FLAGS_working_mem_size_mb;
   if (FLAGS_quick) {
-    FLAGS_m_queries /= 7.0;
+    m_queries_ /= 7.0;
   } else if (FLAGS_best_case) {
-    FLAGS_m_queries /= 3.0;
-    FLAGS_working_mem_size_mb /= 10.0;
+    m_queries_ /= 3.0;
+    working_mem_size_mb /= 10.0;
   }
 
-  filter_opts_.optimize_for_memory_allocation =
-      FLAGS_optimize_for_memory_allocation;
+  filter_opts_.size_optimization_pref =
+      static_cast<SizeOptimizationPref>(FLAGS_size_optimization_pref);
   filter_opts_.tune_in_aggregate = FLAGS_tune_in_aggregate;
 
   std::cout << "Building..." << std::endl;
@@ -348,12 +357,13 @@ void FilterBench::Go() {
     max_mem = SIZE_MAX;
   } else {
     max_total_keys = SIZE_MAX;
-    max_mem = static_cast<size_t>(1024 * 1024 * FLAGS_working_mem_size_mb);
+    max_mem = static_cast<size_t>(1024 * 1024 * working_mem_size_mb);
   }
 
   rocksdb::StopWatchNano timer(rocksdb::Env::Default(), true);
 
-  while ((FLAGS_working_mem_size_mb == 0 || total_memory_used < max_mem) &&
+  infos_.clear();
+  while ((working_mem_size_mb == 0 || total_memory_used < max_mem) &&
          total_keys_added < max_total_keys) {
     uint32_t filter_id = random_.Next();
     uint32_t keys_to_add = FLAGS_average_keys_per_filter +
@@ -430,7 +440,7 @@ void FilterBench::Go() {
     std::cout << "Verifying..." << std::endl;
 
     uint32_t outside_q_per_f =
-        static_cast<uint32_t>(FLAGS_m_queries * 1000000 / infos_.size());
+        static_cast<uint32_t>(m_queries_ * 1000000 / infos_.size());
     uint64_t fps = 0;
     for (uint32_t i = 0; i < infos_.size(); ++i) {
       FilterInfo &info = infos_[i];
@@ -529,8 +539,7 @@ double FilterBench::RandomQueryTest(uint32_t inside_threshold, bool dry_run,
 
   uint32_t num_infos = static_cast<uint32_t>(infos_.size());
   uint32_t dry_run_hash = 0;
-  uint64_t max_queries =
-      static_cast<uint64_t>(FLAGS_m_queries * 1000000 + 0.50);
+  uint64_t max_queries = static_cast<uint64_t>(m_queries_ * 1000000 + 0.50);
   // Some filters may be considered secondary in order to implement skewed
   // queries. num_primary_filters is the number that are to be treated as
   // equal, and any remainder will be treated as secondary.
@@ -738,7 +747,9 @@ int main(int argc, char **argv) {
         << "\n      of queries." << std::endl;
   } else {
     FilterBench b;
-    b.Go();
+    for (uint32_t i = 0; i < FLAGS_runs; ++i) {
+      b.Go();
+    }
   }
 
   return 0;

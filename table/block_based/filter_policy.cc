@@ -101,14 +101,10 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
     // Round up to nearest multiple of 64 (block size)
     uint32_t upper_len = (target_len + 63) & ~63;
 
-    // Adjust if we are taking into consideration friendly memory allocation
-    // sizes
-    size_t upper_mem = 0;
-    if (filter_opts_.optimize_for_memory_allocation) {
-      upper_mem = RoundUpToJemallocSize(upper_len + 5);
-      // Back-port those to supported data structure lengths
-      upper_len = (upper_mem - 5) & ~63;
-    }
+    // Adjust if we are taking into consideration friendly memory allocation sizes
+    size_t upper_mem = RoundUpToEffectiveSize(upper_len + 5);
+    // Back-port those to supported data structure lengths
+    upper_len = (upper_mem - 5) & ~63;
     assert(upper_len >= target_len);
 
     if (!filter_opts_.tune_in_aggregate || upper_len == 0) {
@@ -119,17 +115,15 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
 
     // Mostly analogous to above
     uint32_t lower_len = target_len & ~63;
-    if (filter_opts_.optimize_for_memory_allocation) {
-      size_t lower_mem = RoundUpToJemallocSize(lower_len + 5);
-      if (lower_mem == upper_mem) {
-        // Rounding down by data structure block was not enough to get
-        // to the next smaller memory alloc size. Work backwards from
-        // next smaller memory alloc size instead.
-        lower_mem = RoundDownToJemallocSize(lower_len + 5 - 1);
-        assert(lower_mem < upper_mem);
-      }
-      lower_len = (lower_mem - 5) & ~63;
+    size_t lower_mem = RoundUpToEffectiveSize(lower_len + 5);
+    if (lower_mem == upper_mem) {
+      // Rounding down by data structure block was not enough to get
+      // to the next smaller memory alloc size. Work backwards from
+      // next smaller memory alloc size instead.
+      lower_mem = RoundDownToEffectiveSize(lower_len + 5 - 1);
+      assert(lower_mem < upper_mem);
     }
+    lower_len = (lower_mem - 5) & ~63;
     assert(lower_len <= target_len);
 
     uint32_t choice_len;
@@ -201,6 +195,34 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
   }
 
  private:
+  size_t RoundUpToEffectiveSize(size_t len) {
+    switch (filter_opts_.size_optimization_pref) {
+      case SizeOptimizationPref::kDiskPayload:
+        return len;
+      case SizeOptimizationPref::kAllocatedMemory:
+        return RoundUpToJemallocSize(len);
+      case SizeOptimizationPref::kAllocatedMemoryUsedPages:
+        // FIXME: platform
+        return std::min((len + 4095) & ~4095, RoundUpToJemallocSize(len));
+    }
+    assert(false);
+    return len;
+  }
+
+  size_t RoundDownToEffectiveSize(size_t len) {
+    switch (filter_opts_.size_optimization_pref) {
+      case SizeOptimizationPref::kDiskPayload:
+        return len;
+      case SizeOptimizationPref::kAllocatedMemory:
+        return RoundDownToJemallocSize(len);
+      case SizeOptimizationPref::kAllocatedMemoryUsedPages:
+        // FIXME: platform
+        return std::max(len & ~4095, RoundDownToJemallocSize(len));
+    }
+    assert(false);
+    return len;
+  }
+
   // Compute num_probes after any rounding / adjustments
   int GetNumProbes(size_t keys, size_t len_with_metadata) {
     uint32_t len = len_with_metadata - 5;
@@ -208,7 +230,8 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
         static_cast<int>(uint64_t{len} * 8000 / std::max(keys, size_t{1}));
     // BEGIN XXX/TODO(peterd): preserving old/default behavior for now to
     // minimize unit test churn. Remove this some time.
-    if (!filter_opts_.optimize_for_memory_allocation &&
+    if (filter_opts_.size_optimization_pref ==
+            SizeOptimizationPref::kDiskPayload &&
         !filter_opts_.tune_in_aggregate) {
       actual_millibits_per_key = millibits_per_key_;
     }

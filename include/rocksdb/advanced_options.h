@@ -151,10 +151,22 @@ enum UpdateStatus {    // Return status For inplace update callback
   UPDATED         = 2, // No inplace update. Merged value set
 };
 
+// Different ways of tweaking filter sizes for better performance.
+// This currently only has an effect with format_version>=5.
+enum class SizeOptimizationPref : char {
+  // TODO
+  kDiskPayload = 0x00,
+  // TODO
+  kAllocatedMemory = 0x01,
+  // TODO
+  kAllocatedMemoryUsedPages = 0x02,
+};
+
 // Options controlling generation of (Bloom) filters. In addition to being
 // part of ColumnFamilyOptions, this structure is accessible to a custom
 // FilterPolicy as part of FilterBuildingContext.
 struct FilterOptions {
+  // TODO: fix for enum
   // Specifies that filters should be sized to minimize internal fragmentation
   // when loaded into memory, which on average gives better accuracy (lower
   // false positive rate) for the same actual memory usage. When false (old
@@ -176,13 +188,14 @@ struct FilterOptions {
   // Setting tune_in_aggregate=true is recommended with this option to
   // balance rounding up and rounding down for a predictable weighted
   // average accuracy (false positive rate) and disk usage very close to
-  // optimize_filters_for_memory_allocation=false, with almost-free memory
+  // optimize_for_memory_allocation=false, with almost-free memory
   // savings around 10% of filter memory. (Note: there is roughly 3% higher
   // disk usage for filters to compensate for rounding up/down being
   // slightly less "payload" space efficient than uniform accuracy.)
   //
   // Only takes effect with format_version>=5 (newer Bloom implementation).
-  bool optimize_for_memory_allocation = false;
+  SizeOptimizationPref size_optimization_pref =
+      SizeOptimizationPref::kDiskPayload;
 
   // When enabled, the accuracy target for Bloom filters is taken as an
   // average target across many generated filters (true), rather than as a
