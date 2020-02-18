@@ -88,7 +88,8 @@ class FilterBitsReader {
 // structs because this is expected to be a temporary, stack-allocated object.
 struct FilterBuildingContext {
   // This constructor is for internal use only and subject to change.
-  FilterBuildingContext(const BlockBasedTableOptions& table_options, const FilterOptions& filter_opts);
+  FilterBuildingContext(const BlockBasedTableOptions& table_options,
+                        const FilterOptions& filter_opts);
 
   // Options for the table being built
   const BlockBasedTableOptions& table_options;

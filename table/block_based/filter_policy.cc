@@ -14,8 +14,8 @@
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/slice.h"
 #include "table/block_based/block_based_filter_block.h"
-#include "table/block_based/full_filter_block.h"
 #include "table/block_based/filter_policy_internal.h"
+#include "table/block_based/full_filter_block.h"
 #include "third-party/folly/folly/ConstexprMath.h"
 #include "util/bloom_impl.h"
 #include "util/coding.h"
@@ -29,7 +29,7 @@ namespace {
 class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
  public:
   explicit FastLocalBloomBitsBuilder(
-      const int millibits_per_key, const FilterOptions &filter_opts,
+      const int millibits_per_key, const FilterOptions& filter_opts,
       std::atomic<int64_t>* aggregate_rounding_balance)
       : millibits_per_key_(millibits_per_key),
         filter_opts_(filter_opts),
@@ -101,7 +101,8 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
     // Round up to nearest multiple of 64 (block size)
     uint32_t upper_len = (target_len + 63) & ~63;
 
-    // Adjust if we are taking into consideration friendly memory allocation sizes
+    // Adjust if we are taking into consideration friendly memory allocation
+    // sizes
     size_t upper_mem = 0;
     if (filter_opts_.optimize_for_memory_allocation) {
       upper_mem = RoundUpToJemallocSize(upper_len + 5);
@@ -145,9 +146,12 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
       double upper_fp_rate = EstimatedFpRate(num_entry, upper_len + 5);
 
       // Convert those to weighted expected values (times 2^32)
-      int64_t lower_fp_weight = static_cast<int64_t>(lower_fp_rate * num_entry * double{0x100000000});
-      int64_t target_fp_weight = static_cast<int64_t>(target_fp_rate * num_entry * double{0x100000000});
-      int64_t upper_fp_weight = static_cast<int64_t>(upper_fp_rate * num_entry * double{0x100000000});
+      int64_t lower_fp_weight =
+          static_cast<int64_t>(lower_fp_rate * num_entry * double{0x100000000});
+      int64_t target_fp_weight = static_cast<int64_t>(
+          target_fp_rate * num_entry * double{0x100000000});
+      int64_t upper_fp_weight =
+          static_cast<int64_t>(upper_fp_rate * num_entry * double{0x100000000});
 
       // Rounding down -> more FPs
       assert(lower_fp_weight >= target_fp_weight);
@@ -182,7 +186,8 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
         }
       }
       // Update balance
-      int64_t actual_fp_weight = (choice_len == lower_len) ? lower_fp_weight : upper_fp_weight;
+      int64_t actual_fp_weight =
+          (choice_len == lower_len) ? lower_fp_weight : upper_fp_weight;
       *aggregate_rounding_balance_ += actual_fp_weight - target_fp_weight;
     }
 
@@ -191,8 +196,8 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
 
   double EstimatedFpRate(size_t keys, size_t len_with_metadata) override {
     int num_probes = GetNumProbes(keys, len_with_metadata);
-    return FastLocalBloomImpl::EstimatedFpRate(keys, len_with_metadata - /*metadata*/ 5,
-                                               num_probes, /*hash bits*/ 64);
+    return FastLocalBloomImpl::EstimatedFpRate(
+        keys, len_with_metadata - /*metadata*/ 5, num_probes, /*hash bits*/ 64);
   }
 
  private:
@@ -203,7 +208,8 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
         static_cast<int>(uint64_t{len} * 8000 / std::max(keys, size_t{1}));
     // BEGIN XXX/TODO(peterd): preserving old/default behavior for now to
     // minimize unit test churn. Remove this some time.
-    if (!filter_opts_.optimize_for_memory_allocation && !filter_opts_.tune_in_aggregate) {
+    if (!filter_opts_.optimize_for_memory_allocation &&
+        !filter_opts_.tune_in_aggregate) {
       actual_millibits_per_key = millibits_per_key_;
     }
     // END XXX/TODO
@@ -659,7 +665,8 @@ FilterBitsBuilder* BloomFilterPolicy::GetFilterBitsBuilder() const {
   // been warned (HISTORY.md) that they can no longer call this on
   // the built-in BloomFilterPolicy (unlikely).
   assert(false);
-  return GetBuilderWithContext(FilterBuildingContext(BlockBasedTableOptions(), FilterOptions()));
+  return GetBuilderWithContext(
+      FilterBuildingContext(BlockBasedTableOptions(), FilterOptions()));
 }
 
 FilterBitsBuilder* BloomFilterPolicy::GetBuilderWithContext(
@@ -679,8 +686,9 @@ FilterBitsBuilder* BloomFilterPolicy::GetBuilderWithContext(
       case kDeprecatedBlock:
         return nullptr;
       case kFastLocalBloom:
-        return new FastLocalBloomBitsBuilder(
-            millibits_per_key_, context.filter_opts, &aggregate_rounding_balance_);
+        return new FastLocalBloomBitsBuilder(millibits_per_key_,
+                                             context.filter_opts,
+                                             &aggregate_rounding_balance_);
       case kLegacyBloom:
         if (whole_bits_per_key_ >= 14 && context.info_log &&
             !warned_.load(std::memory_order_relaxed)) {

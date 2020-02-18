@@ -100,8 +100,7 @@ DEFINE_bool(legend, false,
 DEFINE_bool(optimize_for_memory_allocation, false,
             "Set optimize_for_memory_allocation option");
 
-DEFINE_bool(tune_in_aggregate, false,
-            "Set tune_in_aggregate option");
+DEFINE_bool(tune_in_aggregate, false, "Set tune_in_aggregate option");
 
 void _always_assert_fail(int line, const char *file, const char *expr) {
   fprintf(stderr, "%s: %d: Assertion %s failed\n", file, line, expr);
@@ -329,7 +328,8 @@ void FilterBench::Go() {
     FLAGS_working_mem_size_mb /= 10.0;
   }
 
-  filter_opts_.optimize_for_memory_allocation = FLAGS_optimize_for_memory_allocation;
+  filter_opts_.optimize_for_memory_allocation =
+      FLAGS_optimize_for_memory_allocation;
   filter_opts_.tune_in_aggregate = FLAGS_tune_in_aggregate;
 
   std::cout << "Building..." << std::endl;

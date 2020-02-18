@@ -12,7 +12,6 @@
 #include <memory>
 #include <string>
 #include <vector>
-#include <atomic>
 
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/table.h"
