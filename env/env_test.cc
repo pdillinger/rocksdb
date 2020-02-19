@@ -877,9 +877,10 @@ TEST_F(EnvPosixTest, PositionedAppend) {
   // Verify the above
   std::unique_ptr<SequentialFile> seq_file;
   ASSERT_OK(env_->NewSequentialFile(ift.name() + "/f", &seq_file, options));
-  char scratch[port::kPageSize * 2];
+  size_t scratch_len = port::kPageSize * 2;
+  std::unique_ptr<char[]> scratch(new char[scratch_len]);
   Slice result;
-  ASSERT_OK(seq_file->Read(sizeof(scratch), &result, scratch));
+  ASSERT_OK(seq_file->Read(scratch_len, &result, scratch.get()));
   ASSERT_EQ(port::kPageSize + kBlockSize, result.size());
   ASSERT_EQ('a', result[kBlockSize - 1]);
   ASSERT_EQ('b', result[kBlockSize]);
