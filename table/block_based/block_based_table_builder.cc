@@ -421,7 +421,7 @@ struct BlockBasedTableBuilder::Rep {
     if (skip_filters) {
       filter_builder = nullptr;
     } else {
-      FilterBuildingContext context(table_options, ioptions.filter_opts);
+      FilterBuildingContext context(table_options);
       context.column_family_name = column_family_name;
       context.compaction_style = ioptions.compaction_style;
       context.level_at_creation = level_at_creation;

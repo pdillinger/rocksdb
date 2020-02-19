@@ -127,8 +127,6 @@ struct ImmutableCFOptions {
   std::shared_ptr<ConcurrentTaskLimiter> compaction_thread_limiter;
 
   FileChecksumFunc* sst_file_checksum_func;
-
-  FilterOptions filter_opts;
 };
 
 struct MutableCFOptions {

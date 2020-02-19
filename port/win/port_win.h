@@ -270,6 +270,9 @@ inline void cacheline_aligned_free(void *memblock) {
 #endif
 }
 
+// Assume 4KB page size
+static const size_t kPageSize = 4 * 1024;
+
 // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=52991 for MINGW32
 // could not be worked around with by -mno-ms-bitfields
 #ifndef __MINGW32__

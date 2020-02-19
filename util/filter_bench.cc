@@ -98,10 +98,8 @@ DEFINE_bool(legend, false,
             "running tests");
 
 DEFINE_uint32(
-    size_optimization_pref, 0,
-    "Set size_optimization_pref option (see enum SizeOptimizationPref)");
-
-DEFINE_bool(tune_in_aggregate, false, "Set tune_in_aggregate option");
+    space_costing, 0,
+    "Set filter_block_space_costing option (see BlockBasedTableOptions)");
 
 DEFINE_uint32(runs, 1, "Number of times to rebuild and run benchmark tests");
 
@@ -136,9 +134,9 @@ using rocksdb::Lower32of64;
 using rocksdb::ParsedFullFilterBlock;
 using rocksdb::PlainTableBloomV1;
 using rocksdb::Random32;
-using rocksdb::SizeOptimizationPref;
 using rocksdb::Slice;
 using rocksdb::StderrLogger;
+using BlockSpaceCosting = rocksdb::BlockBasedTableOptions::BlockSpaceCosting;
 using rocksdb::mock::MockBlockBasedTableTester;
 
 struct KeyMaker {
@@ -337,9 +335,8 @@ void FilterBench::Go() {
     working_mem_size_mb /= 10.0;
   }
 
-  filter_opts_.size_optimization_pref =
-      static_cast<SizeOptimizationPref>(FLAGS_size_optimization_pref);
-  filter_opts_.tune_in_aggregate = FLAGS_tune_in_aggregate;
+  table_options_.filter_block_space_costing =
+      static_cast<BlockSpaceCosting>(FLAGS_space_costing);
 
   std::cout << "Building..." << std::endl;
 

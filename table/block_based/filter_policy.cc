@@ -25,17 +25,19 @@ namespace rocksdb {
 
 namespace {
 
+using BlockSpaceCosting = BlockBasedTableOptions::BlockSpaceCosting;
+static const uint32_t kPageSize = static_cast<uint32_t>(port::kPageSize);
+
 // See description in FastLocalBloomImpl
 class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
  public:
   explicit FastLocalBloomBitsBuilder(
-      const int millibits_per_key, const FilterOptions& filter_opts,
+      const int millibits_per_key, const BlockSpaceCosting& costing,
       std::atomic<int64_t>* aggregate_rounding_balance)
       : millibits_per_key_(millibits_per_key),
-        filter_opts_(filter_opts),
+        costing_(costing),
         aggregate_rounding_balance_(aggregate_rounding_balance) {
     assert(millibits_per_key >= 1000);
-    assert(!filter_opts_.tune_in_aggregate || aggregate_rounding_balance_);
   }
 
   // No Copy allowed
@@ -101,21 +103,22 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
     // Round up to nearest multiple of 64 (block size)
     uint32_t upper_len = (target_len + 63) & ~63;
 
-    // Adjust if we are taking into consideration friendly memory allocation sizes
-    size_t upper_mem = RoundUpToEffectiveSize(upper_len + 5);
+    // Adjust if we are taking into consideration friendly memory allocation
+    // sizes
+    uint32_t upper_mem = RoundUpToEffectiveSize(upper_len + 5);
     // Back-port those to supported data structure lengths
     upper_len = (upper_mem - 5) & ~63;
     assert(upper_len >= target_len);
 
-    if (!filter_opts_.tune_in_aggregate || upper_len == 0) {
+    if (!aggregate_rounding_balance_ || upper_len == 0) {
       return upper_len + /*metadata*/ 5;
     }
     // Must consider rounding down vs. rounding up
-    assert(filter_opts_.tune_in_aggregate);
+    assert(aggregate_rounding_balance_);
 
     // Mostly analogous to above
     uint32_t lower_len = target_len & ~63;
-    size_t lower_mem = RoundUpToEffectiveSize(lower_len + 5);
+    uint32_t lower_mem = RoundUpToEffectiveSize(lower_len + 5);
     if (lower_mem == upper_mem) {
       // Rounding down by data structure block was not enough to get
       // to the next smaller memory alloc size. Work backwards from
@@ -195,29 +198,32 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
   }
 
  private:
-  size_t RoundUpToEffectiveSize(size_t len) {
-    switch (filter_opts_.size_optimization_pref) {
-      case SizeOptimizationPref::kDiskPayload:
+  uint32_t RoundUpToEffectiveSize(uint32_t len) {
+    switch (costing_) {
+      case BlockBasedTableOptions::kUncompressedPayload:
         return len;
-      case SizeOptimizationPref::kAllocatedMemory:
-        return RoundUpToJemallocSize(len);
-      case SizeOptimizationPref::kAllocatedMemoryUsedPages:
-        // FIXME: platform
-        return std::min((len + 4095) & ~4095, RoundUpToJemallocSize(len));
+      case BlockBasedTableOptions::kAllocatedMemory:
+        // Max for overflow protection
+        return std::max(len, static_cast<uint32_t>(RoundUpToJemallocSize(len)));
+      case BlockBasedTableOptions::kUsedPagesOfAllocatedMemory:
+        // Max for overflow protection
+        return std::max(
+            len, std::min((len + kPageSize - 1) / kPageSize * kPageSize,
+                          static_cast<uint32_t>(RoundUpToJemallocSize(len))));
     }
     assert(false);
     return len;
   }
 
   size_t RoundDownToEffectiveSize(size_t len) {
-    switch (filter_opts_.size_optimization_pref) {
-      case SizeOptimizationPref::kDiskPayload:
+    switch (costing_) {
+      case BlockBasedTableOptions::kUncompressedPayload:
         return len;
-      case SizeOptimizationPref::kAllocatedMemory:
+      case BlockBasedTableOptions::kAllocatedMemory:
         return RoundDownToJemallocSize(len);
-      case SizeOptimizationPref::kAllocatedMemoryUsedPages:
-        // FIXME: platform
-        return std::max(len & ~4095, RoundDownToJemallocSize(len));
+      case BlockBasedTableOptions::kUsedPagesOfAllocatedMemory:
+        return std::max(len / kPageSize * kPageSize,
+                        RoundDownToJemallocSize(len));
     }
     assert(false);
     return len;
@@ -230,9 +236,8 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
         static_cast<int>(uint64_t{len} * 8000 / std::max(keys, size_t{1}));
     // BEGIN XXX/TODO(peterd): preserving old/default behavior for now to
     // minimize unit test churn. Remove this some time.
-    if (filter_opts_.size_optimization_pref ==
-            SizeOptimizationPref::kDiskPayload &&
-        !filter_opts_.tune_in_aggregate) {
+    if (costing_ == BlockBasedTableOptions::kUncompressedPayload &&
+        !aggregate_rounding_balance_) {
       actual_millibits_per_key = millibits_per_key_;
     }
     // END XXX/TODO
@@ -289,9 +294,10 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
 
   // Target allocation per added key, in thousandths of a bit.
   int millibits_per_key_;
-  // Filter options in effect from column family.
-  const FilterOptions filter_opts_;
-  // See BloomFilterPolicy::aggregate_rounding_balance_
+  // BlockSpaceCosting setting to use.
+  const BlockSpaceCosting costing_;
+  // See BloomFilterPolicy::aggregate_rounding_balance_. If nullptr,
+  // always "round up".
   std::atomic<int64_t>* aggregate_rounding_balance_;
   // A deque avoids unnecessary copying of already-saved values
   // and has near-minimal peak memory use.
@@ -688,8 +694,7 @@ FilterBitsBuilder* BloomFilterPolicy::GetFilterBitsBuilder() const {
   // been warned (HISTORY.md) that they can no longer call this on
   // the built-in BloomFilterPolicy (unlikely).
   assert(false);
-  return GetBuilderWithContext(
-      FilterBuildingContext(BlockBasedTableOptions(), FilterOptions()));
+  return GetBuilderWithContext(FilterBuildingContext(BlockBasedTableOptions()));
 }
 
 FilterBitsBuilder* BloomFilterPolicy::GetBuilderWithContext(
@@ -708,10 +713,13 @@ FilterBitsBuilder* BloomFilterPolicy::GetBuilderWithContext(
         break;
       case kDeprecatedBlock:
         return nullptr;
-      case kFastLocalBloom:
-        return new FastLocalBloomBitsBuilder(millibits_per_key_,
-                                             context.filter_opts,
-                                             &aggregate_rounding_balance_);
+      case kFastLocalBloom: {
+        BlockSpaceCosting c = context.table_options.filter_block_space_costing;
+        bool aggregate = c != BlockBasedTableOptions::kUncompressedPayload;
+        return new FastLocalBloomBitsBuilder(
+            millibits_per_key_, c,
+            aggregate ? &aggregate_rounding_balance_ : nullptr);
+      }
       case kLegacyBloom:
         if (whole_bits_per_key_ >= 14 && context.info_log &&
             !warned_.load(std::memory_order_relaxed)) {
@@ -899,9 +907,8 @@ const FilterPolicy* NewBloomFilterPolicy(double bits_per_key,
 }
 
 FilterBuildingContext::FilterBuildingContext(
-    const BlockBasedTableOptions& _table_options,
-    const FilterOptions& _filter_opts)
-    : table_options(_table_options), filter_opts(_filter_opts) {}
+    const BlockBasedTableOptions& _table_options)
+    : table_options(_table_options) {}
 
 FilterPolicy::~FilterPolicy() { }
 

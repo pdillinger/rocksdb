@@ -53,6 +53,7 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
 #include <limits>
 #include <string>
 
@@ -208,6 +209,13 @@ extern void cacheline_aligned_free(void *memblock);
 extern void Crash(const std::string& srcfile, int srcline);
 
 extern int GetMaxOpenFiles();
+
+#if defined(OS_LINUX) || defined(_SC_PAGESIZE)
+static const size_t kPageSize = sysconf(_SC_PAGESIZE);
+#else
+// Assume 4KB if unknown
+static const size_t kPageSize = 4 * 1024;
+#endif
 
 } // namespace port
 } // namespace rocksdb

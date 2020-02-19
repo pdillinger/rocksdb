@@ -196,6 +196,59 @@ struct BlockBasedTableOptions {
   // separately
   uint64_t metadata_block_size = 4096;
 
+  // Identifies a primary way of determining the "cost" in "space" of a
+  // potential table block. In particular, adding "n more bytes" to a
+  // block might be "almost free" or "rather expensive" depending on the
+  // exact sizes, system parameters, and optimization priorities. This
+  // enum attempts to generally classify the effective "cost" in "space"
+  // of a table block so that the best "space" vs. "time" trade-offs can
+  // be achieved.
+  enum BlockSpaceCosting : char {
+    // Assume that the "space cost" of a block is proportional to the size
+    // of its uncompressed payload. This is a reasonable proxy for disk size
+    // with or without compression, with no specific consideration for size
+    // in memory.
+    kUncompressedPayload = 0x00,
+
+    // Assume that the primary "space cost" of a block is the amount of
+    // memory allocated to it in block cache, including internal
+    // fragmentation. Thus, this creates a preference for block sizes
+    // just under sizes used by the memory allocator.
+    //
+    // Jemalloc generally uses allocation sizes that are 4, 5, 6, and 7
+    // times a power of two, generally averaging about 10% internal
+    // fragmentation unless allocation-friendly sizes are considered.
+    //
+    // For (Bloom) filters, there is roughly 3% higher disk usage to
+    // compensate for rounding up/down being slightly less "payload"
+    // space efficient than uniform accuracy, while saving about 10%
+    // in allocated memory.
+    kAllocatedMemory = 0x01,
+
+    // Like kAllocatedMemory, but assume there is approximately no cost
+    // for whole memory pages that are part of the allocated space but
+    // unused. Thus, this creates a preference for block sizes just under
+    // the closer of (a) a size used by the memory allocator, and
+    // (b) a multiple of the native default page size (4KB on Intel).
+    //
+    // At least on Linux, Jemalloc or the kernel might reclaim unused pages
+    // in internal fragmentation, so this setting might work better than
+    // kAllocatedMemory in some cases.
+    kUsedPagesOfAllocatedMemory = 0x02,
+  };
+
+  // The costing method to use when determining the size of filter blocks.
+  // When set to kUncompressedPayload (or format_version < 5, old behavior),
+  // filter blocks are always closely sized to meet a minimum accuracy
+  // (currently specified by bits_per_key setting to the FilterPolicy).
+  // For other settings, each Bloom filter size is "rounded up" or "rounded
+  // down" to some friendly, non-wasteful size, with a corresponding bump
+  // up or down in accuracy (false positive rate). Rounding history is
+  // sufficiently tracked and considered to ensure consistent average
+  // accuracy (false positive rate, weighted by number of keys added to each
+  // filter).
+  BlockSpaceCosting filter_block_space_costing = kUncompressedPayload;
+
   // Note: currently this option requires kTwoLevelIndexSearch to be set as
   // well.
   // TODO(myabandeh): remove the note above once the limitation is lifted

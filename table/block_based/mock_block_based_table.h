@@ -27,7 +27,6 @@ class MockBlockBasedTableTester {
   EnvOptions env_options_;
   BlockBasedTableOptions table_options_;
   InternalKeyComparator icomp_;
-  FilterOptions filter_opts_;
   std::unique_ptr<BlockBasedTable> table_;
 
   MockBlockBasedTableTester(const FilterPolicy *filter_policy)
@@ -44,7 +43,7 @@ class MockBlockBasedTableTester {
   }
 
   FilterBitsBuilder* GetBuilder() const {
-    FilterBuildingContext context(table_options_, filter_opts_);
+    FilterBuildingContext context(table_options_);
     context.column_family_name = "mock_cf";
     context.compaction_style = ioptions_.compaction_style;
     context.level_at_creation = kMockLevel;

@@ -42,12 +42,6 @@
 #include "util/mutexlock.h"
 #include "util/string_util.h"
 
-#ifdef OS_LINUX
-static const size_t kPageSize = sysconf(_SC_PAGESIZE);
-#else
-static const size_t kPageSize = 4 * 1024;
-#endif
-
 namespace rocksdb {
 
 static const int kDelayMicros = 100000;
@@ -67,12 +61,14 @@ struct Deleter {
 std::unique_ptr<char, Deleter> NewAligned(const size_t size, const char ch) {
   char* ptr = nullptr;
 #ifdef OS_WIN
-  if (nullptr == (ptr = reinterpret_cast<char*>(_aligned_malloc(size, kPageSize)))) {
+  if (nullptr ==
+      (ptr = reinterpret_cast<char*>(_aligned_malloc(size, port::kPageSize)))) {
     return std::unique_ptr<char, Deleter>(nullptr, Deleter(_aligned_free));
   }
   std::unique_ptr<char, Deleter> uptr(ptr, Deleter(_aligned_free));
 #else
-  if (posix_memalign(reinterpret_cast<void**>(&ptr), kPageSize, size) != 0) {
+  if (posix_memalign(reinterpret_cast<void**>(&ptr), port::kPageSize, size) !=
+      0) {
     return std::unique_ptr<char, Deleter>(nullptr, Deleter(free));
   }
   std::unique_ptr<char, Deleter> uptr(ptr, Deleter(free));
@@ -866,7 +862,7 @@ TEST_F(EnvPosixTest, PositionedAppend) {
   IoctlFriendlyTmpdir ift;
   ASSERT_OK(env_->NewWritableFile(ift.name() + "/f", &writable_file, options));
   const size_t kBlockSize = 4096;
-  const size_t kDataSize = kPageSize;
+  const size_t kDataSize = port::kPageSize;
   // Write a page worth of 'a'
   auto data_ptr = NewAligned(kDataSize, 'a');
   Slice data_a(data_ptr.get(), kDataSize);
@@ -881,10 +877,10 @@ TEST_F(EnvPosixTest, PositionedAppend) {
   // Verify the above
   std::unique_ptr<SequentialFile> seq_file;
   ASSERT_OK(env_->NewSequentialFile(ift.name() + "/f", &seq_file, options));
-  char scratch[kPageSize * 2];
+  char scratch[port::kPageSize * 2];
   Slice result;
   ASSERT_OK(seq_file->Read(sizeof(scratch), &result, scratch));
-  ASSERT_EQ(kPageSize + kBlockSize, result.size());
+  ASSERT_EQ(port::kPageSize + kBlockSize, result.size());
   ASSERT_EQ('a', result[kBlockSize - 1]);
   ASSERT_EQ('b', result[kBlockSize]);
 }
@@ -977,7 +973,6 @@ TEST_P(EnvPosixTestWithParam, AllocateTest) {
     // allocate 100 MB
     size_t kPreallocateSize = 100 * 1024 * 1024;
     size_t kBlockSize = 512;
-    size_t kPageSize = 4096;
     size_t kDataSize = 1024 * 1024;
     auto data_ptr = NewAligned(kDataSize, 'A');
     Slice data(data_ptr.get(), kDataSize);
@@ -1005,7 +1000,7 @@ TEST_P(EnvPosixTestWithParam, AllocateTest) {
     // verify that preallocated blocks were deallocated on file close
     // Because the FS might give us more blocks, we add a full page to the size
     // and expect the number of blocks to be less or equal to that.
-    ASSERT_GE((f_stat.st_size + kPageSize + kBlockSize - 1) / kBlockSize,
+    ASSERT_GE((f_stat.st_size + port::kPageSize + kBlockSize - 1) / kBlockSize,
               (unsigned int)f_stat.st_blocks);
   }
 }
