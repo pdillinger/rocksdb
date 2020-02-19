@@ -231,9 +231,9 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
 
   // Compute num_probes after any rounding / adjustments
   int GetNumProbes(size_t keys, size_t len_with_metadata) {
-    uint32_t len = len_with_metadata - 5;
+    uint64_t millibits = uint64_t{len_with_metadata - 5} * 8000;
     int actual_millibits_per_key =
-        static_cast<int>(uint64_t{len} * 8000 / std::max(keys, size_t{1}));
+        static_cast<int>(millibits / std::max(keys, size_t{1}));
     // BEGIN XXX/TODO(peterd): preserving old/default behavior for now to
     // minimize unit test churn. Remove this some time.
     if (costing_ == BlockBasedTableOptions::kUncompressedPayload &&
