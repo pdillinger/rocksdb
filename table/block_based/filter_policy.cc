@@ -215,15 +215,15 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
     return len;
   }
 
-  size_t RoundDownToEffectiveSize(size_t len) {
+  uint32_t RoundDownToEffectiveSize(uint32_t len) {
     switch (costing_) {
       case BlockBasedTableOptions::kUncompressedPayload:
         return len;
       case BlockBasedTableOptions::kAllocatedMemory:
-        return RoundDownToJemallocSize(len);
+        return static_cast<uint32_t>(RoundDownToJemallocSize(len));
       case BlockBasedTableOptions::kUsedPagesOfAllocatedMemory:
         return std::max(len / kPageSize * kPageSize,
-                        RoundDownToJemallocSize(len));
+                        static_cast<uint32_t>(RoundDownToJemallocSize(len)));
     }
     assert(false);
     return len;

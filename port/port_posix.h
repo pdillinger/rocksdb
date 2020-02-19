@@ -97,7 +97,7 @@ const int64_t kMaxInt64 = std::numeric_limits<int64_t>::max();
 const int64_t kMinInt64 = std::numeric_limits<int64_t>::min();
 const size_t kMaxSizet = std::numeric_limits<size_t>::max();
 
-static const bool kLittleEndian = PLATFORM_IS_LITTLE_ENDIAN;
+constexpr bool kLittleEndian = PLATFORM_IS_LITTLE_ENDIAN;
 #undef PLATFORM_IS_LITTLE_ENDIAN
 
 class CondVar;
@@ -210,12 +210,7 @@ extern void Crash(const std::string& srcfile, int srcline);
 
 extern int GetMaxOpenFiles();
 
-#if defined(OS_LINUX) || defined(_SC_PAGESIZE)
-static const size_t kPageSize = sysconf(_SC_PAGESIZE);
-#else
-// Assume 4KB if unknown
-static const size_t kPageSize = 4 * 1024;
-#endif
+extern const size_t kPageSize;
 
 } // namespace port
 } // namespace rocksdb

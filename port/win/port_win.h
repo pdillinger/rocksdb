@@ -70,10 +70,6 @@ typedef SSIZE_T ssize_t;
 
 #endif
 
-#ifndef PLATFORM_IS_LITTLE_ENDIAN
-#define PLATFORM_IS_LITTLE_ENDIAN (__BYTE_ORDER == __LITTLE_ENDIAN)
-#endif
-
 namespace rocksdb {
 
 #define PREFETCH(addr, rw, locality)
@@ -122,7 +118,7 @@ const size_t kMaxSizet = std::numeric_limits<size_t>::max();
 
 #endif //_MSC_VER
 
-const bool kLittleEndian = true;
+constexpr bool kLittleEndian = true;
 
 class CondVar;
 
@@ -270,8 +266,7 @@ inline void cacheline_aligned_free(void *memblock) {
 #endif
 }
 
-// Assume 4KB page size
-static const size_t kPageSize = 4 * 1024;
+extern const size_t kPageSize;
 
 // https://gcc.gnu.org/bugzilla/show_bug.cgi?id=52991 for MINGW32
 // could not be worked around with by -mno-ms-bitfields
