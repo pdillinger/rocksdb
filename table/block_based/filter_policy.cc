@@ -54,10 +54,12 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
   }
 
   virtual Slice Finish(std::unique_ptr<const char[]>* buf) override {
-    uint32_t num_entry = static_cast<uint32_t>(hash_entries_.size());
-    uint32_t len_with_metadata = CalculateSpace(num_entry);
+    size_t num_entry = hash_entries_.size();
+    size_t len_with_metadata = CalculateSpace(num_entry, /*update_balance*/ true);
     assert(len_with_metadata >= 5);
-    uint32_t len = len_with_metadata - 5;
+    // Max supported size for this implementation
+    assert(len_with_metadata <= size_t{0xffffffc5});
+    uint32_t len = static_cast<uint32_t>(len_with_metadata - 5);
 
     char* data = new char[len_with_metadata];
     memset(data, 0, len_with_metadata);
@@ -94,18 +96,27 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
   }
 
   uint32_t CalculateSpace(const int num_entry) override {
+    // NB: the BuiltinFilterBitsBuilder API presumes len fits in uint32_t.
+    return static_cast<uint32_t>(CalculateSpace(static_cast<size_t>(num_entry), /*update_balance*/false));
+  }
+
+  size_t CalculateSpace(size_t num_entry, bool update_balance) {
     // If not for cache line blocks in the filter, what would the target
     // length in bytes be?
-    // NB: the BuiltinFilterBitsBuilder API presumes len fits in uint32_t.
-    uint32_t target_len = static_cast<uint32_t>(
-        (int64_t{num_entry} * millibits_per_key_ + 7999) / 8000);
+    size_t target_len = static_cast<size_t>(
+        (uint64_t{num_entry} * millibits_per_key_ + 7999) / 8000);
+
+    if (target_len >= size_t{0xffffffc0}) {
+      // Max supported for this data structure implementation
+      return size_t{0xffffffc0} + 5;
+    }
 
     // Round up to nearest multiple of 64 (block size)
-    uint32_t upper_len = (target_len + 63) & ~63;
+    size_t upper_len = (target_len + 63) & ~63;
 
     // Adjust if we are taking into consideration friendly memory allocation
     // sizes
-    uint32_t upper_mem = RoundUpToEffectiveSize(upper_len + 5);
+    size_t upper_mem = RoundUpToEffectiveSize(upper_len + 5);
     // Back-port those to supported data structure lengths
     upper_len = (upper_mem - 5) & ~63;
     assert(upper_len >= target_len);
@@ -117,8 +128,8 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
     assert(aggregate_rounding_balance_);
 
     // Mostly analogous to above
-    uint32_t lower_len = target_len & ~63;
-    uint32_t lower_mem = RoundUpToEffectiveSize(lower_len + 5);
+    size_t lower_len = target_len & ~63;
+    size_t lower_mem = RoundUpToEffectiveSize(lower_len + 5);
     if (lower_mem == upper_mem) {
       // Rounding down by data structure block was not enough to get
       // to the next smaller memory alloc size. Work backwards from
@@ -129,7 +140,7 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
     lower_len = (lower_mem - 5) & ~63;
     assert(lower_len <= target_len);
 
-    uint32_t choice_len;
+    size_t choice_len;
     if (lower_len == upper_len) {
       // No decision to make
       choice_len = lower_len;
@@ -155,8 +166,8 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
       assert(target_fp_weight >= upper_fp_weight);
 
       // Absolute differences in size
-      uint32_t lower_diff = target_len - lower_len;
-      uint32_t upper_diff = upper_len - target_len;
+      size_t lower_diff = target_len - lower_len;
+      size_t upper_diff = upper_len - target_len;
 
       // Load the balance to inform rounding up vs. down. (OK if this goes
       // stale, because a data race can only have temporary impact,
@@ -182,10 +193,11 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
           choice_len = lower_len;
         }
       }
-      // Update balance
-      int64_t actual_fp_weight =
-          (choice_len == lower_len) ? lower_fp_weight : upper_fp_weight;
-      *aggregate_rounding_balance_ += actual_fp_weight - target_fp_weight;
+      if (update_balance) {
+        int64_t actual_fp_weight =
+            (choice_len == lower_len) ? lower_fp_weight : upper_fp_weight;
+        *aggregate_rounding_balance_ += actual_fp_weight - target_fp_weight;
+      }
     }
 
     return choice_len + /*metadata*/ 5;
@@ -198,32 +210,29 @@ class FastLocalBloomBitsBuilder : public BuiltinFilterBitsBuilder {
   }
 
  private:
-  uint32_t RoundUpToEffectiveSize(uint32_t len) {
+  size_t RoundUpToEffectiveSize(size_t len) {
     switch (costing_) {
       case BlockBasedTableOptions::kUncompressedPayload:
         return len;
       case BlockBasedTableOptions::kAllocatedMemory:
-        // Max for overflow protection
-        return std::max(len, static_cast<uint32_t>(RoundUpToJemallocSize(len)));
+        return RoundUpToJemallocSize(len);
       case BlockBasedTableOptions::kUsedPagesOfAllocatedMemory:
-        // Max for overflow protection
-        return std::max(
-            len, std::min((len + kPageSize - 1) / kPageSize * kPageSize,
-                          static_cast<uint32_t>(RoundUpToJemallocSize(len))));
+        return std::min((len + kPageSize - 1) / kPageSize * kPageSize,
+                          RoundUpToJemallocSize(len));
     }
     assert(false);
     return len;
   }
 
-  uint32_t RoundDownToEffectiveSize(uint32_t len) {
+  size_t RoundDownToEffectiveSize(size_t len) {
     switch (costing_) {
       case BlockBasedTableOptions::kUncompressedPayload:
         return len;
       case BlockBasedTableOptions::kAllocatedMemory:
-        return static_cast<uint32_t>(RoundDownToJemallocSize(len));
+        return RoundDownToJemallocSize(len);
       case BlockBasedTableOptions::kUsedPagesOfAllocatedMemory:
         return std::max(len / kPageSize * kPageSize,
-                        static_cast<uint32_t>(RoundDownToJemallocSize(len)));
+                        RoundDownToJemallocSize(len));
     }
     assert(false);
     return len;

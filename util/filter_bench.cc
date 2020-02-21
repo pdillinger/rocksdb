@@ -746,6 +746,8 @@ int main(int argc, char **argv) {
     FilterBench b;
     for (uint32_t i = 0; i < FLAGS_runs; ++i) {
       b.Go();
+      FLAGS_seed += 100;
+      b.random_.Seed(FLAGS_seed);
     }
   }
 
