@@ -97,6 +97,10 @@ DEFINE_bool(legend, false,
             "Print more information about interpreting results instead of "
             "running tests");
 
+DEFINE_uint32(
+    space_costing, 0,
+    "Set filter_block_space_costing option (see BlockBasedTableOptions)");
+
 DEFINE_uint32(runs, 1, "Number of times to rebuild and run benchmark tests");
 
 void _always_assert_fail(int line, const char *file, const char *expr) {
@@ -133,6 +137,9 @@ using ROCKSDB_NAMESPACE::Random32;
 using ROCKSDB_NAMESPACE::Slice;
 using ROCKSDB_NAMESPACE::StderrLogger;
 using ROCKSDB_NAMESPACE::mock::MockBlockBasedTableTester;
+
+using BlockSpaceCosting =
+    ROCKSDB_NAMESPACE::BlockBasedTableOptions::BlockSpaceCosting;
 
 struct KeyMaker {
   KeyMaker(size_t avg_size)
@@ -329,6 +336,9 @@ void FilterBench::Go() {
     m_queries_ /= 3.0;
     working_mem_size_mb /= 10.0;
   }
+
+  table_options_.filter_block_space_costing =
+      static_cast<BlockSpaceCosting>(FLAGS_space_costing);
 
   std::cout << "Building..." << std::endl;
 

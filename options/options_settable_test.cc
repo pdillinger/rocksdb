@@ -145,6 +145,7 @@ TEST_F(OptionsSettableTest, BlockBasedTableOptionsAllFieldsSettable) {
       "block_cache=1M;block_cache_compressed=1k;block_size=1024;"
       "block_size_deviation=8;block_restart_interval=4; "
       "metadata_block_size=1024;"
+      "filter_block_space_costing=kUncompressedPayload;"
       "partition_filters=false;"
       "index_block_restart_interval=4;"
       "filter_policy=bloomfilter:4:true;whole_key_filtering=1;"

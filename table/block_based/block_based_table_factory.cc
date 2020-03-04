@@ -383,6 +383,9 @@ std::string BlockBasedTableFactory::GetPrintableTableOptions() const {
   snprintf(buffer, kBufferSize, "  metadata_block_size: %" PRIu64 "\n",
            table_options_.metadata_block_size);
   ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  filter_block_space_costing: %d\n",
+           table_options_.filter_block_space_costing);
+  ret.append(buffer);
   snprintf(buffer, kBufferSize, "  partition_filters: %d\n",
            table_options_.partition_filters);
   ret.append(buffer);

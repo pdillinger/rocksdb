@@ -72,6 +72,7 @@ enum class OptionType {
   kMemTableRepFactory,
   kBlockBasedTableIndexType,
   kBlockBasedTableDataBlockIndexType,
+  kBlockBasedTableBlockSpaceCosting,
   kBlockBasedTableIndexShorteningMode,
   kFilterPolicy,
   kFlushBlockPolicyFactory,
@@ -172,6 +173,9 @@ struct OptionsHelper {
                             BlockBasedTableOptions::DataBlockIndexType>
       block_base_table_data_block_index_type_string_map;
   static std::unordered_map<std::string,
+                            BlockBasedTableOptions::BlockSpaceCosting>
+      block_base_table_block_space_costing_string_map;
+  static std::unordered_map<std::string,
                             BlockBasedTableOptions::IndexShorteningMode>
       block_base_table_index_shortening_mode_string_map;
   static std::unordered_map<std::string, EncodingType> encoding_type_string_map;
@@ -216,6 +220,8 @@ static auto& block_base_table_index_type_string_map =
     OptionsHelper::block_base_table_index_type_string_map;
 static auto& block_base_table_data_block_index_type_string_map =
     OptionsHelper::block_base_table_data_block_index_type_string_map;
+static auto& block_base_table_block_space_costing_string_map =
+    OptionsHelper::block_base_table_block_space_costing_string_map;
 static auto& block_base_table_index_shortening_mode_string_map =
     OptionsHelper::block_base_table_index_shortening_mode_string_map;
 static auto& encoding_type_string_map = OptionsHelper::encoding_type_string_map;

@@ -538,6 +538,11 @@ bool ParseOptionHelper(char* opt_address, const OptionType& opt_type,
           block_base_table_data_block_index_type_string_map, value,
           reinterpret_cast<BlockBasedTableOptions::DataBlockIndexType*>(
               opt_address));
+    case OptionType::kBlockBasedTableBlockSpaceCosting:
+      return ParseEnum<BlockBasedTableOptions::BlockSpaceCosting>(
+          block_base_table_block_space_costing_string_map, value,
+          reinterpret_cast<BlockBasedTableOptions::BlockSpaceCosting*>(
+              opt_address));
     case OptionType::kBlockBasedTableIndexShorteningMode:
       return ParseEnum<BlockBasedTableOptions::IndexShorteningMode>(
           block_base_table_index_shortening_mode_string_map, value,
@@ -736,6 +741,12 @@ bool SerializeSingleOptionHelper(const char* opt_address,
       return SerializeEnum<BlockBasedTableOptions::DataBlockIndexType>(
           block_base_table_data_block_index_type_string_map,
           *reinterpret_cast<const BlockBasedTableOptions::DataBlockIndexType*>(
+              opt_address),
+          value);
+    case OptionType::kBlockBasedTableBlockSpaceCosting:
+      return SerializeEnum<BlockBasedTableOptions::BlockSpaceCosting>(
+          block_base_table_block_space_costing_string_map,
+          *reinterpret_cast<const BlockBasedTableOptions::BlockSpaceCosting*>(
               opt_address),
           value);
     case OptionType::kBlockBasedTableIndexShorteningMode:
@@ -1698,6 +1709,16 @@ std::unordered_map<std::string, BlockBasedTableOptions::DataBlockIndexType>
          BlockBasedTableOptions::DataBlockIndexType::kDataBlockBinarySearch},
         {"kDataBlockBinaryAndHash",
          BlockBasedTableOptions::DataBlockIndexType::kDataBlockBinaryAndHash}};
+
+std::unordered_map<std::string, BlockBasedTableOptions::BlockSpaceCosting>
+    OptionsHelper::block_base_table_block_space_costing_string_map = {
+        {"kUncompressedPayload",
+         BlockBasedTableOptions::BlockSpaceCosting::kUncompressedPayload},
+        {"kAllocatedMemory",
+         BlockBasedTableOptions::BlockSpaceCosting::kAllocatedMemory},
+        {"kUsedPagesOfAllocatedMemory",
+         BlockBasedTableOptions::BlockSpaceCosting::
+             kUsedPagesOfAllocatedMemory}};
 
 std::unordered_map<std::string, BlockBasedTableOptions::IndexShorteningMode>
     OptionsHelper::block_base_table_index_shortening_mode_string_map = {
