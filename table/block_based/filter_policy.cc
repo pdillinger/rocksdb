@@ -20,6 +20,7 @@
 #include "util/bloom_impl.h"
 #include "util/coding.h"
 #include "util/hash.h"
+#include "util/math.h"
 #include "util/util.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -207,22 +208,27 @@ struct GaussData {
   // The index of the first non-zero column in coeff for this row.
   // Equivalently, the starting index of output rows to be used in
   // query. Based on hash.
-  uint32_t start = 0;
+  uint16_t start = 0;
   // A row in output, or a column in coeff.
   // Computed during gaussian elimination.
-  uint32_t pivot = 0;
+  uint16_t pivot = 0;
 
-  static constexpr uint32_t front_smash = 20;
-  static constexpr uint32_t back_smash = 20;
+  // Using 20/20 was found to be most compact in some circumstances, but now
+  // 32/31 (fastest) seems most compact also.
+  static constexpr uint32_t front_smash = 32;
+  static constexpr uint32_t back_smash = 31;
 
-  static inline uint32_t HashToStart(uint64_t h, uint32_t num_output_rows) {
+  static inline uint16_t HashToStart(uint64_t h, uint32_t num_output_rows) {
+    // NB: addrs == num_output_rows with 32/31 setting
     const uint32_t addrs = num_output_rows - 63 + front_smash + back_smash;
-    uint32_t start = fastrange32(static_cast<uint32_t>(h >> 32), addrs);
-    start = std::max(start, front_smash);
+    uint32_t start = fastrange32(Upper32of64(h), addrs);
+    uint32_t x = front_smash; // FIXME for DEBUG_LEVEL=2
+    start = std::max(start, x);
     start -= front_smash;
     start = std::min(start, num_output_rows - 64);
     assert(start < num_output_rows - 63);
-    return start;
+    assert(start < 0x10000U);
+    return static_cast<uint16_t>(start);
   }
 
   static inline uint64_t HashToCoeffRow(uint64_t h) {
@@ -232,7 +238,8 @@ struct GaussData {
   }
 
   static inline uint32_t HashToMatchRow(uint64_t h) {
-    return static_cast<uint32_t>(h);
+    // NB: just h seems to cause some association affecting FP rate
+    return Lower32of64(h ^ (h >> 13) ^ (h >> 26));
   }
 
   inline void Reset(uint64_t h, uint32_t num_output_rows, uint32_t match_row_mask) {
@@ -240,6 +247,35 @@ struct GaussData {
     coeff_row = HashToCoeffRow(h);
     match_row = HashToMatchRow(h) & match_row_mask;
     pivot = 0;
+  }
+
+  // FIXME: better way?
+  static inline uint64_t TweakPreHash(uint64_t h) {
+    if ((h & uint64_t{0x8000000000000380}) == uint64_t{0x0000000000000380}) {
+      return h + uint64_t{0x8000000000000000};
+    } else {
+      return h;
+    }
+  }
+
+  static inline uint32_t PreHashToSection(uint64_t h) {
+    uint32_t v = Lower32of64(h) & 1023;
+    if (v < 300) {
+        return v / 3;
+    } else if (v < 428) {
+        return v - 200;
+    } else if (v < 512) {
+        return (v + 256) / 3;
+//    } else if (v < 532) {
+//        return (v + 1516) / 8;
+    } else {
+        return 0;
+    }
+  }
+
+  static inline uint64_t SeedPreHash(uint64_t h, uint32_t seed) {
+    uint32_t rot = (seed * 39) & 63;
+    return ((h << rot) | (h >> (64 - rot))) * 0x9e3779b97f4a7c13;
   }
 
   static inline bool DotCoeffRowWithOutputColumn(uint32_t start, uint64_t coeff_row, const uint64_t *output_data, uint32_t match_bits, uint32_t selected_match_bit) {
@@ -250,12 +286,14 @@ struct GaussData {
     if (start_bit > 0) {
       output_column |= output_data[start_word + match_bits] << (64 - start_bit);
     }
-    return __builtin_parityl(output_column & coeff_row) != 0;
+    return BitParity(output_column & coeff_row) != 0;
   }
 
   static inline void StoreOutputVal(bool val, uint64_t *output_data, uint32_t match_bits, uint32_t start, uint32_t selected_match_bit) {
     uint32_t selected_word = (start / 64) * match_bits + selected_match_bit;
     uint64_t bit_selector = uint64_t{1} << (start % 64);
+
+    //printf("Storing %u @ %u.%u\n", (unsigned)val, (unsigned)(size_t)(output_data + selected_word), start % 64);
 
     // TODO: endianness
     if (val) {
@@ -263,6 +301,423 @@ struct GaussData {
     } else {
       output_data[selected_word] &= ~bit_selector;
     }
+  }
+
+  static bool CompareByStart(const GaussData &a, const GaussData &b) {
+    return a.start < b.start;
+  }
+};
+
+static inline ptrdiff_t size_t_diff(size_t a, size_t b) {
+  return static_cast<ptrdiff_t>(a) - static_cast<ptrdiff_t>(b);
+}
+
+struct SimpleGaussFilter {
+  static constexpr uint32_t metadata_size = 5;
+
+  char* data = nullptr;
+  size_t bytes = metadata_size; // incl metadata
+  size_t total_blocks = 0;
+  size_t first_block_upper = 0;
+  uint32_t log2_shards = 0;
+  uint32_t avg_shard_slots = 0;
+  uint32_t lower_match_bits = 0;
+  uint32_t first_shard_extra_blocks = 0;
+
+  inline size_t GetShardBeginBlock(uint32_t shard) const {
+    return static_cast<size_t>((uint64_t{shard} * avg_shard_slots + first_shard_extra_blocks) / 64);
+  }
+
+  inline char* GetBlockDataStart(size_t block) const {
+    assert(data);
+    char *rv = data + block * 8 * lower_match_bits;
+    rv += std::max(ptrdiff_t{0}, size_t_diff(block, first_block_upper)) * 8;
+    return rv;
+  }
+
+  inline char* GetShardMetaDataStart() const {
+    return GetBlockDataStart(GetShardBeginBlock(uint32_t{1} << log2_shards));
+  }
+
+  // Reads:
+  //   bytes
+  //   log2_shards
+  //   avg_shard_slots
+  // Reads+writes:
+  //   first_shard_extra_blocks
+  //   lower_match_bits
+  //   total_blocks
+  //   first_block_upper
+  void ElasticShrinkForFirstShard(uint32_t new_first_shard_extra_blocks) {
+    uint32_t old_first_shard_extra_blocks = first_shard_extra_blocks;
+    uint32_t old_lower_match_bits = lower_match_bits;
+    size_t old_total_blocks = total_blocks;
+    //size_t old_first_block_upper = first_block_upper;
+
+    this->first_shard_extra_blocks = new_first_shard_extra_blocks;
+    CalculateMatchBitSettings();
+
+    assert(first_shard_extra_blocks > old_first_shard_extra_blocks);
+    assert(lower_match_bits <= old_lower_match_bits);
+    assert(total_blocks > old_total_blocks);
+
+    fprintf(stderr, "Elastic shrink for first shard not yet implemented. Aborting.\n");
+    abort();
+  }
+
+  // Reads:
+  //   bytes
+  //   log2_shards
+  //   avg_shard_slots
+  //   first_shard_extra_blocks (default 0 OK)
+  // Writes:
+  //   lower_match_bits
+  //   total_blocks
+  //   first_block_upper
+  void CalculateMatchBitSettings() {
+    uint32_t shards = uint32_t{1} << log2_shards;
+    uint64_t orig_total_slots = uint64_t{shards} * avg_shard_slots;
+    // Must be multiple of 64 already
+    assert((orig_total_slots & 63) == 0);
+    this->total_blocks = static_cast<size_t>(orig_total_slots / 64) + first_shard_extra_blocks;
+
+    // One byte per shard of sharding data
+    size_t bytes_for_blocks = bytes - metadata_size - /*sharding data*/shards;
+    // Slots only work in 64-bit word chunks
+    size_t words_for_blocks = bytes_for_blocks / 8;
+    this->lower_match_bits =
+        static_cast<uint32_t>(std::min(uint64_t{31}, words_for_blocks / total_blocks));
+    uint32_t upper_match_bits = lower_match_bits + 1;
+    size_t words_for_upper_extra = words_for_blocks - lower_match_bits * total_blocks;
+    this->first_block_upper = total_blocks - words_for_upper_extra;
+    assert(words_for_blocks == (first_block_upper * lower_match_bits) +
+                               ((total_blocks - first_block_upper) * upper_match_bits));
+    //printf("%u %u %u %u %u %u %u\n", (unsigned) bytes, (unsigned)total_blocks, (unsigned) first_block_upper, log2_shards, avg_shard_slots, lower_match_bits, first_shard_extra_blocks);
+  }
+
+  // Reads no fields
+  // Writes:
+  //   log2_shards
+  //   avg_shard_slots
+  void CalculatePreferredSharding(size_t keys) {
+    // FIXME: 1.004
+    size_t total_slots = static_cast<size_t>(1.008 * keys + 0.5);
+    // Make it a multiple of 64
+    total_slots = (total_slots + 63) & ~size_t{63};
+    // Find power of two number of shards that gets average slots per shard
+    // closest to ~1000
+    this->log2_shards = 0;
+    while (log2_shards + 1 < 32 && (total_slots >> log2_shards) > 1414U) {
+        ++log2_shards;
+    }
+    uint32_t shards = uint32_t{1} << log2_shards;
+    this->avg_shard_slots = (total_slots + shards - 1) / shards;
+  }
+
+  // Reads no fields
+  // Writes:
+  //   log2_shards
+  //   avg_shard_slots
+  //   lower_match_bits
+  //   total_blocks
+  //   first_block_upper
+  void CalculateSpace(size_t keys, int millibits_per_key) {
+    CalculatePreferredSharding(keys);
+    uint32_t shards = uint32_t{1} << log2_shards;
+    size_t ideal_bytes = static_cast<size_t>((int64_t{millibits_per_key} * keys + 7999) / 8000);
+    size_t rounded_bytes_for_blocks = ((ideal_bytes - shards - metadata_size + 7) & ~size_t{7});
+    this->bytes = rounded_bytes_for_blocks + shards + metadata_size;
+    CalculateMatchBitSettings();
+  }
+
+  // Reads:
+  //   bytes
+  // Writes:
+  //   data
+  //   owned_data
+  void AllocateSpace(std::unique_ptr<const char[]>* buf) {
+    assert(bytes >= metadata_size);
+    buf->reset(data = new char[bytes]());
+  }
+
+  static bool TrySolve(std::vector<GaussData> &gauss, uint32_t num_coeff_rows, uint32_t num_output_rows, const std::vector<uint64_t> &shard_hashes, const std::vector<uint64_t> &bumped_hashes, uint32_t seed, uint32_t last_section, uint32_t match_row_mask) {
+    assert(gauss.size() >= num_coeff_rows);
+    // Build gauss data with seeded hashes
+    uint32_t next_gauss_idx = 0;
+    for (uint64_t pre_h : shard_hashes) {
+      uint32_t section = GaussData::PreHashToSection(pre_h);
+      if (section <= last_section) {
+        uint64_t h = GaussData::SeedPreHash(pre_h, seed);
+        GaussData &d = gauss[next_gauss_idx];
+        d.Reset(h, num_output_rows, match_row_mask);
+        assert(d.start < num_output_rows);
+        ++next_gauss_idx;
+      }
+    }
+    // ... except bumped hashes don't get the seed
+    for (uint64_t h : bumped_hashes) {
+      GaussData &d = gauss[next_gauss_idx];
+      d.Reset(h, num_output_rows, match_row_mask);
+      assert(d.start < num_output_rows);
+      ++next_gauss_idx;
+    }
+    assert(next_gauss_idx == num_coeff_rows);
+    // Sort based on start positions
+    std::sort(gauss.begin(), gauss.begin() + num_coeff_rows, GaussData::CompareByStart);
+    // Now "simple" gaussian elimination
+    for (uint32_t i = 0; i < num_coeff_rows; ++i) {
+      GaussData &di = gauss[i];
+      if (di.coeff_row == 0) {
+        // Might be a total duplicate or lucky coincidence in generating
+        // desired output. For plain (over-approximate) sets, that's just
+        // fine. Pivot of 0 is a safe fake here, because if a real row uses
+        // pivot 0, it has to be the first row and will be back-propagated
+        // last.
+        if (false && di.match_row == 0) { // FIXME: doesn't work; handle duplicates?
+          assert(di.pivot == 0);
+        } else {
+          // Attempt failed
+          return false;
+        }
+      }
+      int tz = CountTrailingZeroBits(di.coeff_row);
+      di.pivot = di.start + tz;
+      for (uint32_t j = i + 1; j < num_coeff_rows; ++j) {
+        GaussData &dj = gauss[j];
+        assert(dj.start >= di.start);
+        if (di.pivot < dj.start) {
+          break;
+        }
+        if ((dj.coeff_row >> (di.pivot - dj.start)) & 1) {
+          dj.coeff_row ^= (di.coeff_row >> (dj.start - di.start));
+          dj.match_row ^= di.match_row;
+        }
+      }
+    }
+    // Success
+    return true;
+  }
+
+  static void BackPropAndStoreSingle(GaussData &d, uint64_t *word_data, uint32_t match_bits) {
+    const uint32_t start = d.start;
+    const uint64_t coeff_row = d.coeff_row;
+    const uint32_t match_row = d.match_row;
+    const uint32_t pivot = d.pivot;
+    //printf("BPSS %u %u %u\n", (unsigned)(size_t)word_data, start, match_bits);
+
+    for (uint32_t j = 0; j < match_bits; ++j) {
+      bool val = GaussData::DotCoeffRowWithOutputColumn(start, coeff_row, word_data, match_bits, j);
+      val ^= ((match_row >> j) & 1);
+      GaussData::StoreOutputVal(val, word_data, match_bits, pivot, j);
+    }
+  }
+
+  void BackPropAndStore(size_t starting_block, std::vector<GaussData> &gauss, uint32_t num_coeff_rows, uint32_t num_output_rows) {
+    size_t ending_block = starting_block + num_output_rows / 64;
+    uint32_t match_bits = lower_match_bits + (starting_block >= first_block_upper);
+    uint32_t i = num_coeff_rows;
+    uint64_t *word_data = reinterpret_cast<uint64_t *>(GetBlockDataStart(starting_block));
+    if (first_block_upper > starting_block && first_block_upper < ending_block) {
+      // Special handling (mixed match_bits in shard)
+      uint32_t num_lower_blocks = first_block_upper - starting_block;
+      uint32_t first_start_upper = num_lower_blocks * 64;
+      // Where the starting pointer would be if the whole thing used
+      // upper match bits and ended at the same pointer (but started
+      // before actual start).
+      uint64_t *special_word_data = word_data - num_lower_blocks;
+      for (; i > 0 && gauss[i - 1].start >= first_start_upper; --i) {
+        BackPropAndStoreSingle(gauss[i - 1], special_word_data, match_bits + 1);
+      }
+      // There is one intermediate block where we might need to use
+      // upper match bits or lower match bits depending on position
+      // of the pivot (where we are writing data to)
+      for (; i > 0 && gauss[i - 1].start >= first_start_upper - 64; --i) {
+        if (gauss[i - 1].pivot >= first_start_upper) {
+          BackPropAndStoreSingle(gauss[i - 1], special_word_data, match_bits + 1);
+        } else {
+          BackPropAndStoreSingle(gauss[i - 1], word_data, match_bits);
+        }
+      }
+      // fall through for lower portion
+    }
+    // Easy handling (consistent match_bits in shard, or lower portion)
+    for (; i > 0; --i) {
+      BackPropAndStoreSingle(gauss[i - 1], word_data, match_bits);
+    }
+  }
+
+  void BuildShards(std::deque<uint64_t> *hashes) {
+    assert(log2_shards < 32);
+    uint32_t shards = uint32_t{1} << log2_shards;
+
+    std::unique_ptr<std::vector<uint64_t>[]> shard_hashes{new std::vector<uint64_t>[shards]};
+    std::unique_ptr<std::vector<uint64_t>[]> bumped_hashes{new std::vector<uint64_t>[shards]};
+    std::unique_ptr<std::array<uint32_t, 256>[]> shard_section_counts{new std::array<uint32_t, 256>[shards]()};
+
+    // TODO: pre-allocate vector capacity?
+
+    uint32_t leave_shard_shift_minus1 = 64U - log2_shards - 1;
+    while (!hashes->empty()) {
+      uint64_t h = GaussData::TweakPreHash(hashes->front());
+      hashes->pop_front();
+      uint32_t shard = h >> 1 >> leave_shard_shift_minus1;
+      uint32_t section = GaussData::PreHashToSection(h);
+      assert(section < 256U);
+      shard_hashes[shard].push_back(h);
+      shard_section_counts[shard][section]++;
+    }
+
+    char *shard_metadata = GetShardMetaDataStart();
+
+    std::vector<GaussData> gauss;
+    gauss.resize(avg_shard_slots + 63);
+
+    uint32_t match_row_mask = (uint32_t{1} << 1 << lower_match_bits) - 1;
+
+    size_t shard_begin_block = total_blocks;
+    size_t shard_end_block;
+    for (uint32_t shard = shards - 1; shard > 0; --shard) {
+      shard_end_block = shard_begin_block;
+      shard_begin_block = GetShardBeginBlock(shard);
+
+      uint32_t shard_slots = (shard_end_block - shard_begin_block) * 64;
+      uint32_t last_section = 0;
+      uint32_t count = shard_section_counts[shard][0] + bumped_hashes[shard].size();
+      for (; last_section < 255U; ++last_section) {
+        uint32_t next_count = count + shard_section_counts[shard][last_section + 1];
+        if (next_count > shard_slots) {
+          break;
+        }
+        count = next_count;
+      }
+
+      for (; last_section > 0; --last_section) {
+        if (TrySolve(gauss, count, shard_slots, shard_hashes[shard], bumped_hashes[shard], /*seed*/last_section, last_section, match_row_mask)) {
+          BackPropAndStore(shard_begin_block, gauss, count, shard_slots);
+          break;
+        }
+        count -= shard_section_counts[shard][last_section];
+      }
+      shard_metadata[shard] = static_cast<char>(last_section);
+      // Handle bumping
+      // TODO: combine with solving passes
+      if (last_section < 255) {
+        uint32_t bumped_shard_or = (uint32_t{1} << FloorLog2(shard));
+        uint32_t bumped_shard_mask = bumped_shard_or - 1;
+        bumped_shard_or /= 2;
+        bumped_shard_mask /= 2;
+        for (uint64_t pre_h : shard_hashes[shard]) {
+          uint32_t section = GaussData::PreHashToSection(pre_h);
+          if (section > last_section) {
+            // TODO: reconsider/refactor
+            uint32_t bumped_shard = (Upper32of64(pre_h) & bumped_shard_mask) | bumped_shard_or;
+            assert(bumped_shard < shard);
+            uint64_t h = pre_h * 0x9e3779b97f4a7c13 * 0x9e3779b97f4a7c13;
+            bumped_hashes[bumped_shard].push_back(h);
+          }
+        }
+      }
+      if (last_section == 0) {
+        fprintf(stderr, "Bloom fallback not yet implemented. Aborting.\n");
+        abort();
+      }
+    }
+    // special treatment for first shard
+    uint32_t original_shard_end_block = shard_begin_block;
+    shard_end_block = original_shard_end_block;
+    shard_begin_block = 0;
+    uint32_t shard_slots = (shard_end_block - shard_begin_block) * 64;
+
+    uint32_t count = bumped_hashes[0].size();
+    for (uint32_t i = 0; i < 256U; ++i) {
+      count += shard_section_counts[0][i];
+    }
+    while (count > shard_slots) {
+      ++shard_end_block;
+      shard_slots = (shard_end_block - shard_begin_block) * 64;
+      gauss.resize(shard_slots);
+    }
+    uint32_t seed = 255;
+    for (; shard_slots <= 0x10000U && seed > 0; --seed) {
+      if (seed < 240 && shard_slots < 0x10000U) {
+        ++shard_end_block;
+        shard_slots = (shard_end_block - shard_begin_block) * 64;
+        gauss.resize(shard_slots);
+      }
+      if (TrySolve(gauss, count, shard_slots, shard_hashes[0], bumped_hashes[0], seed, /*all*/ 255, match_row_mask)) {
+        break;
+      }
+    }
+    if (shard_slots > 0x10000U || seed == 0) {
+      fprintf(stderr, "Bloom fallback not yet implemented (last shard). Aborting.\n");
+      abort();
+    }
+    shard_metadata[0] = static_cast<char>(seed);
+    if (shard_end_block != original_shard_end_block) {
+      assert(shard_end_block > original_shard_end_block);
+      // Needed to add extra blocks to last shard, so need to
+      // elastic shrink earlier data to make room.
+      ElasticShrinkForFirstShard(first_shard_extra_blocks + (shard_end_block - original_shard_end_block));
+      assert(shard_end_block == GetShardBeginBlock(1));
+    }
+    BackPropAndStore(shard_begin_block, gauss, count, shard_slots);
+  }
+
+  void StoreFilterMetadata() {
+    assert(data);
+    assert(bytes >= metadata_size);
+
+    char *metadata = data + bytes - metadata_size;
+
+    // See BloomFilterPolicy::GetSimpleGaussBitsReader re: metadata
+    // -2 = Marker for Simple Gauss
+    metadata[0] = static_cast<char>(-2);
+
+    // Log2 of number of shards
+    assert(log2_shards < 64);
+    metadata[1] = static_cast<char>(log2_shards);
+
+    // Extra space going into last shard (x 64 x match_bits bits)
+    assert(first_shard_extra_blocks < 256);
+    metadata[2] = static_cast<char>(first_shard_extra_blocks);
+
+    // Average number of slots per shard, in 16 bits
+    assert(avg_shard_slots < 0x10000U);
+    EncodeFixed16(metadata + 3, static_cast<uint16_t>(avg_shard_slots));
+  }
+
+  void InitializeFromMetadata() {
+    assert(data);
+    assert(bytes >= metadata_size);
+
+    char *metadata = data + bytes - metadata_size;
+    assert(metadata[0] == static_cast<char>(-2));
+
+    this->log2_shards = static_cast<uint8_t>(metadata[1]);
+    assert(log2_shards < 64);
+
+    this->first_shard_extra_blocks = static_cast<uint8_t>(metadata[2]);
+
+    this->avg_shard_slots = DecodeFixed16(metadata + 3);
+
+    CalculateMatchBitSettings();
+  }
+
+  // Reads:
+  //   lower_match_bits
+  //   total_blocks
+  //   first_block_upper
+  double GetFpRate() const {
+    if (total_blocks == 0) {
+      return 1.0;
+    }
+    double upper_fp_rate = std::pow(0.5, lower_match_bits + 1);
+    double lower_fp_rate = std::pow(0.5, lower_match_bits);
+    double upper_portion = static_cast<double>(total_blocks - first_block_upper) /
+                           static_cast<double>(total_blocks);
+    double lower_portion = static_cast<double>(first_block_upper) /
+                           static_cast<double>(total_blocks);
+    return upper_portion * upper_fp_rate + lower_portion * lower_fp_rate;
   }
 };
 
@@ -287,92 +742,42 @@ class SimpleGaussBitsBuilder : public BuiltinFilterBitsBuilder {
   }
 
   virtual Slice Finish(std::unique_ptr<const char[]>* buf) override {
-    size_t len;
-    uint32_t num_output_rows;
-    uint32_t match_bits;
-    CalculateSpaceInternal(static_cast<uint32_t>(hash_entries_.size()), &len, &num_output_rows, &match_bits);
-    size_t len_with_metadata = len + 5;
-    char* data = new char[len_with_metadata];
-    memset(data, 0, len_with_metadata);
+    SimpleGaussFilter f;
 
-    //printf("nkeys: %d len: %d nor: %d mb: %d\n", (int)hash_entries_.size(), (int)len, (int)num_output_rows, (int)match_bits);
-    assert(data);
-    assert(len_with_metadata >= 5);
+    f.CalculateSpace(hash_entries_.size(), millibits_per_key_);
+    f.AllocateSpace(buf);
+    f.BuildShards(&hash_entries_);
+    f.StoreFilterMetadata();
 
-    int reseed_count = 0;
-    if (len > 0) {
-      AddAllEntries(data, len, num_output_rows, match_bits, &reseed_count);
-    }
-    hash_entries_.clear();
-
-    // See BloomFilterPolicy::GetSimpleGaussBitsReader re: metadata
-    // -2 = Marker for Simple Gauss
-    data[len] = static_cast<char>(-2);
-    // 0 = Marker for this sub-implementation
-    data[len + 1] = static_cast<char>(0);
-    // Bits to match against, FP rate 2^-match_bits
-    assert(match_bits > 0 && match_bits <= 32);
-    data[len + 2] = static_cast<char>(match_bits);
-    // "Reseed" count gives us a way of remixing hashes for the effect
-    // of different seeds.
-    assert(reseed_count >= 0 && reseed_count < 256);
-    data[len + 3] = static_cast<char>(reseed_count);
-    // rest of metadata stays zero
-
-    //printf("reseed_count: %d\n", reseed_count);
-
-    const char* const_data = data;
-    buf->reset(const_data);
-
-    return Slice(data, len_with_metadata);
+    return Slice(f.data, f.bytes);
   }
 
   int CalculateNumEntry(const uint32_t bytes) override {
+    // FIXME?
     uint32_t bytes_no_meta = bytes >= 5u ? bytes - 5u : 0;
     return static_cast<int>(uint64_t{8000} * bytes_no_meta /
                             millibits_per_key_);
   }
 
   uint32_t CalculateSpace(const int num_entry) override {
-    size_t bytes;
-    uint32_t num_output_rows;
-    uint32_t match_bits;
-    CalculateSpaceInternal(static_cast<uint32_t>(num_entry), &bytes, &num_output_rows, &match_bits);
-    return static_cast<uint32_t>(bytes) + /*metadata*/5;
+    SimpleGaussFilter f;
+    assert(num_entry >= 0);
+    f.CalculateSpace(static_cast<size_t>(num_entry), millibits_per_key_);
+    return static_cast<uint32_t>(f.bytes);
   }
 
   double EstimatedFpRate(size_t keys, size_t bytes) override {
-    (void)keys;
-    (void)bytes;
-    return /*FIXME*/0.01;
+    SimpleGaussFilter f;
+    f.CalculatePreferredSharding(keys);
+    // TODO: set for more conservative estimate?
+    assert(f.first_shard_extra_blocks == 0);
+    f.bytes = bytes;
+    f.CalculateMatchBitSettings();
+    return f.GetFpRate();
   }
 
  private:
-  void CalculateSpaceInternal(uint32_t num_coeff_rows, size_t *bytes, uint32_t *num_output_rows, uint32_t *match_bits) {
-    *num_output_rows = GetPreferredNumOutputRows(static_cast<uint32_t>(num_coeff_rows));
-    assert((*num_output_rows & 63) == 0);
-    // FIXME
-    *match_bits = millibits_per_key_ / 1000;
-    //*match_bits = static_cast<uint32_t>(((int64_t{num_coeff_rows} * millibits_per_key_ + *num_output_rows - 1) / *num_output_rows + 999) / 1000);
-    *match_bits = std::max(uint32_t{1}, std::min(uint32_t{32}, *match_bits));
-    *bytes = size_t{*num_output_rows / 8} * *match_bits;
-  }
-
-  void ResetGaussData(GaussData *gauss, uint32_t num_output_rows, uint32_t match_row_mask) {
-    size_t nkeys = static_cast<uint32_t>(hash_entries_.size());
-    for (size_t i = 0; i < nkeys; ++i) {
-      gauss[i].Reset(hash_entries_[i], num_output_rows, match_row_mask);
-    }
-  }
-
-  void NextReseed(int *reseed_count) {
-    for (uint64_t &h : hash_entries_) {
-      h *= 0x9e3779b97f4a7c13;
-    }
-    std::sort(hash_entries_.begin(), hash_entries_.end());
-    ++*reseed_count;
-  }
-
+/*
   uint32_t GetPreferredNumOutputRows(uint32_t num_coeff_rows) {
     // Seems to be roughly 80% chance encoding success with this formula
     //double overhead = std::min(1.1, 1.0 + std::max(1.5, std::log2(num_coeff_rows) - 8) / 100.0);
@@ -380,91 +785,21 @@ class SimpleGaussBitsBuilder : public BuiltinFilterBitsBuilder {
     double overhead = std::min(1.1, 1.0 + std::max(0.8, std::log2(num_coeff_rows) - 9) / 100.0);
     return static_cast<uint32_t>(num_coeff_rows * overhead + 63) / 64 * 64;
   }
-
-  void AddAllEntries(char* data, uint32_t len, uint32_t num_output_rows, uint32_t match_bits, int *reseed_count) {
-    std::sort(hash_entries_.begin(), hash_entries_.end());
-
-    // FIXME: bounds check
-    uint32_t num_coeff_rows = static_cast<uint32_t>(hash_entries_.size());
-
-    assert(uint64_t{num_output_rows} * match_bits <= uint64_t{len} * 8);
-    assert(num_output_rows > num_coeff_rows);
-
-    uint32_t match_row_mask = (uint32_t{1} << match_bits) - 1;
-
-    std::unique_ptr<GaussData[]> gauss{new GaussData[num_coeff_rows]};
-
-    *reseed_count = 0;
-    ResetGaussData(gauss.get(), num_output_rows, match_row_mask);
-
-    for (uint32_t i = 0; i < num_coeff_rows;) {
-      GaussData &di = gauss[i];
-      if (di.coeff_row == 0) {
-        // Might be a total duplicate or lucky coincidence in generating
-        // desired output. For plain (over-approximate) sets, that's just
-        // fine. Pivot of 0 is a safe fake here, because if a real row uses
-        // pivot 0, it has to be the first row and will be back-propagated
-        // last.
-        if (false && di.match_row == 0) { // FIXME: doesn't work
-          assert(di.pivot == 0);
-        } else {
-          // Re-seed and start over
-          NextReseed(reseed_count);
-          // FIXME: limit
-          assert(*reseed_count < 256);
-          ResetGaussData(gauss.get(), num_output_rows, match_row_mask);
-          i = 0;
-          continue;
-        }
-      }
-      int tz = __builtin_ctzl(di.coeff_row);
-      di.pivot = di.start + tz;
-      for (uint32_t j = i + 1; j < num_coeff_rows; ++j) {
-          GaussData &dj = gauss[j];
-          assert(dj.start >= di.start);
-          if (di.pivot < dj.start) {
-              break;
-          }
-          if ((dj.coeff_row >> (di.pivot - dj.start)) & 1) {
-              dj.coeff_row ^= (di.coeff_row >> (dj.start - di.start));
-              dj.match_row ^= di.match_row;
-          }
-      }
-      ++i;
-    }
-
-    uint64_t *word_data = reinterpret_cast<uint64_t *>(data);
-
-    // back propagation
-    for (uint32_t i = num_coeff_rows; i > 0;) {
-      --i;
-      GaussData &di = gauss[i];
-      const uint32_t start = di.start;
-      const uint64_t coeff_row = di.coeff_row;
-      const uint32_t match_row = di.match_row;
-      const uint32_t pivot = di.pivot;
-      for (uint32_t j = 0; j < match_bits; ++j) {
-        bool val = GaussData::DotCoeffRowWithOutputColumn(start, coeff_row, word_data, match_bits, j);
-        val ^= ((match_row >> j) & 1);
-        GaussData::StoreOutputVal(val, word_data, match_bits, pivot, j);
-      }
-    }
-  }
+*/
 
   int millibits_per_key_;
-  // TODO: A deque avoids unnecessary copying of already-saved values
+  // A deque avoids unnecessary copying of already-saved values
   // and has near-minimal peak memory use.
-  std::vector<uint64_t> hash_entries_;
+  std::deque<uint64_t> hash_entries_;
 };
 
 class SimpleGaussBitsReader : public FilterBitsReader {
  public:
-  SimpleGaussBitsReader(const char* data, uint32_t len_bytes, uint32_t match_bits, int reseed_count)
-  : data_(data), num_output_rows_(len_bytes / match_bits * 8), match_bits_(match_bits) {
-    reseed_ = 1;
-    for (int i = 0; i < reseed_count; ++i) {
-      reseed_ *= 0x9e3779b97f4a7c13;
-    }
+  SimpleGaussBitsReader(const char* data, size_t bytes) {
+    // FIXME?
+    f.data = const_cast<char *>(data);
+    f.bytes = bytes;
+    f.InitializeFromMetadata();
   }
 
   // No Copy allowed
@@ -474,15 +809,39 @@ class SimpleGaussBitsReader : public FilterBitsReader {
   ~SimpleGaussBitsReader() override {}
 
   bool MayMatch(const Slice& key) override {
-    const uint64_t h = reseed_ * GetSliceHash64(key);
-    const uint32_t start = GaussData::HashToStart(h, num_output_rows_);
+    const uint64_t pre_h = GaussData::TweakPreHash(GetSliceHash64(key));
+    const uint32_t leave_shard_shift_minus1 = 64U - f.log2_shards - 1;
+    uint32_t shard = pre_h >> 1 >> leave_shard_shift_minus1;
+    const uint32_t section = GaussData::PreHashToSection(pre_h);
 
-    const uint64_t *word_data = reinterpret_cast<const uint64_t *>(data_);
-    word_data += (start / 64) * match_bits_;
+    const uint8_t shard_meta = static_cast<uint8_t>(f.GetShardMetaDataStart()[shard]);
+
+    uint64_t h;
+    if (shard > 0 && section > shard_meta) {
+      // Bumped
+      uint32_t bumped_shard_or = (uint32_t{1} << FloorLog2(shard));
+      uint32_t bumped_shard_mask = bumped_shard_or - 1;
+      bumped_shard_or /= 2;
+      bumped_shard_mask /= 2;
+      shard = (Upper32of64(pre_h) & bumped_shard_mask) | bumped_shard_or;
+      h = pre_h * 0x9e3779b97f4a7c13 * 0x9e3779b97f4a7c13;
+    } else {
+      // Not bumped
+      h = GaussData::SeedPreHash(pre_h, shard_meta);
+    }
+
+    const size_t begin_block = f.GetShardBeginBlock(shard);
+    const size_t end_block = f.GetShardBeginBlock(shard + 1);
+    const uint32_t num_output_rows = static_cast<uint32_t>(end_block - begin_block) * 64;
+
+    const uint32_t start = GaussData::HashToStart(h, num_output_rows);
+    const size_t start_block = begin_block + start / 64;
     const uint32_t start_bit = start % 64;
+    const uint32_t match_bits = f.lower_match_bits + (start_block >= f.first_block_upper);
+    const uint64_t *word_data = reinterpret_cast<const uint64_t *>(f.GetBlockDataStart(start_block));
     PREFETCH(word_data, 0 /* rw */, 1 /* locality */);
-    const uint32_t maybe_offset = (start_bit != 0) * match_bits_;
-    PREFETCH(word_data + maybe_offset + match_bits_ - 1, 0 /* rw */, 1 /* locality */);
+    const uint32_t maybe_offset = (start_bit != 0) * match_bits;
+    PREFETCH(word_data + maybe_offset + match_bits - 1, 0 /* rw */, 1 /* locality */);
 
     const uint64_t coeff_row = GaussData::HashToCoeffRow(h);
     const uint32_t match_row = GaussData::HashToMatchRow(h);
@@ -490,55 +849,58 @@ class SimpleGaussBitsReader : public FilterBitsReader {
     uint64_t column;
 
     // TODO: endianness
-    switch (match_bits_) {
+    switch (match_bits) {
       default:
       case 10:
         column = (word_data[9] >> start_bit) | (word_data[9 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 9;
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 9;
         FALLTHROUGH_INTENDED;
       case 9:
         column = (word_data[8] >> start_bit) | (word_data[8 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 8;
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 8;
         FALLTHROUGH_INTENDED;
       case 8:
         column = (word_data[7] >> start_bit) | (word_data[7 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 7;
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 7;
         FALLTHROUGH_INTENDED;
       case 7:
         column = (word_data[6] >> start_bit) | (word_data[6 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 6;
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 6;
         FALLTHROUGH_INTENDED;
       case 6:
         column = (word_data[5] >> start_bit) | (word_data[5 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 5;
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 5;
         FALLTHROUGH_INTENDED;
       case 5:
         column = (word_data[4] >> start_bit) | (word_data[4 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 4;
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 4;
         FALLTHROUGH_INTENDED;
       case 4:
         column = (word_data[3] >> start_bit) | (word_data[3 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 3;
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 3;
         FALLTHROUGH_INTENDED;
       case 3:
         column = (word_data[2] >> start_bit) | (word_data[2 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 2;
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 2;
         FALLTHROUGH_INTENDED;
       case 2:
         column = (word_data[1] >> start_bit) | (word_data[1 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 1;
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 1;
         FALLTHROUGH_INTENDED;
       case 1:
         column = (word_data[0] >> start_bit) | (word_data[0 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(__builtin_parityl(column & coeff_row)) << 0;
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 0;
+        FALLTHROUGH_INTENDED;
+      case 0:
         FALLTHROUGH_INTENDED;
     }
-    return versus_row == (match_row & ((uint32_t{1} << match_bits_) - 1));
+    //printf("QM: %u\n", match_bits);
+    return versus_row == (match_row & ((uint32_t{1} << match_bits) - 1));
 
     // Old, not as efficient?
     /*
     for (uint32_t i = 0; i < match_bits_; ++i) {
-      bool v = GaussData::DotCoeffRowWithOutputColumn(start, coeff_row, word_data, match_bits_, i);
+      bool v = GaussData::DotCoeffRowWithOutputColumn(start, coeff_row, word_data, match_bits, i);
       if (v != (match_row & 1)) {
         return false;
       }
@@ -569,10 +931,7 @@ class SimpleGaussBitsReader : public FilterBitsReader {
   }
 
  private:
-  const char* data_;
-  const uint32_t num_output_rows_;
-  const uint32_t match_bits_;
-  uint64_t reseed_;
+  SimpleGaussFilter f;
 };
 
 using LegacyBloomImpl = LegacyLocalityBloomImpl</*ExtraRotates*/ false>;
@@ -1125,57 +1484,8 @@ FilterBitsReader* BloomFilterPolicy::GetBloomBitsReader(
 
 FilterBitsReader* BloomFilterPolicy::GetSimpleGaussBitsReader(
     const Slice& contents) const {
-  uint32_t len_with_meta = static_cast<uint32_t>(contents.size());
-  uint32_t len = len_with_meta - 5;
-
-  assert(len > 0);  // precondition
-
-  // FIXME
-  // New Bloom filter data:
-  //             0 +-----------------------------------+
-  //               | Raw Bloom filter data             |
-  //               | ...                               |
-  //           len +-----------------------------------+
-  //               | char{-1} byte -> new Bloom filter |
-  //         len+1 +-----------------------------------+
-  //               | byte for subimplementation        |
-  //               |   0: FastLocalBloom               |
-  //               |   other: reserved                 |
-  //         len+2 +-----------------------------------+
-  //               | byte for block_and_probes         |
-  //               |   0 in top 3 bits -> 6 -> 64-byte |
-  //               |   reserved:                       |
-  //               |   1 in top 3 bits -> 7 -> 128-byte|
-  //               |   2 in top 3 bits -> 8 -> 256-byte|
-  //               |   ...                             |
-  //               |   num_probes in bottom 5 bits,    |
-  //               |     except 0 and 31 reserved      |
-  //         len+3 +-----------------------------------+
-  //               | two bytes reserved                |
-  //               |   possibly for hash seed          |
-  // len_with_meta +-----------------------------------+
-
-  // Read more metadata (see above)
-  char sub_impl_val = contents.data()[len_with_meta - 4];
-  uint8_t match_bits = static_cast<uint8_t>(contents.data()[len_with_meta - 3]);
-  uint8_t reseed = static_cast<uint8_t>(contents.data()[len_with_meta - 2]);
-  char rest = contents.data()[len_with_meta - 1];
-  if (rest != 0) {
-    // Reserved
-    // Future safe
-    assert(false);//FIXME
-    return new AlwaysTrueFilter();
-  }
-
-  if (sub_impl_val == 0) {        // FastLocalBloom
-    if (match_bits > 0 && match_bits <= 32) {
-      return new SimpleGaussBitsReader(contents.data(), len, match_bits, reseed);
-    }
-  }
-  // otherwise
-  // Reserved / future safe
-  assert(false);// FIXME
-  return new AlwaysTrueFilter();
+  // FIXME: more checks?
+  return new SimpleGaussBitsReader(contents.data(), contents.size());
 }
 
 const FilterPolicy* NewBloomFilterPolicy(double bits_per_key,
