@@ -364,14 +364,17 @@ struct SimpleGaussFilter {
     CalculateMatchBitSettings();
 
     assert(first_shard_extra_blocks > old_first_shard_extra_blocks);
+    (void)old_first_shard_extra_blocks;
     assert(lower_match_bits <= old_lower_match_bits);
     assert(total_blocks > old_total_blocks);
+    (void)old_total_blocks;
 
     uint64_t *upper_word_data_start = reinterpret_cast<uint64_t *>(GetBlockDataStart(first_block_upper));
     uint64_t *second_word_data_start = reinterpret_cast<uint64_t *>(GetBlockDataStart(GetShardBeginBlock(1)));
 
     // TODO: optimize == case?
     assert(second_word_data_start >= old_second_word_data_start);
+    (void)second_word_data_start;
 
     uint64_t *word_data_from = reinterpret_cast<uint64_t *>(GetBlockDataStart(total_blocks));
     uint64_t *word_data_to = word_data_from;
@@ -421,11 +424,10 @@ struct SimpleGaussFilter {
     size_t words_for_blocks = bytes_for_blocks / 8;
     this->lower_match_bits =
         static_cast<uint32_t>(std::min(uint64_t{31}, words_for_blocks / total_blocks));
-    uint32_t upper_match_bits = lower_match_bits + 1;
     size_t words_for_upper_extra = words_for_blocks - lower_match_bits * total_blocks;
     this->first_block_upper = total_blocks - words_for_upper_extra;
     assert(words_for_blocks == (first_block_upper * lower_match_bits) +
-                               ((total_blocks - first_block_upper) * upper_match_bits));
+                               ((total_blocks - first_block_upper) * (lower_match_bits + 1)));
     //printf("%u %u %u %u %u %u %u\n", (unsigned) bytes, (unsigned)total_blocks, (unsigned) first_block_upper, log2_shards, avg_shard_slots, lower_match_bits, first_shard_extra_blocks);
   }
 
