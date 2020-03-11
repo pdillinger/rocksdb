@@ -325,7 +325,11 @@ struct SimpleGaussFilter {
   uint32_t first_shard_extra_blocks = 0;
 
   inline size_t GetShardBeginBlock(uint32_t shard) const {
-    return static_cast<size_t>((uint64_t{shard} * avg_shard_slots + first_shard_extra_blocks) / 64);
+    if (shard == 0) {
+      return 0;
+    } else {
+      return static_cast<size_t>((uint64_t{shard} * avg_shard_slots) / 64) + first_shard_extra_blocks;
+    }
   }
 
   inline char* GetBlockDataStart(size_t block) const {
@@ -352,6 +356,8 @@ struct SimpleGaussFilter {
     uint32_t old_first_shard_extra_blocks = first_shard_extra_blocks;
     uint32_t old_lower_match_bits = lower_match_bits;
     size_t old_total_blocks = total_blocks;
+    uint64_t *old_upper_word_data_start = reinterpret_cast<uint64_t *>(GetBlockDataStart(first_block_upper));
+    uint64_t *old_second_word_data_start = reinterpret_cast<uint64_t *>(GetBlockDataStart(GetShardBeginBlock(1)));
     //size_t old_first_block_upper = first_block_upper;
 
     this->first_shard_extra_blocks = new_first_shard_extra_blocks;
@@ -361,8 +367,36 @@ struct SimpleGaussFilter {
     assert(lower_match_bits <= old_lower_match_bits);
     assert(total_blocks > old_total_blocks);
 
-    fprintf(stderr, "Elastic shrink for first shard not yet implemented. Aborting.\n");
-    abort();
+    uint64_t *upper_word_data_start = reinterpret_cast<uint64_t *>(GetBlockDataStart(first_block_upper));
+    uint64_t *second_word_data_start = reinterpret_cast<uint64_t *>(GetBlockDataStart(GetShardBeginBlock(1)));
+
+    // TODO: optimize == case?
+    assert(second_word_data_start >= old_second_word_data_start);
+
+    uint64_t *word_data_from = reinterpret_cast<uint64_t *>(GetBlockDataStart(total_blocks));
+    uint64_t *word_data_to = word_data_from;
+
+    //printf("Elastic shrink! %u->%u %u->%u\n", (unsigned)(old_upper_word_data_start - (uint64_t*)data), (unsigned)(upper_word_data_start - (uint64_t*)data), (unsigned)(old_second_word_data_start - (uint64_t*)data), (unsigned)(second_word_data_start - (uint64_t*)data));
+    // TODO: optimize from == to
+    while (word_data_from > old_second_word_data_start) {
+      word_data_from -= old_lower_match_bits + (word_data_from > old_upper_word_data_start);
+      uint32_t to_match_bits = lower_match_bits + (word_data_to > upper_word_data_start);
+      word_data_to -= to_match_bits;
+      //printf("%u from %u to %u\n", to_match_bits, (unsigned)(word_data_from - (uint64_t*)data), (unsigned)(word_data_to - (uint64_t*)data));
+      for (uint32_t i = to_match_bits; i > 0;) {
+        --i;
+        word_data_to[i] = word_data_from[i];
+      }
+    }
+    assert(word_data_from == old_second_word_data_start);
+    assert(word_data_to == second_word_data_start);
+    while (word_data_to > word_data_from) {
+      --word_data_to;
+      //printf("Zero %u\n", (unsigned)(word_data_to - (uint64_t*)data));
+      *word_data_to = 0;
+    }
+    assert(word_data_to == old_second_word_data_start);
+    //printf("Elastic shrink done\n");
   }
 
   // Reads:
@@ -400,8 +434,7 @@ struct SimpleGaussFilter {
   //   log2_shards
   //   avg_shard_slots
   void CalculatePreferredSharding(size_t keys) {
-    // FIXME: 1.004
-    size_t total_slots = static_cast<size_t>(1.008 * keys + 0.5);
+    size_t total_slots = static_cast<size_t>(1.004 * keys + 0.5);
     // Make it a multiple of 64
     total_slots = (total_slots + 63) & ~size_t{63};
     // Find power of two number of shards that gets average slots per shard
