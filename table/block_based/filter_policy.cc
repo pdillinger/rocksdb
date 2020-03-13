@@ -670,6 +670,13 @@ struct SimpleGaussFilter {
       // of the pivot (where we are writing data to)
       for (; i > 0 && gauss[i - 1].start >= first_start_upper - 64; --i) {
         if (gauss[i - 1].pivot >= first_start_upper) {
+          // Shenanigans to avoid out-of-bounds read before start
+          // (of throw-away data)
+          uint32_t diff = gauss[i - 1].pivot - gauss[i - 1].start;
+          gauss[i - 1].start += diff;
+          assert((gauss[i - 1].coeff_row & ((uint64_t{1} << diff) - 1)) == 0);
+          gauss[i - 1].coeff_row >>= diff;
+          // End Shenanigans
           BackPropAndStoreSingle(gauss[i - 1], special_word_data, match_bits + 1);
         } else {
           BackPropAndStoreSingle(gauss[i - 1], word_data, match_bits);
