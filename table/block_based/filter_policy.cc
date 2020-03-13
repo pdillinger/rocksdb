@@ -250,16 +250,16 @@ struct GaussData {
   }
 
   // FIXME: better way?
-  static inline uint64_t TweakPreHash(uint64_t h) {
-    if ((h & uint64_t{0x8000000000000380}) == uint64_t{0x0000000000000380}) {
-      return h + uint64_t{0x8000000000000000};
+  static inline uint64_t TweakPreHash(uint64_t pre_h) {
+    if ((pre_h & uint64_t{0x8000000000000380}) == uint64_t{0x0000000000000380}) {
+      return pre_h + uint64_t{0x8000000000000000};
     } else {
-      return h;
+      return pre_h;
     }
   }
 
-  static inline uint32_t PreHashToSection(uint64_t h) {
-    uint32_t v = Lower32of64(h) & 1023;
+  static inline uint32_t PreHashToSection(uint64_t pre_h) {
+    uint32_t v = Lower32of64(pre_h) & 1023;
     if (v < 300) {
         return v / 3;
     } else if (v < 428) {
@@ -273,20 +273,41 @@ struct GaussData {
     }
   }
 
-  static inline uint64_t SeedPreHash(uint64_t h, uint32_t seed) {
-    uint32_t rot = (seed * 39) & 63;
-    return ((h << rot) | (h >> (64 - rot))) * 0x9e3779b97f4a7c13;
+  static inline uint32_t PreHashToShard(uint64_t pre_h, uint32_t log2_shards) {
+    const uint32_t leave_shard_shift_minus1 = 64U - log2_shards - 1;
+    return pre_h >> 1 >> leave_shard_shift_minus1;
   }
 
-  static inline bool DotCoeffRowWithOutputColumn(uint32_t start, uint64_t coeff_row, const uint64_t *output_data, uint32_t match_bits, uint32_t selected_match_bit) {
-    uint32_t start_word = (start / 64) * match_bits + selected_match_bit;
-    uint32_t start_bit = start % 64;
+  static inline uint64_t SeedPreHash(uint64_t pre_h, uint32_t seed) {
+    uint32_t rot = (seed * 39) & 63;
+    return ((pre_h << rot) | (pre_h >> (64 - rot))) * 0x9e3779b97f4a7c13;
+  }
+
+  static inline uint64_t BumpPreHash(uint64_t pre_h) {
+    return pre_h * 0x9e3779b97f4a7c13 * 0x9e3779b97f4a7c13;
+  }
+
+  static inline uint32_t GetBumpedShard(uint32_t from_shard, uint64_t pre_h) {
+      uint32_t bumped_shard_or = (uint32_t{1} << FloorLog2(from_shard));
+      uint32_t bumped_shard_mask = bumped_shard_or - 1;
+      bumped_shard_or /= 2;
+      bumped_shard_mask /= 2;
+      return (Upper32of64(pre_h) & bumped_shard_mask) | bumped_shard_or;
+  }
+
+  static inline bool DotCoeffRowWithOutputColumn(uint32_t start_word, uint32_t start_bit, uint64_t coeff_row, const uint64_t *output_data, uint32_t match_bits) {
     // TODO: endianness
     uint64_t output_column = output_data[start_word] >> start_bit;
     if (start_bit > 0) {
       output_column |= output_data[start_word + match_bits] << (64 - start_bit);
     }
     return BitParity(output_column & coeff_row) != 0;
+  }
+
+  static inline bool DotCoeffRowWithOutputColumn(uint32_t start, uint64_t coeff_row, const uint64_t *output_data, uint32_t match_bits, uint32_t selected_match_bit) {
+    uint32_t start_word = (start / 64) * match_bits + selected_match_bit;
+    uint32_t start_bit = start % 64;
+    return DotCoeffRowWithOutputColumn(start_word, start_bit, coeff_row, output_data, match_bits);
   }
 
   static inline void StoreOutputVal(bool val, uint64_t *output_data, uint32_t match_bits, uint32_t start, uint32_t selected_match_bit) {
@@ -305,6 +326,72 @@ struct GaussData {
 
   static bool CompareByStart(const GaussData &a, const GaussData &b) {
     return a.start < b.start;
+  }
+
+  static inline bool MayMatchQuery(const uint64_t *word_data, uint32_t start_bit, uint32_t match_bits, uint64_t coeff_row, uint32_t match_row) {
+/*
+    // Not an improvement
+    uint32_t versus_row = 0;
+    uint64_t column;
+    const uint32_t maybe_offset = (start_bit != 0) * match_bits;
+    // TODO: endianness
+    switch (match_bits) {
+      default:
+      case 10:
+        column = (word_data[9] >> start_bit) | (word_data[9 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 9;
+        FALLTHROUGH_INTENDED;
+      case 9:
+        column = (word_data[8] >> start_bit) | (word_data[8 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 8;
+        FALLTHROUGH_INTENDED;
+      case 8:
+        column = (word_data[7] >> start_bit) | (word_data[7 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 7;
+        FALLTHROUGH_INTENDED;
+      case 7:
+        column = (word_data[6] >> start_bit) | (word_data[6 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 6;
+        FALLTHROUGH_INTENDED;
+      case 6:
+        column = (word_data[5] >> start_bit) | (word_data[5 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 5;
+        FALLTHROUGH_INTENDED;
+      case 5:
+        column = (word_data[4] >> start_bit) | (word_data[4 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 4;
+        FALLTHROUGH_INTENDED;
+      case 4:
+        column = (word_data[3] >> start_bit) | (word_data[3 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 3;
+        FALLTHROUGH_INTENDED;
+      case 3:
+        column = (word_data[2] >> start_bit) | (word_data[2 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 2;
+        FALLTHROUGH_INTENDED;
+      case 2:
+        column = (word_data[1] >> start_bit) | (word_data[1 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 1;
+        FALLTHROUGH_INTENDED;
+      case 1:
+        column = (word_data[0] >> start_bit) | (word_data[0 + maybe_offset] << (64 - start_bit));
+        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 0;
+        FALLTHROUGH_INTENDED;
+      case 0:
+        FALLTHROUGH_INTENDED;
+    }
+    //printf("QM: %u\n", match_bits);
+    return versus_row == (match_row & ((uint32_t{1} << match_bits) - 1));
+*/
+    // Simple and OK
+    for (uint32_t i = 0; i < match_bits; ++i) {
+      bool v = GaussData::DotCoeffRowWithOutputColumn(i, start_bit, coeff_row, word_data, match_bits);
+      if (v != (match_row & 1)) {
+        return false;
+      }
+      match_row >>= 1;
+    }
+    return true;
   }
 };
 
@@ -341,6 +428,21 @@ struct SimpleGaussFilter {
 
   inline char* GetShardMetaDataStart() const {
     return GetBlockDataStart(GetShardBeginBlock(uint32_t{1} << log2_shards));
+  }
+
+  inline void GetQueryInfoAndPrefetch(uint32_t shard, uint64_t h, uint32_t *start_bit, uint32_t *match_bits, const uint64_t **word_data) const {
+    const size_t begin_block = GetShardBeginBlock(shard);
+    const size_t end_block = GetShardBeginBlock(shard + 1);
+    const uint32_t num_output_rows = static_cast<uint32_t>(end_block - begin_block) * 64;
+
+    const uint32_t start = GaussData::HashToStart(h, num_output_rows);
+    const size_t start_block = begin_block + start / 64;
+    *start_bit = start % 64;
+    *match_bits = lower_match_bits + (start_block >= first_block_upper);
+    *word_data = reinterpret_cast<const uint64_t *>(GetBlockDataStart(start_block));
+    PREFETCH(word_data, 0 /* rw */, 1 /* locality */);
+    const uint32_t maybe_offset = (*start_bit != 0) * *match_bits;
+    PREFETCH(word_data + maybe_offset + *match_bits - 1, 0 /* rw */, 1 /* locality */);
   }
 
   // Reads:
@@ -591,11 +693,10 @@ struct SimpleGaussFilter {
 
     // TODO: pre-allocate vector capacity?
 
-    uint32_t leave_shard_shift_minus1 = 64U - log2_shards - 1;
     while (!hashes->empty()) {
       uint64_t h = GaussData::TweakPreHash(hashes->front());
       hashes->pop_front();
-      uint32_t shard = h >> 1 >> leave_shard_shift_minus1;
+      uint32_t shard = GaussData::PreHashToShard(h, log2_shards);
       uint32_t section = GaussData::PreHashToSection(h);
       assert(section < 256U);
       shard_hashes[shard].push_back(h);
@@ -832,9 +933,10 @@ class SimpleGaussBitsReader : public FilterBitsReader {
  public:
   SimpleGaussBitsReader(const char* data, size_t bytes) {
     // FIXME?
-    f.data = const_cast<char *>(data);
-    f.bytes = bytes;
-    f.InitializeFromMetadata();
+    f_.data = const_cast<char *>(data);
+    f_.bytes = bytes;
+    f_.InitializeFromMetadata();
+    shard_metadata_ = f_.GetShardMetaDataStart();
   }
 
   // No Copy allowed
@@ -845,128 +947,80 @@ class SimpleGaussBitsReader : public FilterBitsReader {
 
   bool MayMatch(const Slice& key) override {
     const uint64_t pre_h = GaussData::TweakPreHash(GetSliceHash64(key));
-    const uint32_t leave_shard_shift_minus1 = 64U - f.log2_shards - 1;
-    uint32_t shard = pre_h >> 1 >> leave_shard_shift_minus1;
-    const uint32_t section = GaussData::PreHashToSection(pre_h);
-
-    const uint8_t shard_meta = static_cast<uint8_t>(f.GetShardMetaDataStart()[shard]);
+    uint32_t shard = GaussData::PreHashToShard(pre_h, f_.log2_shards);
+    const uint8_t shard_meta = static_cast<uint8_t>(shard_metadata_[shard]);
 
     uint64_t h;
+    const uint32_t section = GaussData::PreHashToSection(pre_h);
     if (shard > 0 && section > shard_meta) {
       // Bumped
-      uint32_t bumped_shard_or = (uint32_t{1} << FloorLog2(shard));
-      uint32_t bumped_shard_mask = bumped_shard_or - 1;
-      bumped_shard_or /= 2;
-      bumped_shard_mask /= 2;
-      shard = (Upper32of64(pre_h) & bumped_shard_mask) | bumped_shard_or;
-      h = pre_h * 0x9e3779b97f4a7c13 * 0x9e3779b97f4a7c13;
+      shard = GaussData::GetBumpedShard(shard, pre_h);
+      h = GaussData::BumpPreHash(pre_h);
     } else {
       // Not bumped
       h = GaussData::SeedPreHash(pre_h, shard_meta);
     }
 
-    const size_t begin_block = f.GetShardBeginBlock(shard);
-    const size_t end_block = f.GetShardBeginBlock(shard + 1);
-    const uint32_t num_output_rows = static_cast<uint32_t>(end_block - begin_block) * 64;
+    uint32_t start_bit;
+    uint32_t match_bits;
+    const uint64_t *word_data;
+    f_.GetQueryInfoAndPrefetch(shard, h, &start_bit, &match_bits, &word_data);
 
-    const uint32_t start = GaussData::HashToStart(h, num_output_rows);
-    const size_t start_block = begin_block + start / 64;
-    const uint32_t start_bit = start % 64;
-    const uint32_t match_bits = f.lower_match_bits + (start_block >= f.first_block_upper);
-    const uint64_t *word_data = reinterpret_cast<const uint64_t *>(f.GetBlockDataStart(start_block));
-    PREFETCH(word_data, 0 /* rw */, 1 /* locality */);
-    const uint32_t maybe_offset = (start_bit != 0) * match_bits;
-    PREFETCH(word_data + maybe_offset + match_bits - 1, 0 /* rw */, 1 /* locality */);
-
-    const uint64_t coeff_row = GaussData::HashToCoeffRow(h);
-    const uint32_t match_row = GaussData::HashToMatchRow(h);
-    uint32_t versus_row = 0;
-    uint64_t column;
-
-    // TODO: endianness
-    switch (match_bits) {
-      default:
-      case 10:
-        column = (word_data[9] >> start_bit) | (word_data[9 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 9;
-        FALLTHROUGH_INTENDED;
-      case 9:
-        column = (word_data[8] >> start_bit) | (word_data[8 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 8;
-        FALLTHROUGH_INTENDED;
-      case 8:
-        column = (word_data[7] >> start_bit) | (word_data[7 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 7;
-        FALLTHROUGH_INTENDED;
-      case 7:
-        column = (word_data[6] >> start_bit) | (word_data[6 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 6;
-        FALLTHROUGH_INTENDED;
-      case 6:
-        column = (word_data[5] >> start_bit) | (word_data[5 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 5;
-        FALLTHROUGH_INTENDED;
-      case 5:
-        column = (word_data[4] >> start_bit) | (word_data[4 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 4;
-        FALLTHROUGH_INTENDED;
-      case 4:
-        column = (word_data[3] >> start_bit) | (word_data[3 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 3;
-        FALLTHROUGH_INTENDED;
-      case 3:
-        column = (word_data[2] >> start_bit) | (word_data[2 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 2;
-        FALLTHROUGH_INTENDED;
-      case 2:
-        column = (word_data[1] >> start_bit) | (word_data[1 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 1;
-        FALLTHROUGH_INTENDED;
-      case 1:
-        column = (word_data[0] >> start_bit) | (word_data[0 + maybe_offset] << (64 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 0;
-        FALLTHROUGH_INTENDED;
-      case 0:
-        FALLTHROUGH_INTENDED;
-    }
-    //printf("QM: %u\n", match_bits);
-    return versus_row == (match_row & ((uint32_t{1} << match_bits) - 1));
-
-    // Old, not as efficient?
-    /*
-    for (uint32_t i = 0; i < match_bits_; ++i) {
-      bool v = GaussData::DotCoeffRowWithOutputColumn(start, coeff_row, word_data, match_bits, i);
-      if (v != (match_row & 1)) {
-        return false;
-      }
-      match_row >>= 1;
-    }
-    return true;
-    */
+    return GaussData::MayMatchQuery(word_data, start_bit, match_bits, GaussData::HashToCoeffRow(h), GaussData::HashToMatchRow(h));
   }
 
   virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
-    (void)num_keys;
-    (void)keys;
-    (void)may_match;
-/*
-    std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> hashes;
-    std::array<uint32_t, MultiGetContext::MAX_BATCH_SIZE> byte_offsets;
+    struct MultiData {
+      uint64_t h;
+      const char *ptr;
+      uint32_t a;
+      uint32_t b;
+    };
+    std::array<MultiData, MultiGetContext::MAX_BATCH_SIZE> data;
     for (int i = 0; i < num_keys; ++i) {
-      uint64_t h = GetSliceHash64(*keys[i]);
-      SimpleGaussImpl::PrepareHash(Lower32of64(h), len_bytes_, data_,
-                                      &byte_offsets[i]);
-      hashes[i] = Upper32of64(h);
+      MultiData &d = data[i];
+      const uint64_t pre_h = d.h = GaussData::TweakPreHash(GetSliceHash64(*keys[i]));
+      uint32_t shard = d.a = GaussData::PreHashToShard(pre_h, f_.log2_shards);
+      PREFETCH(d.ptr = shard_metadata_ + shard, 0 /* rw */, 1 /* locality */);
     }
     for (int i = 0; i < num_keys; ++i) {
-      may_match[i] = SimpleGaussImpl::HashMayMatchPrepared(
-          hashes[i], num_probes_, data_ + byte_offsets[i]);
+      MultiData &d = data[i];
+      const uint8_t shard_meta = static_cast<uint8_t>(*d.ptr);
+      const uint64_t pre_h = d.h;
+      uint32_t shard = d.a;
+      uint64_t h;
+      const uint32_t section = GaussData::PreHashToSection(pre_h);
+      if (shard > 0 && section > shard_meta) {
+        // Bumped
+        shard = GaussData::GetBumpedShard(shard, pre_h);
+        h = GaussData::BumpPreHash(pre_h);
+      } else {
+        // Not bumped
+        h = GaussData::SeedPreHash(pre_h, shard_meta);
+      }
+
+      uint32_t start_bit;
+      uint32_t match_bits;
+      const uint64_t *word_data;
+      f_.GetQueryInfoAndPrefetch(shard, h, &start_bit, &match_bits, &word_data);
+      d.h = h;
+      d.ptr = reinterpret_cast<const char*>(word_data);
+      d.a = start_bit;
+      d.b = match_bits;
     }
-*/
+    for (int i = 0; i < num_keys; ++i) {
+      MultiData &d = data[i];
+      const uint64_t h = d.h;
+      const uint64_t * const word_data = reinterpret_cast<const uint64_t*>(d.ptr);
+      uint32_t start_bit = d.a;
+      uint32_t match_bits = d.b;
+      may_match[i] = GaussData::MayMatchQuery(word_data, start_bit, match_bits, GaussData::HashToCoeffRow(h), GaussData::HashToMatchRow(h));
+    }
   }
 
  private:
-  SimpleGaussFilter f;
+  SimpleGaussFilter f_;
+  const char *shard_metadata_;
 };
 
 using LegacyBloomImpl = LegacyLocalityBloomImpl</*ExtraRotates*/ false>;
