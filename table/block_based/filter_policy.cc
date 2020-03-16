@@ -792,6 +792,7 @@ struct SimpleGaussFilter {
       }
     }
     if (shard_slots > 0x10000U || seed == 0) {
+      // TODO: in addition, check if slots / entry > 1.5 and fall back to Bloom
       fprintf(stderr, "Bloom fallback not yet implemented (last shard). Aborting.\n");
       abort();
     }
@@ -1390,7 +1391,31 @@ FilterBitsBuilder* BloomFilterPolicy::GetBuilderWithContext(
   for (int i = 0; i < 2; ++i) {
     switch (cur) {
       case kAuto:
-        if (context.table_options.format_version < 5) {
+        if (getenv("USE_SGAUSS_BG")) {
+          if (context.level_at_creation > 0) {
+            static bool reported = false;
+            if (!reported) {
+              printf("Using sgauss bg! :-D\n");
+              reported = true;
+            }
+            cur = kSimpleGauss;
+            break;
+          } else {
+            static bool reported = false;
+            if (!reported) {
+              printf("Not using sgauss (flush)! :-D\n");
+              reported = true;
+            }
+          }
+        }
+        if (getenv("USE_SGAUSS")) {
+          static bool reported = false;
+          if (!reported) {
+            printf("Using sgauss! :-D\n");
+            reported = true;
+          }
+          cur = kSimpleGauss;
+        } else if (context.table_options.format_version < 5) {
           cur = kLegacyBloom;
         } else {
           cur = kFastLocalBloom;
