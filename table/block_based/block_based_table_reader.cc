@@ -396,19 +396,19 @@ void BlockBasedTable::UpdateCacheInsertionMetrics(BlockType block_type,
   }
 }
 
-Cache::Handle* BlockBasedTable::GetEntryFromCache(
+void BlockBasedTable::GetEntryFromCache(
     Cache* block_cache, const Slice& key, BlockType block_type,
-    GetContext* get_context) const {
-  auto cache_handle = block_cache->Lookup(key, rep_->ioptions.statistics);
+    GetContext* get_context, Cache::Handle** found_out,
+    Cache::IncompleteHandle** incomplete_out) const {
+      block_cache->CoopLookup(key, found_out, incomplete_out, -1 /*no timeout*/,
+                              rep_->ioptions.statistics);
 
-  if (cache_handle != nullptr) {
+  if (*found_out != nullptr) {
     UpdateCacheHitMetrics(block_type, get_context,
-                          block_cache->GetUsage(cache_handle));
+                          block_cache->GetUsage(*found_out));
   } else {
     UpdateCacheMissMetrics(block_type, get_context);
   }
-
-  return cache_handle;
 }
 
 // Helper function to setup the cache key's prefix for the Table.
@@ -1098,7 +1098,7 @@ Status BlockBasedTable::GetDataBlockFromCache(
     Cache* block_cache, Cache* block_cache_compressed,
     const ReadOptions& read_options, CachableEntry<TBlocklike>* block,
     const UncompressionDict& uncompression_dict, BlockType block_type,
-    GetContext* get_context) const {
+    GetContext* get_context, Cache::IncompleteHandle** incomplete) const {
   const size_t read_amp_bytes_per_bit =
       block_type == BlockType::kData
           ? rep_->table_options.read_amp_bytes_per_bit
@@ -1112,8 +1112,10 @@ Status BlockBasedTable::GetDataBlockFromCache(
 
   // Lookup uncompressed cache first
   if (block_cache != nullptr) {
-    auto cache_handle = GetEntryFromCache(block_cache, block_cache_key,
-                                          block_type, get_context);
+    Cache::Handle* cache_handle = nullptr;
+    assert(*incomplete == nullptr);
+    GetEntryFromCache(block_cache, block_cache_key, block_type, get_context,
+                      &cache_handle, incomplete);
     if (cache_handle != nullptr) {
       block->SetCachedValue(
           reinterpret_cast<TBlocklike*>(block_cache->Value(cache_handle)),
@@ -1170,8 +1172,15 @@ Status BlockBasedTable::GetDataBlockFromCache(
         read_options.fill_cache) {
       size_t charge = block_holder->ApproximateMemoryUsage();
       Cache::Handle* cache_handle = nullptr;
-      s = block_cache->Insert(block_cache_key, block_holder.get(), charge,
-                              &DeleteCachedEntry<TBlocklike>, &cache_handle);
+      if (*incomplete) {
+        s = block_cache->CoopComplete(*incomplete, block_holder.get(), charge,
+                                      &DeleteCachedEntry<TBlocklike>,
+                                      &cache_handle);
+        *incomplete = nullptr;
+      } else {
+        s = block_cache->Insert(block_cache_key, block_holder.get(), charge,
+                                &DeleteCachedEntry<TBlocklike>, &cache_handle);
+      }
       if (s.ok()) {
         assert(cache_handle != nullptr);
         block->SetCachedValue(block_holder.release(), block_cache,
@@ -1199,7 +1208,7 @@ Status BlockBasedTable::PutDataBlockToCache(
     CompressionType raw_block_comp_type,
     const UncompressionDict& uncompression_dict,
     MemoryAllocator* memory_allocator, BlockType block_type,
-    GetContext* get_context) const {
+    GetContext* get_context, Cache::IncompleteHandle** incomplete) const {
   const ImmutableCFOptions& ioptions = rep_->ioptions;
   const uint32_t format_version = rep_->table_options.format_version;
   const size_t read_amp_bytes_per_bit =
@@ -1274,9 +1283,16 @@ Status BlockBasedTable::PutDataBlockToCache(
   if (block_cache != nullptr && block_holder->own_bytes()) {
     size_t charge = block_holder->ApproximateMemoryUsage();
     Cache::Handle* cache_handle = nullptr;
-    s = block_cache->Insert(block_cache_key, block_holder.get(), charge,
-                            &DeleteCachedEntry<TBlocklike>, &cache_handle,
-                            priority);
+    if (*incomplete) {
+      s = block_cache->CoopComplete(*incomplete, block_holder.get(), charge,
+                                    &DeleteCachedEntry<TBlocklike>,
+                                    &cache_handle, priority);
+      *incomplete = nullptr;
+    } else {
+      s = block_cache->Insert(block_cache_key, block_holder.get(), charge,
+                              &DeleteCachedEntry<TBlocklike>, &cache_handle,
+                              priority);
+    }
     if (s.ok()) {
       assert(cache_handle != nullptr);
       cached_block->SetCachedValue(block_holder.release(), block_cache,
@@ -1407,10 +1423,11 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
                          compressed_cache_key);
     }
 
+    Cache::IncompleteHandle* incomplete = nullptr;
     if (!contents) {
       s = GetDataBlockFromCache(key, ckey, block_cache, block_cache_compressed,
                                 ro, block_entry, uncompression_dict, block_type,
-                                get_context);
+                                get_context, &incomplete);
       if (block_entry->GetValue()) {
         // TODO(haoyu): Differentiate cache hit on uncompressed block cache and
         // compressed block cache.
@@ -1448,10 +1465,14 @@ Status BlockBasedTable::MaybeReadBlockAndLoadToCache(
       if (s.ok()) {
         // If filling cache is allowed and a cache is configured, try to put the
         // block to the cache.
-        s = PutDataBlockToCache(
-            key, ckey, block_cache, block_cache_compressed, block_entry,
-            contents, raw_block_comp_type, uncompression_dict,
-            GetMemoryAllocator(rep_->table_options), block_type, get_context);
+        s = PutDataBlockToCache(key, ckey, block_cache, block_cache_compressed,
+                                block_entry, contents, raw_block_comp_type,
+                                uncompression_dict,
+                                GetMemoryAllocator(rep_->table_options),
+                                block_type, get_context, &incomplete);
+      }
+      if (incomplete) {
+        block_cache->CoopAbort(incomplete);
       }
     }
   }

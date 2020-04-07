@@ -69,6 +69,9 @@ struct LRUHandle {
     IN_HIGH_PRI_POOL = (1 << 2),
     // Wwhether this entry has had any lookups (hits).
     HAS_HIT = (1 << 3),
+    // Whether this is an incomplete entry that has been
+    // disowned by its original owner.
+    INCOMPLETE_DISOWNED = (1 << 4),
   };
 
   uint8_t flags;
@@ -95,6 +98,7 @@ struct LRUHandle {
   bool IsHighPri() const { return flags & IS_HIGH_PRI; }
   bool InHighPriPool() const { return flags & IN_HIGH_PRI_POOL; }
   bool HasHit() const { return flags & HAS_HIT; }
+  bool IsIncompleteDisowned() const { return flags & INCOMPLETE_DISOWNED; }
 
   void SetInCache(bool in_cache) {
     if (in_cache) {
@@ -121,6 +125,10 @@ struct LRUHandle {
   }
 
   void SetHit() { flags |= HAS_HIT; }
+
+  void SetIncompleteOwned() { flags &= ~INCOMPLETE_DISOWNED; }
+
+  void SetIncompleteDisowned() { flags |= INCOMPLETE_DISOWNED; }
 
   void Free() {
     assert(refs == 0);
@@ -160,6 +168,14 @@ class LRUHandleTable {
   LRUHandle* Insert(LRUHandle* h);
   LRUHandle* Remove(const Slice& key, uint32_t hash);
 
+  // Return a pointer to slot that points to a cache entry that
+  // matches key/hash.  If there is no such cache entry, return a
+  // pointer to the trailing slot in the corresponding linked list.
+  LRUHandle** FindPointer(const Slice& key, uint32_t hash);
+
+  // Faster Insert with hint from FindPointer
+  void InsertWithHint(LRUHandle* h, LRUHandle** hint);
+
   template <typename T>
   void ApplyToAllCacheEntries(T func) {
     for (uint32_t i = 0; i < length_; i++) {
@@ -174,11 +190,6 @@ class LRUHandleTable {
   }
 
  private:
-  // Return a pointer to slot that points to a cache entry that
-  // matches key/hash.  If there is no such cache entry, return a
-  // pointer to the trailing slot in the corresponding linked list.
-  LRUHandle** FindPointer(const Slice& key, uint32_t hash);
-
   void Resize();
 
   // The table consists of an array of buckets where each bucket is
@@ -189,7 +200,7 @@ class LRUHandleTable {
 };
 
 // A single shard of sharded cache.
-class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
+class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard : public CacheShard {
  public:
   LRUCacheShard(size_t capacity, bool strict_capacity_limit,
                 double high_pri_pool_ratio, bool use_adaptive_mutex,
@@ -207,13 +218,14 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
   // Set percentage of capacity reserved for high-pri cache entries.
   void SetHighPriorityPoolRatio(double high_pri_pool_ratio);
 
-  // Like Cache methods, but with an extra "hash" parameter.
+  // Like Cache methods, but with an extra "hash" parameter with key
   virtual Status Insert(const Slice& key, uint32_t hash, void* value,
                         size_t charge,
                         void (*deleter)(const Slice& key, void* value),
                         Cache::Handle** handle,
                         Cache::Priority priority) override;
   virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash) override;
+
   virtual bool Ref(Cache::Handle* handle) override;
   virtual bool Release(Cache::Handle* handle,
                        bool force_erase = false) override;
@@ -242,7 +254,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
   //  Retrives high pri pool ratio
   double GetHighPriPoolRatio();
 
- private:
+ protected:
   void LRU_Remove(LRUHandle* e);
   void LRU_Insert(LRUHandle* e);
 
@@ -255,6 +267,12 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
   // This function is not thread safe - it needs to be executed while
   // holding the mutex_
   void EvictFromLRU(size_t charge, autovector<LRUHandle*>* deleted);
+
+  // Allocate and populate a new LRUHandle
+  LRUHandle* NewHandle(const Slice& key, uint32_t hash, void* value,
+                       size_t charge,
+                       void (*deleter)(const Slice& key, void* value),
+                       Cache::Priority priority);
 
   // Initialized before use.
   size_t capacity_;
@@ -303,6 +321,36 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
   // We don't count mutex_ as the cache's internal state so semantically we
   // don't mind mutex_ invoking the non-const actions.
   mutable port::Mutex mutex_;
+
+  // For notifying blocked cooperative lookups
+  // (Only used in derived class but here for placement new)
+  mutable port::CondVar condvar_;
+};
+
+class ALIGN_AS(CACHE_LINE_SIZE) CoopLRUCacheShard final : public LRUCacheShard {
+ public:
+  CoopLRUCacheShard(size_t capacity, bool strict_capacity_limit,
+                    double high_pri_pool_ratio, bool use_adaptive_mutex,
+                    CacheMetadataChargePolicy metadata_charge_policy);
+  virtual ~CoopLRUCacheShard() override = default;
+
+  virtual void CoopLookup(const Slice& key, uint32_t hash,
+                          Cache::Handle** found_out,
+                          Cache::IncompleteHandle** incomplete_out = nullptr,
+                          int64_t timeout_us = -1) override;
+  virtual Status CoopComplete(
+      Cache::IncompleteHandle* incomplete, void* value, size_t charge,
+      void (*deleter)(const Slice& key, void* value),
+      Cache::Handle** handle = nullptr,
+      Cache::Priority priority = Cache::Priority::LOW) override;
+  virtual void CoopAbort(Cache::IncompleteHandle* handle) override;
+
+  // Slightly modified:
+  virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash) override;
+
+ private:
+  // Special 'value' to mark incomplete entries
+  static void* const kIncompleteValueMarker;
 };
 
 class LRUCache
@@ -316,7 +364,8 @@ class LRUCache
            std::shared_ptr<MemoryAllocator> memory_allocator = nullptr,
            bool use_adaptive_mutex = kDefaultToAdaptiveMutex,
            CacheMetadataChargePolicy metadata_charge_policy =
-               kDontChargeCacheMetadata);
+               kDontChargeCacheMetadata,
+           bool cooperative = false);
   virtual ~LRUCache();
   virtual const char* Name() const override { return "LRUCache"; }
   virtual CacheShard* GetShard(int shard) override;
@@ -324,6 +373,7 @@ class LRUCache
   virtual void* Value(Handle* handle) override;
   virtual size_t GetCharge(Handle* handle) const override;
   virtual uint32_t GetHash(Handle* handle) const override;
+  virtual uint32_t GetHashIncomplete(IncompleteHandle* handle) const override;
   virtual void DisownData() override;
 
   //  Retrieves number of elements in LRU, for unit test purpose only

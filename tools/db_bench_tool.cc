@@ -2633,7 +2633,9 @@ class Benchmark {
     } else {
       return NewLRUCache(
           static_cast<size_t>(capacity), FLAGS_cache_numshardbits,
-          false /*strict_capacity_limit*/, FLAGS_cache_high_pri_pool_ratio);
+          false /*strict_capacity_limit*/, FLAGS_cache_high_pri_pool_ratio,
+          nullptr, kDefaultToAdaptiveMutex, kDefaultCacheMetadataChargePolicy,
+          true /*cooperative*/);
     }
   }
 

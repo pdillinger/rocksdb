@@ -36,10 +36,16 @@ LRUHandle* LRUHandleTable::Lookup(const Slice& key, uint32_t hash) {
 }
 
 LRUHandle* LRUHandleTable::Insert(LRUHandle* h) {
-  LRUHandle** ptr = FindPointer(h->key(), h->hash);
-  LRUHandle* old = *ptr;
+  LRUHandle** hint = FindPointer(h->key(), h->hash);
+  LRUHandle* old = *hint;
+  InsertWithHint(h, hint);
+  return old;
+}
+
+void LRUHandleTable::InsertWithHint(LRUHandle* h, LRUHandle** hint) {
+  LRUHandle* old = *hint;
   h->next_hash = (old == nullptr ? nullptr : old->next_hash);
-  *ptr = h;
+  *hint = h;
   if (old == nullptr) {
     ++elems_;
     if (elems_ > length_) {
@@ -48,7 +54,6 @@ LRUHandle* LRUHandleTable::Insert(LRUHandle* h) {
       Resize();
     }
   }
-  return old;
 }
 
 LRUHandle* LRUHandleTable::Remove(const Slice& key, uint32_t hash) {
@@ -106,7 +111,8 @@ LRUCacheShard::LRUCacheShard(size_t capacity, bool strict_capacity_limit,
       high_pri_pool_capacity_(0),
       usage_(0),
       lru_usage_(0),
-      mutex_(use_adaptive_mutex) {
+      mutex_(use_adaptive_mutex),
+      condvar_(&mutex_) {
   set_metadata_charge_policy(metadata_charge_policy);
   // Make empty circular linked list
   lru_.next = &lru_;
@@ -336,17 +342,11 @@ bool LRUCacheShard::Release(Cache::Handle* handle, bool force_erase) {
   return last_reference;
 }
 
-Status LRUCacheShard::Insert(const Slice& key, uint32_t hash, void* value,
-                             size_t charge,
-                             void (*deleter)(const Slice& key, void* value),
-                             Cache::Handle** handle, Cache::Priority priority) {
-  // Allocate the memory here outside of the mutex
-  // If the cache is full, we'll have to release it
-  // It shouldn't happen very often though.
+LRUHandle* LRUCacheShard::NewHandle(
+    const Slice& key, uint32_t hash, void* value, size_t charge,
+    void (*deleter)(const Slice& key, void* value), Cache::Priority priority) {
   LRUHandle* e = reinterpret_cast<LRUHandle*>(
       new char[sizeof(LRUHandle) - 1 + key.size()]);
-  Status s = Status::OK();
-  autovector<LRUHandle*> last_reference_list;
 
   e->value = value;
   e->deleter = deleter;
@@ -359,6 +359,19 @@ Status LRUCacheShard::Insert(const Slice& key, uint32_t hash, void* value,
   e->SetInCache(true);
   e->SetPriority(priority);
   memcpy(e->key_data, key.data(), key.size());
+  return e;
+}
+
+Status LRUCacheShard::Insert(const Slice& key, uint32_t hash, void* value,
+                             size_t charge,
+                             void (*deleter)(const Slice& key, void* value),
+                             Cache::Handle** handle, Cache::Priority priority) {
+  // Allocate the memory here outside of the mutex
+  // If the cache is full, we'll have to release it
+  // It shouldn't happen very often though.
+  LRUHandle* e = NewHandle(key, hash, value, charge, deleter, priority);
+  Status s = Status::OK();
+  autovector<LRUHandle*> last_reference_list;
   size_t total_charge = e->CalcTotalCharge(metadata_charge_policy_);
 
   {
@@ -464,11 +477,205 @@ std::string LRUCacheShard::GetPrintableOptions() const {
   return std::string(buffer);
 }
 
+CoopLRUCacheShard::CoopLRUCacheShard(
+    size_t capacity, bool strict_capacity_limit, double high_pri_pool_ratio,
+    bool use_adaptive_mutex, CacheMetadataChargePolicy metadata_charge_policy)
+    : LRUCacheShard(capacity, strict_capacity_limit, high_pri_pool_ratio,
+                    use_adaptive_mutex, metadata_charge_policy) {}
+
+void* const CoopLRUCacheShard::kIncompleteValueMarker = const_cast<char*>("x");
+
+void CoopLRUCacheShard::CoopLookup(const Slice& key, uint32_t hash,
+                                   Cache::Handle** found_out,
+                                   Cache::IncompleteHandle** incomplete_out,
+                                   int64_t timeout_us) {
+  *found_out = nullptr;
+  if (incomplete_out) {
+    *incomplete_out = nullptr;
+  }
+  MutexLock l(&mutex_);
+  LRUHandle** hint = table_.FindPointer(key, hash);
+  LRUHandle* e = *hint;
+  if (e != nullptr) {
+    assert(e->InCache());
+    e->SetHit();
+    if (!e->HasRefs()) {
+      // The entry is in LRU since it's in hash and has no external references
+      LRU_Remove(e);
+    }
+    e->Ref();
+    while (e->value == kIncompleteValueMarker) {
+      // Incomplete entry
+      if (e->IsIncompleteDisowned()) {
+        if (incomplete_out != nullptr) {
+          // Take over ownership
+          e->SetIncompleteOwned();
+          *incomplete_out = reinterpret_cast<Cache::IncompleteHandle*>(e);
+          return; /*EARLY*/
+        } else {
+          // Not willing to take ownership
+          if (e->Unref()) {  // undo above ref
+            // must have become last ref during wait
+            table_.Remove(e->key(), e->hash);
+            e->Free();
+          }
+          return; /*EARLY*/
+        }
+      } else if (timeout_us == 0) {
+        // Not willing to block
+        if (e->Unref()) {  // undo above ref
+          // must have become last ref during wait
+          table_.Remove(e->key(), e->hash);
+          e->Free();
+        }
+        return; /*EARLY*/
+      } else if (timeout_us < 0) {
+        // Wait for owner to populate
+        condvar_.Wait();
+      } else {
+        // Wait (timed) for owner to populate
+        condvar_.TimedWait(timeout_us);
+        // FIXME: time tracking
+        timeout_us = 0;
+      }
+    }
+    // Complete entry
+    *found_out = reinterpret_cast<Cache::Handle*>(e);
+  } else if (incomplete_out != nullptr) {
+    // Insert placeholder without charge
+    e = NewHandle(key, hash, kIncompleteValueMarker, 0 /*charge*/,
+                  nullptr /*deleter*/, Cache::Priority::LOW);
+    assert(e->InCache());
+    table_.InsertWithHint(e, hint);
+    e->Ref();
+    *incomplete_out = reinterpret_cast<Cache::IncompleteHandle*>(e);
+  }
+}
+
+Status CoopLRUCacheShard::CoopComplete(
+    Cache::IncompleteHandle* incomplete, void* value, size_t charge,
+    void (*deleter)(const Slice& key, void* value), Cache::Handle** handle,
+    Cache::Priority priority) {
+  assert(incomplete != nullptr);
+  LRUHandle* e = reinterpret_cast<LRUHandle*>(incomplete);
+
+  Status s = Status::OK();
+  autovector<LRUHandle*> last_reference_list;
+
+  {
+    MutexLock l(&mutex_);
+    assert(e->HasRefs());
+    assert(e->value == kIncompleteValueMarker);
+    assert(!e->IsIncompleteDisowned());
+    e->value = value;
+    e->charge = charge;
+    e->deleter = deleter;
+    e->SetPriority(priority);
+
+    bool has_other_refs = e->refs > 1;
+
+    if (!e->InCache()) {
+      // Erased - bypass eviction and LRU but report OK as if erasure
+      // happened after
+      if (handle == nullptr) {
+        if (e->Unref()) {
+          last_reference_list.push_back(e);
+        }
+      } else {
+        *handle = reinterpret_cast<Cache::Handle*>(e);
+      }
+    } else {
+      size_t total_charge = e->CalcTotalCharge(metadata_charge_policy_);
+
+      // Free the space following strict LRU policy until enough space
+      // is freed or the lru list is empty
+      EvictFromLRU(total_charge, &last_reference_list);
+
+      if ((usage_ + total_charge) > capacity_ &&
+          (strict_capacity_limit_ || handle == nullptr)) {
+        // Can't keep in cache
+        if (e->Unref()) {
+          last_reference_list.push_back(e);
+        }
+        table_.Remove(e->key(), e->hash);
+        e->SetInCache(false);
+        if (handle != nullptr) {
+          *handle = nullptr;
+          s = Status::Incomplete("Insert failed due to LRU cache being full.");
+        }
+      } else {
+        // Keep
+        usage_ += total_charge;
+        if (handle == nullptr) {
+          e->Unref();
+          LRU_Insert(e);
+        } else {
+          *handle = reinterpret_cast<Cache::Handle*>(e);
+        }
+      }
+    }
+    if (has_other_refs) {
+      condvar_.SignalAll();
+    }
+  }
+
+  // Free the entries here outside of mutex for performance reasons
+  for (auto entry : last_reference_list) {
+    entry->Free();
+  }
+  return s;
+}
+
+void CoopLRUCacheShard::CoopAbort(Cache::IncompleteHandle* incomplete) {
+  assert(incomplete != nullptr);
+  LRUHandle* e = reinterpret_cast<LRUHandle*>(incomplete);
+  MutexLock l(&mutex_);
+  assert(e->HasRefs());
+  assert(e->value == kIncompleteValueMarker);
+  assert(!e->IsIncompleteDisowned());
+
+  if (e->InCache()) {
+    table_.Remove(e->key(), e->hash);
+  }
+
+  if (e->Unref()) {
+    // last reference
+    e->Free();
+  } else {
+    // other references
+    e->SetInCache(false);
+    e->SetIncompleteDisowned();
+    condvar_.SignalAll();
+  }
+}
+
+Cache::Handle* CoopLRUCacheShard::Lookup(const Slice& key, uint32_t hash) {
+  MutexLock l(&mutex_);
+  LRUHandle* e = table_.Lookup(key, hash);
+  if (e != nullptr) {
+    assert(e->InCache());
+    // ADDED in override
+    if (e->value == kIncompleteValueMarker) {
+      // Non-blocking
+      return nullptr;
+    }
+    // END ADDED in override
+    if (!e->HasRefs()) {
+      // The entry is in LRU since it's in hash and has no external references
+      LRU_Remove(e);
+    }
+    e->Ref();
+    e->SetHit();
+  }
+  return reinterpret_cast<Cache::Handle*>(e);
+}
+
 LRUCache::LRUCache(size_t capacity, int num_shard_bits,
                    bool strict_capacity_limit, double high_pri_pool_ratio,
                    std::shared_ptr<MemoryAllocator> allocator,
                    bool use_adaptive_mutex,
-                   CacheMetadataChargePolicy metadata_charge_policy)
+                   CacheMetadataChargePolicy metadata_charge_policy,
+                   bool cooperative)
     : ShardedCache(capacity, num_shard_bits, strict_capacity_limit,
                    std::move(allocator)) {
   num_shards_ = 1 << num_shard_bits;
@@ -476,9 +683,17 @@ LRUCache::LRUCache(size_t capacity, int num_shard_bits,
       port::cacheline_aligned_alloc(sizeof(LRUCacheShard) * num_shards_));
   size_t per_shard = (capacity + (num_shards_ - 1)) / num_shards_;
   for (int i = 0; i < num_shards_; i++) {
-    new (&shards_[i])
-        LRUCacheShard(per_shard, strict_capacity_limit, high_pri_pool_ratio,
-                      use_adaptive_mutex, metadata_charge_policy);
+    if (cooperative) {
+      static_assert(sizeof(CoopLRUCacheShard) == sizeof(LRUCacheShard),
+                    "Needed for placement new");
+      new (&shards_[i]) CoopLRUCacheShard(
+          per_shard, strict_capacity_limit, high_pri_pool_ratio,
+          use_adaptive_mutex, metadata_charge_policy);
+    } else {
+      new (&shards_[i])
+          LRUCacheShard(per_shard, strict_capacity_limit, high_pri_pool_ratio,
+                        use_adaptive_mutex, metadata_charge_policy);
+    }
   }
 }
 
@@ -509,6 +724,10 @@ size_t LRUCache::GetCharge(Handle* handle) const {
 }
 
 uint32_t LRUCache::GetHash(Handle* handle) const {
+  return reinterpret_cast<const LRUHandle*>(handle)->hash;
+}
+
+uint32_t LRUCache::GetHashIncomplete(IncompleteHandle* handle) const {
   return reinterpret_cast<const LRUHandle*>(handle)->hash;
 }
 
@@ -548,14 +767,14 @@ std::shared_ptr<Cache> NewLRUCache(const LRUCacheOptions& cache_opts) {
                      cache_opts.strict_capacity_limit,
                      cache_opts.high_pri_pool_ratio,
                      cache_opts.memory_allocator, cache_opts.use_adaptive_mutex,
-                     cache_opts.metadata_charge_policy);
+                     cache_opts.metadata_charge_policy, cache_opts.cooperative);
 }
 
 std::shared_ptr<Cache> NewLRUCache(
     size_t capacity, int num_shard_bits, bool strict_capacity_limit,
     double high_pri_pool_ratio,
     std::shared_ptr<MemoryAllocator> memory_allocator, bool use_adaptive_mutex,
-    CacheMetadataChargePolicy metadata_charge_policy) {
+    CacheMetadataChargePolicy metadata_charge_policy, bool cooperative) {
   if (num_shard_bits >= 20) {
     return nullptr;  // the cache cannot be sharded into too many fine pieces
   }
@@ -568,7 +787,8 @@ std::shared_ptr<Cache> NewLRUCache(
   }
   return std::make_shared<LRUCache>(
       capacity, num_shard_bits, strict_capacity_limit, high_pri_pool_ratio,
-      std::move(memory_allocator), use_adaptive_mutex, metadata_charge_policy);
+      std::move(memory_allocator), use_adaptive_mutex, metadata_charge_policy,
+      cooperative);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

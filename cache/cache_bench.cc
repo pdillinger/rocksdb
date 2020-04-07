@@ -49,6 +49,9 @@ DEFINE_bool(populate_cache, true, "Populate cache before operations");
 DEFINE_uint32(lookup_insert_percent, 87,
               "Ratio of lookup (+ insert on not found) to total workload "
               "(expressed as a percentage)");
+DEFINE_uint32(coop_lookup_percent, 0,
+              "Ratio of coop lookup (+ insert on not found) to total "
+              "workload (expressed as a percentage)");
 DEFINE_uint32(insert_percent, 2,
               "Ratio of insert to total workload (expressed as a percentage)");
 DEFINE_uint32(lookup_percent, 10,
@@ -56,7 +59,8 @@ DEFINE_uint32(lookup_percent, 10,
 DEFINE_uint32(erase_percent, 1,
               "Ratio of erase to total workload (expressed as a percentage)");
 
-DEFINE_bool(use_clock_cache, false, "");
+DEFINE_bool(use_clock_cache, false, "Use ClockCache instead of LRUCache");
+DEFINE_bool(use_coop, false, "Use cooperative variant of LRUCache");
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -173,7 +177,9 @@ class CacheBench {
                                        FLAGS_value_bytes)),
         lookup_insert_threshold_(kHundredthUint64 *
                                  FLAGS_lookup_insert_percent),
-        insert_threshold_(lookup_insert_threshold_ +
+        coop_lookup_threshold_(lookup_insert_threshold_ +
+                               kHundredthUint64 * FLAGS_coop_lookup_percent),
+        insert_threshold_(coop_lookup_threshold_ +
                           kHundredthUint64 * FLAGS_insert_percent),
         lookup_threshold_(insert_threshold_ +
                           kHundredthUint64 * FLAGS_lookup_percent),
@@ -190,7 +196,11 @@ class CacheBench {
         exit(1);
       }
     } else {
-      cache_ = NewLRUCache(FLAGS_cache_size, FLAGS_num_shard_bits);
+      cache_ = NewLRUCache(FLAGS_cache_size, FLAGS_num_shard_bits,
+                           false /*strict_capacity_limit*/,
+                           0.5 /*high_pri_pool_ratio*/, nullptr /*allocator*/,
+                           kDefaultToAdaptiveMutex,
+                           kDefaultCacheMetadataChargePolicy, FLAGS_use_coop);
     }
     if (FLAGS_ops_per_thread == 0) {
       FLAGS_ops_per_thread = 5 * max_key_;
@@ -250,6 +260,7 @@ class CacheBench {
   const uint64_t max_key_;
   // Cumulative thresholds in the space of a random uint64_t
   const uint64_t lookup_insert_threshold_;
+  const uint64_t coop_lookup_threshold_;
   const uint64_t insert_threshold_;
   const uint64_t lookup_threshold_;
   const uint64_t erase_threshold_;
@@ -295,14 +306,37 @@ class CacheBench {
         }
         // do lookup
         handle = cache_->Lookup(key);
+        if (handle == nullptr) {
+          // do insert
+          cache_->Insert(key, createValue(thread->rnd), FLAGS_value_bytes,
+                         &deleter, &handle);
+        }
         if (handle) {
           // do something with the data
           result += NPHash64(static_cast<char*>(cache_->Value(handle)),
                              FLAGS_value_bytes);
-        } else {
+        }
+      } else if (random_op < coop_lookup_threshold_) {
+        if (handle) {
+          cache_->Release(handle);
+          handle = nullptr;
+        }
+        // do lookup
+        Cache::IncompleteHandle* incomplete;
+        cache_->CoopLookup(key, &handle, &incomplete);
+        if (incomplete) {
+          // do insert
+          cache_->CoopComplete(incomplete, createValue(thread->rnd),
+                               FLAGS_value_bytes, &deleter, &handle);
+        } else if (handle == nullptr) {
           // do insert
           cache_->Insert(key, createValue(thread->rnd), FLAGS_value_bytes,
                          &deleter, &handle);
+        }
+        if (handle) {
+          // do something with the data
+          result += NPHash64(static_cast<char*>(cache_->Value(handle)),
+                             FLAGS_value_bytes);
         }
       } else if (random_op < insert_threshold_) {
         if (handle) {
@@ -349,6 +383,7 @@ class CacheBench {
     printf("Skew degree         : %u\n", FLAGS_skew);
     printf("Populate cache      : %d\n", int{FLAGS_populate_cache});
     printf("Lookup+Insert pct   : %u%%\n", FLAGS_lookup_insert_percent);
+    printf("Coop Lookup pct     : %u%%\n", FLAGS_coop_lookup_percent);
     printf("Insert percentage   : %u%%\n", FLAGS_insert_percent);
     printf("Lookup percentage   : %u%%\n", FLAGS_lookup_percent);
     printf("Erase percentage    : %u%%\n", FLAGS_erase_percent);

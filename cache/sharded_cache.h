@@ -29,6 +29,38 @@ class CacheShard {
                         void (*deleter)(const Slice& key, void* value),
                         Cache::Handle** handle, Cache::Priority priority) = 0;
   virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash) = 0;
+  virtual void CoopLookup(const Slice& key, uint32_t hash,
+                          Cache::Handle** found_out,
+                          Cache::IncompleteHandle** incomplete_out = nullptr,
+                          int64_t timeout_us = -1) {
+    (void)timeout_us;
+    // Default impl: plain non-blocking lookup
+    *found_out = Lookup(key, hash);
+    if (incomplete_out) {
+      *incomplete_out = nullptr;
+    }
+  }
+  virtual Status CoopComplete(Cache::IncompleteHandle* incomplete, void* value,
+                              size_t charge,
+                              void (*deleter)(const Slice& key, void* value),
+                              Cache::Handle** handle = nullptr,
+                              Cache::Priority priority = Cache::Priority::LOW) {
+    (void)incomplete;
+    (void)value;
+    (void)charge;
+    (void)deleter;
+    (void)handle;
+    (void)priority;
+    // Default not implemented
+    assert(false);
+    return Status::NotSupported(
+        "CoopComplete not implemented for this type of CacheShard");
+  }
+  virtual void CoopAbort(Cache::IncompleteHandle* handle) {
+    (void)handle;
+    // Default not implemented
+    assert(false);
+  }
   virtual bool Ref(Cache::Handle* handle) = 0;
   virtual bool Release(Cache::Handle* handle, bool force_erase = false) = 0;
   virtual void Erase(const Slice& key, uint32_t hash) = 0;
@@ -64,6 +96,12 @@ class ShardedCache : public Cache {
   virtual size_t GetCharge(Handle* handle) const override = 0;
 
   virtual uint32_t GetHash(Handle* handle) const = 0;
+  virtual uint32_t GetHashIncomplete(IncompleteHandle* handle) const {
+    (void)handle;
+    // Default unimplemented
+    assert(false);
+    return 0;
+  }
   virtual void DisownData() override = 0;
 
   virtual void SetCapacity(size_t capacity) override;
@@ -73,6 +111,16 @@ class ShardedCache : public Cache {
                         void (*deleter)(const Slice& key, void* value),
                         Handle** handle, Priority priority) override;
   virtual Handle* Lookup(const Slice& key, Statistics* stats) override;
+  virtual void CoopLookup(const Slice& key, Handle** found_out,
+                          IncompleteHandle** incomplete_out = nullptr,
+                          int64_t timeout_us = -1,
+                          Statistics* stats = nullptr) override;
+  virtual Status CoopComplete(IncompleteHandle* incomplete, void* value,
+                              size_t charge,
+                              void (*deleter)(const Slice& key, void* value),
+                              Handle** handle = nullptr,
+                              Priority priority = Priority::LOW) override;
+  virtual void CoopAbort(IncompleteHandle* handle) override;
   virtual bool Ref(Handle* handle) override;
   virtual bool Release(Handle* handle, bool force_erase = false) override;
   virtual void Erase(const Slice& key) override;

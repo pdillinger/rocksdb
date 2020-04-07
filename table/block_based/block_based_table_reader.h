@@ -11,6 +11,7 @@
 
 #include "db/range_tombstone_fragmenter.h"
 #include "file/filename.h"
+#include "rocksdb/cache.h"
 #include "table/block_based/block_based_table_factory.h"
 #include "table/block_based/block_type.h"
 #include "table/block_based/cachable_entry.h"
@@ -24,7 +25,6 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-class Cache;
 class FilterBlockReader;
 class BlockBasedFilterBlockReader;
 class FullFilterBlockReader;
@@ -260,9 +260,10 @@ class BlockBasedTable : public TableReader {
                               GetContext* get_context) const;
   void UpdateCacheInsertionMetrics(BlockType block_type,
                                    GetContext* get_context, size_t usage) const;
-  Cache::Handle* GetEntryFromCache(Cache* block_cache, const Slice& key,
-                                   BlockType block_type,
-                                   GetContext* get_context) const;
+  void GetEntryFromCache(Cache* block_cache, const Slice& key,
+                         BlockType block_type, GetContext* get_context,
+                         Cache::Handle** found_out,
+                         Cache::IncompleteHandle** incomplete_out) const;
 
   // Either Block::NewDataIterator() or Block::NewIndexIterator().
   template <typename TBlockIter>
@@ -338,7 +339,7 @@ class BlockBasedTable : public TableReader {
       Cache* block_cache, Cache* block_cache_compressed,
       const ReadOptions& read_options, CachableEntry<TBlocklike>* block,
       const UncompressionDict& uncompression_dict, BlockType block_type,
-      GetContext* get_context) const;
+      GetContext* get_context, Cache::IncompleteHandle** incomplete) const;
 
   // Put a raw block (maybe compressed) to the corresponding block caches.
   // This method will perform decompression against raw_block if needed and then
@@ -359,8 +360,8 @@ class BlockBasedTable : public TableReader {
                              CompressionType raw_block_comp_type,
                              const UncompressionDict& uncompression_dict,
                              MemoryAllocator* memory_allocator,
-                             BlockType block_type,
-                             GetContext* get_context) const;
+                             BlockType block_type, GetContext* get_context,
+                             Cache::IncompleteHandle** incomplete) const;
 
   // Calls (*handle_result)(arg, ...) repeatedly, starting with the entry found
   // after a call to Seek(key), until handle_result returns false.

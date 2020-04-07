@@ -56,6 +56,29 @@ Cache::Handle* ShardedCache::Lookup(const Slice& key, Statistics* /*stats*/) {
   return GetShard(Shard(hash))->Lookup(key, hash);
 }
 
+void ShardedCache::CoopLookup(const Slice& key, Handle** found_out,
+                              IncompleteHandle** incomplete_out,
+                              int64_t timeout_us, Statistics* /*stats*/) {
+  uint32_t hash = HashSlice(key);
+  GetShard(Shard(hash))
+      ->CoopLookup(key, hash, found_out, incomplete_out, timeout_us);
+}
+
+Status ShardedCache::CoopComplete(IncompleteHandle* incomplete, void* value,
+                                  size_t charge,
+                                  void (*deleter)(const Slice& key,
+                                                  void* value),
+                                  Handle** handle, Priority priority) {
+  uint32_t hash = GetHashIncomplete(incomplete);
+  return GetShard(Shard(hash))
+      ->CoopComplete(incomplete, value, charge, deleter, handle, priority);
+}
+
+void ShardedCache::CoopAbort(IncompleteHandle* incomplete) {
+  uint32_t hash = GetHashIncomplete(incomplete);
+  GetShard(Shard(hash))->CoopAbort(incomplete);
+}
+
 bool ShardedCache::Ref(Handle* handle) {
   uint32_t hash = GetHash(handle);
   return GetShard(Shard(hash))->Ref(handle);

@@ -86,20 +86,24 @@ struct LRUCacheOptions {
   CacheMetadataChargePolicy metadata_charge_policy =
       kDefaultCacheMetadataChargePolicy;
 
+  bool cooperative = false;
+
   LRUCacheOptions() {}
   LRUCacheOptions(size_t _capacity, int _num_shard_bits,
                   bool _strict_capacity_limit, double _high_pri_pool_ratio,
                   std::shared_ptr<MemoryAllocator> _memory_allocator = nullptr,
                   bool _use_adaptive_mutex = kDefaultToAdaptiveMutex,
                   CacheMetadataChargePolicy _metadata_charge_policy =
-                      kDefaultCacheMetadataChargePolicy)
+                      kDefaultCacheMetadataChargePolicy,
+                  bool _cooperative = false)
       : capacity(_capacity),
         num_shard_bits(_num_shard_bits),
         strict_capacity_limit(_strict_capacity_limit),
         high_pri_pool_ratio(_high_pri_pool_ratio),
         memory_allocator(std::move(_memory_allocator)),
         use_adaptive_mutex(_use_adaptive_mutex),
-        metadata_charge_policy(_metadata_charge_policy) {}
+        metadata_charge_policy(_metadata_charge_policy),
+        cooperative(_cooperative) {}
 };
 
 // Create a new cache with a fixed size capacity. The cache is sharded
@@ -116,7 +120,8 @@ extern std::shared_ptr<Cache> NewLRUCache(
     std::shared_ptr<MemoryAllocator> memory_allocator = nullptr,
     bool use_adaptive_mutex = kDefaultToAdaptiveMutex,
     CacheMetadataChargePolicy metadata_charge_policy =
-        kDefaultCacheMetadataChargePolicy);
+        kDefaultCacheMetadataChargePolicy,
+    bool cooperative = false);
 
 extern std::shared_ptr<Cache> NewLRUCache(const LRUCacheOptions& cache_opts);
 
@@ -130,6 +135,9 @@ extern std::shared_ptr<Cache> NewClockCache(
     bool strict_capacity_limit = false,
     CacheMetadataChargePolicy metadata_charge_policy =
         kDefaultCacheMetadataChargePolicy);
+
+// Abstract base class of concurrent in-memory key->value cache, used
+// for block cache.
 class Cache {
  public:
   // Depending on implementation, cache entries with high priority could be less
@@ -150,6 +158,10 @@ class Cache {
 
   // Opaque handle to an entry stored in the cache.
   struct Handle {};
+
+  // Opaque handle to a placeholder entry in the cache, not yet associated
+  // with a value. See CoopLookup().
+  struct IncompleteHandle {};
 
   // The type of the Cache
   virtual const char* Name() const = 0;
@@ -182,6 +194,82 @@ class Cache {
   // If stats is not nullptr, relative tickers could be used inside the
   // function.
   virtual Handle* Lookup(const Slice& key, Statistics* stats = nullptr) = 0;
+
+  // Cooperative lookup: when fully implemented by the Cache, this interface
+  // avoids the race condition between Lookup and Insert where multiple
+  // threads fetch the same data for insertion into the Cache. Unlike
+  // Lookup, CoopLookup can block other threads wanting the same data while
+  // one is fetching the data.
+  //
+  // Note: in some Cache implementations, this is the same as Lookup
+  // (non-blocking) so redundant fetching and Inserting is still possible.
+  //
+  // found_out - must be non-null. If lookup successfully returns a complete
+  //   entry, *found_out is assigned non-null Handle* and caller must
+  //   eventually Release it. *found_out is assigned nullptr if not found
+  //   (within timout) or is incomplete.
+  // incomplete_out - non-null indicates that this thread intends to load
+  //   data for the cache entry if not found. If non-null and a complete
+  //   entry is not found, *incomplete_out may be assigned an
+  //   IncompleteHandle*, obliging the caller either to call CoopComplete
+  //   or CoopAbort with the IncompleteHandle*.
+  // timeout_us - how long this call is willing to block waiting for another
+  //   thread to complete a cache entry for the given key. < 0 => forever,
+  //   0 => don't block (for IO), >0 => max blocking time in microseconds.
+  // stats - like Lookup
+  //
+  // Note: passing incomplete_out = nullptr and timeout_us = 0 is equivalent
+  // to Lookup. Either a Handle, an IncompleteHandle, or neither is returned
+  // to the caller (never both). An implementation may guarantee some kind
+  // of handle returned when timeout_us < 0, but callers should not rely on
+  // this. An implementation will generally only return an IncompleteHandle
+  // to one thread at a time, but callers should not rely on this (for now).
+  virtual void CoopLookup(const Slice& key, Handle** found_out,
+                          IncompleteHandle** incomplete_out = nullptr,
+                          int64_t timeout_us = -1,
+                          Statistics* stats = nullptr) {
+    (void)timeout_us;
+    // Default impl: plain non-blocking lookup
+    *found_out = Lookup(key, stats);
+    if (incomplete_out) {
+      *incomplete_out = nullptr;
+    }
+  }
+
+  // Associates a placeholder handle from CoopLookup with fetched data.
+  // Contract is essentially the same as Insert, except that an
+  // IncompleteHandle is given instead of a key, and the IncompleteHandle
+  // is always released with this call. If return status is not OK, the
+  // call acts like CoopAbort.
+  virtual Status CoopComplete(IncompleteHandle* incomplete, void* value,
+                              size_t charge,
+                              void (*deleter)(const Slice& key, void* value),
+                              Handle** handle = nullptr,
+                              Priority priority = Priority::LOW) {
+    (void)incomplete;
+    (void)value;
+    (void)charge;
+    (void)deleter;
+    (void)handle;
+    (void)priority;
+    // Default not implemented
+    assert(false);
+    return Status::NotSupported(
+        "CoopComplete not implemented for this type of Cache");
+  }
+
+  // Releases / erases a placeholder handle from CoopLookup without
+  // associating fetched data. This would be used to indicate that the
+  // thread responsible for fetching data after a CoopLookup (thread
+  // holding the IncompleteHandle) failed to fetch the data. (No reason
+  // or status is provided because a Cache operates on best effort for
+  // Lookups; other threads blocked in CoopLookup may see "not found" or
+  // get returned an IncompleteHandle.)
+  virtual void CoopAbort(IncompleteHandle* handle) {
+    (void)handle;
+    // Default not implemented
+    assert(false);
+  }
 
   // Increments the reference count for the handle if it refers to an entry in
   // the cache. Returns true if refcount was incremented; otherwise, returns
