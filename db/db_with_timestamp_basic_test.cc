@@ -787,13 +787,15 @@ TEST_F(DBBasicTestWithTimestamp, MultiGetNoReturnTs) {
   write_opts.timestamp = &ts;
   ASSERT_OK(db_->Put(write_opts, "foo", "value"));
   ASSERT_OK(db_->Put(write_opts, "bar", "value"));
+  ASSERT_OK(db_->Put(write_opts, "fooXXXXXXXXXXXXXXXX", "value"));
+  ASSERT_OK(db_->Put(write_opts, "barXXXXXXXXXXXXXXXX", "value"));
   ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
   ts_str = Timestamp(2, 0);
   ts = ts_str;
   ReadOptions read_opts;
   read_opts.timestamp = &ts;
   ColumnFamilyHandle* column_families[] = {cfh, cfh};
-  Slice keys[] = {"foo", "bar"};
+  Slice keys[] = {"fooXXXXXXXXXXXXXXXX", "barXXXXXXXXXXXXXXXX"};
   PinnableSlice values[] = {PinnableSlice(), PinnableSlice()};
   Status statuses[] = {Status::OK(), Status::OK()};
   dbfull()->MultiGet(read_opts, 2, &column_families[0], &keys[0], &values[0],
