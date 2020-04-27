@@ -785,8 +785,6 @@ TEST_F(DBBasicTestWithTimestamp, MultiGetNoReturnTs) {
   std::string ts_str = Timestamp(1, 0);
   Slice ts = ts_str;
   write_opts.timestamp = &ts;
-  ASSERT_OK(db_->Put(write_opts, "foo", "value"));
-  ASSERT_OK(db_->Put(write_opts, "bar", "value"));
   ASSERT_OK(db_->Put(write_opts, "fooXXXXXXXXXXXXXXXX", "value"));
   ASSERT_OK(db_->Put(write_opts, "barXXXXXXXXXXXXXXXX", "value"));
   ColumnFamilyHandle* cfh = dbfull()->DefaultColumnFamily();
