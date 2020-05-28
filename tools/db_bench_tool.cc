@@ -73,6 +73,10 @@
 #include "utilities/merge_operators/sortlist.h"
 #include "utilities/persistent_cache/block_cache_tier.h"
 
+#ifdef MEMKIND
+#include "memory/memkind_kmem_allocator.h"
+#endif
+
 #ifdef OS_WIN
 #include <io.h>  // open/close
 #endif
@@ -451,6 +455,9 @@ DEFINE_int64(simcache_size, -1,
 
 DEFINE_bool(cache_index_and_filter_blocks, false,
             "Cache index/filter blocks in block cache.");
+
+DEFINE_bool(use_cache_memkind_kmem_allocator, false,
+            "Use memkind kmem allocator for block cache.");
 
 DEFINE_bool(partition_index_and_filters, false,
             "Partition index and filter blocks.");
@@ -918,6 +925,9 @@ DEFINE_int32(min_level_to_compress, -1, "If non-negative, compression starts"
              " from this level. Levels with number < min_level_to_compress are"
              " not compressed. Otherwise, apply compression_type to "
              "all levels.");
+
+DEFINE_int32(compression_parallel_threads, 1,
+             "Number of threads for parallel compression.");
 
 static bool ValidateTableCacheNumshardbits(const char* flagname,
                                            int32_t value) {
@@ -1484,9 +1494,8 @@ static enum DistributionType StringToDistributionType(const char* ctype) {
 
 class BaseDistribution {
  public:
-  BaseDistribution(unsigned int min, unsigned int max) :
-    min_value_size_(min),
-    max_value_size_(max) {}
+  BaseDistribution(unsigned int _min, unsigned int _max)
+      : min_value_size_(_min), max_value_size_(_max) {}
   virtual ~BaseDistribution() {}
 
   unsigned int Generate() {
@@ -1525,12 +1534,14 @@ class FixedDistribution : public BaseDistribution
 class NormalDistribution
     : public BaseDistribution, public std::normal_distribution<double> {
  public:
-  NormalDistribution(unsigned int min, unsigned int max) :
-    BaseDistribution(min, max),
-    // 99.7% values within the range [min, max].
-    std::normal_distribution<double>((double)(min + max) / 2.0 /*mean*/,
-                                     (double)(max - min) / 6.0 /*stddev*/),
-    gen_(rd_()) {}
+  NormalDistribution(unsigned int _min, unsigned int _max)
+      : BaseDistribution(_min, _max),
+        // 99.7% values within the range [min, max].
+        std::normal_distribution<double>(
+            (double)(_min + _max) / 2.0 /*mean*/,
+            (double)(_max - _min) / 6.0 /*stddev*/),
+        gen_(rd_()) {}
+
  private:
   virtual unsigned int Get() override {
     return static_cast<unsigned int>((*this)(gen_));
@@ -1543,10 +1554,11 @@ class UniformDistribution
     : public BaseDistribution,
       public std::uniform_int_distribution<unsigned int> {
  public:
-  UniformDistribution(unsigned int min, unsigned int max) :
-    BaseDistribution(min, max),
-    std::uniform_int_distribution<unsigned int>(min, max),
-    gen_(rd_()) {}
+  UniformDistribution(unsigned int _min, unsigned int _max)
+      : BaseDistribution(_min, _max),
+        std::uniform_int_distribution<unsigned int>(_min, _max),
+        gen_(rd_()) {}
+
  private:
   virtual unsigned int Get() override {
     return (*this)(gen_);
@@ -2626,9 +2638,22 @@ class Benchmark {
       }
       return cache;
     } else {
-      return NewLRUCache(
-          static_cast<size_t>(capacity), FLAGS_cache_numshardbits,
-          false /*strict_capacity_limit*/, FLAGS_cache_high_pri_pool_ratio);
+      if (FLAGS_use_cache_memkind_kmem_allocator) {
+#ifdef MEMKIND
+        return NewLRUCache(
+            static_cast<size_t>(capacity), FLAGS_cache_numshardbits,
+            false /*strict_capacity_limit*/, FLAGS_cache_high_pri_pool_ratio,
+            std::make_shared<MemkindKmemAllocator>());
+
+#else
+        fprintf(stderr, "Memkind library is not linked with the binary.");
+        exit(1);
+#endif
+      } else {
+        return NewLRUCache(
+            static_cast<size_t>(capacity), FLAGS_cache_numshardbits,
+            false /*strict_capacity_limit*/, FLAGS_cache_high_pri_pool_ratio);
+      }
     }
   }
 
@@ -3262,10 +3287,9 @@ class Benchmark {
       fprintf(stdout, "STATISTICS:\n%s\n", dbstats->ToString().c_str());
     }
     if (FLAGS_simcache_size >= 0) {
-      fprintf(stdout, "SIMULATOR CACHE STATISTICS:\n%s\n",
-              static_cast_with_check<SimCache, Cache>(cache_.get())
-                  ->ToString()
-                  .c_str());
+      fprintf(
+          stdout, "SIMULATOR CACHE STATISTICS:\n%s\n",
+          static_cast_with_check<SimCache>(cache_.get())->ToString().c_str());
     }
 
 #ifndef ROCKSDB_LITE
@@ -4006,6 +4030,8 @@ class Benchmark {
     options.compression_opts.max_dict_bytes = FLAGS_compression_max_dict_bytes;
     options.compression_opts.zstd_max_train_bytes =
         FLAGS_compression_zstd_max_train_bytes;
+    options.compression_opts.parallel_threads =
+        FLAGS_compression_parallel_threads;
     // If this is a block based table, set some related options
     if (options.table_factory->Name() == BlockBasedTableFactory::kName &&
         options.table_factory->GetOptions() != nullptr) {
@@ -4287,9 +4313,8 @@ class Benchmark {
         for (uint64_t i = 0; i < num_; ++i) {
           values_[i] = i;
         }
-        std::shuffle(
-            values_.begin(), values_.end(),
-            std::default_random_engine(static_cast<unsigned int>(FLAGS_seed)));
+        RandomShuffle(values_.begin(), values_.end(),
+                      static_cast<uint32_t>(FLAGS_seed));
       }
     }
 
@@ -5034,7 +5059,7 @@ class Benchmark {
     int64_t found = 0;
     int64_t bytes = 0;
     int num_keys = 0;
-    int64_t key_rand = GetRandomKey(&thread->rand);
+    int64_t key_rand = 0;
     ReadOptions options(FLAGS_verify_checksum, true);
     std::unique_ptr<const char[]> key_guard;
     Slice key = AllocateKey(&key_guard);
@@ -5046,7 +5071,6 @@ class Benchmark {
       // We use same key_rand as seed for key and column family so that we can
       // deterministically find the cfh corresponding to a particular key, as it
       // is done in DoWrite method.
-      GenerateKeyFromInt(key_rand, FLAGS_num, &key);
       if (entries_per_batch_ > 1 && FLAGS_multiread_stride) {
         if (++num_keys == entries_per_batch_) {
           num_keys = 0;
@@ -5061,6 +5085,7 @@ class Benchmark {
       } else {
         key_rand = GetRandomKey(&thread->rand);
       }
+      GenerateKeyFromInt(key_rand, FLAGS_num, &key);
       read++;
       Status s;
       if (FLAGS_num_column_families > 1) {
@@ -5390,13 +5415,15 @@ class Benchmark {
 
       // Select one key in the key-range and compose the keyID
       int64_t key_offset = 0, key_seed;
-      if (key_dist_a == 0.0 && key_dist_b == 0.0) {
+      if (key_dist_a == 0.0 || key_dist_b == 0.0) {
         key_offset = ini_rand % keyrange_size_;
       } else {
+        double u =
+            static_cast<double>(ini_rand % keyrange_size_) / keyrange_size_;
         key_seed = static_cast<int64_t>(
-            ceil(std::pow((ini_rand / key_dist_a), (1 / key_dist_b))));
+            ceil(std::pow((u / key_dist_a), (1 / key_dist_b))));
         Random64 rand_key(key_seed);
-        key_offset = static_cast<int64_t>(rand_key.Next()) % keyrange_size_;
+        key_offset = rand_key.Next() % keyrange_size_;
       }
       return keyrange_size_ * keyrange_id + key_offset;
     }
@@ -5423,6 +5450,7 @@ class Benchmark {
     double write_rate = 1000000.0;
     double read_rate = 1000000.0;
     bool use_prefix_modeling = false;
+    bool use_random_modeling = false;
     GenerateTwoTermExpKeys gen_exp;
     std::vector<double> ratio{FLAGS_mix_get_ratio, FLAGS_mix_put_ratio,
                               FLAGS_mix_seek_ratio};
@@ -5457,6 +5485,9 @@ class Benchmark {
           FLAGS_num, FLAGS_keyrange_dist_a, FLAGS_keyrange_dist_b,
           FLAGS_keyrange_dist_c, FLAGS_keyrange_dist_d);
     }
+    if (FLAGS_key_dist_a == 0 || FLAGS_key_dist_b == 0) {
+      use_random_modeling = true;
+    }
 
     Duration duration(FLAGS_duration, reads_);
     while (!duration.Done(1)) {
@@ -5467,7 +5498,9 @@ class Benchmark {
       double u = static_cast<double>(rand_v) / FLAGS_num;
 
       // Generate the keyID based on the key hotness and prefix hotness
-      if (use_prefix_modeling) {
+      if (use_random_modeling) {
+        key_rand = ini_rand;
+      } else if (use_prefix_modeling) {
         key_rand =
             gen_exp.DistGetKeyID(ini_rand, FLAGS_key_dist_a, FLAGS_key_dist_b);
       } else {

@@ -23,6 +23,7 @@
 #include "memory/memory_usage.h"
 #include "monitoring/perf_context_imp.h"
 #include "monitoring/statistics.h"
+#include "port/lang.h"
 #include "port/port.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/env.h"
@@ -36,7 +37,6 @@
 #include "util/autovector.h"
 #include "util/coding.h"
 #include "util/mutexlock.h"
-#include "util/util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -919,9 +919,9 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
           range_del_iter->MaxCoveringTombstoneSeqnum(iter->lkey->user_key()));
     }
     GetFromTable(*(iter->lkey), iter->max_covering_tombstone_seq, true,
-                 callback, is_blob, iter->value->GetSelf(),
-                 /*timestamp=*/nullptr, iter->s, &(iter->merge_context), &seq,
-                 &found_final_value, &merge_in_progress);
+                 callback, is_blob, iter->value->GetSelf(), iter->timestamp,
+                 iter->s, &(iter->merge_context), &seq, &found_final_value,
+                 &merge_in_progress);
 
     if (!found_final_value && merge_in_progress) {
       *(iter->s) = Status::MergeInProgress();
@@ -929,8 +929,18 @@ void MemTable::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
 
     if (found_final_value) {
       iter->value->PinSelf();
+      range->AddValueSize(iter->value->size());
       range->MarkKeyDone(iter);
       RecordTick(moptions_.statistics, MEMTABLE_HIT);
+      if (range->GetValueSize() > read_options.value_size_soft_limit) {
+        // Set all remaining keys in range to Abort
+        for (auto range_iter = range->begin(); range_iter != range->end();
+             ++range_iter) {
+          range->MarkKeyDone(range_iter);
+          *(range_iter->s) = Status::Aborted();
+        }
+        break;
+      }
     }
   }
   PERF_COUNTER_ADD(get_from_memtable_count, 1);
