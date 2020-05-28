@@ -12,6 +12,7 @@
 
 #include "rocksdb/filter_policy.h"
 
+#include "port/lang.h"
 #include "rocksdb/slice.h"
 #include "table/block_based/block_based_filter_block.h"
 #include "table/block_based/full_filter_block.h"
@@ -21,7 +22,6 @@
 #include "util/coding.h"
 #include "util/hash.h"
 #include "util/math.h"
-#include "util/util.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -861,6 +861,7 @@ struct SimpleGaussFilter {
                            static_cast<double>(total_blocks);
     double lower_portion = static_cast<double>(first_block_upper) /
                            static_cast<double>(total_blocks);
+    //printf("%g %g  %g %g\n", upper_fp_rate, lower_fp_rate, upper_portion, lower_portion);
     return upper_portion * upper_fp_rate + lower_portion * lower_fp_rate;
   }
 };

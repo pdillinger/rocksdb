@@ -419,9 +419,17 @@ void FilterBench::Go() {
   double bpk = total_memory_used * 8.0 / total_keys_added;
   std::cout << "Bits/key actual: " << bpk << std::endl;
 #ifdef PREDICT_FP_RATE
-  std::cout << "Predicted FP rate %: "
-            << 100.0 * (weighted_predicted_fp_rate / total_keys_added)
-            << std::endl;
+  {
+    double predicted_rate = weighted_predicted_fp_rate / total_keys_added;
+    std::cout << "Predicted FP rate %: "
+              << (100.0 * predicted_rate)
+              << std::endl;
+    if (!FLAGS_quick) {
+      double predicted_ideal_bpk = -std::log(predicted_rate) / std::log(2.0);
+      std::cout << " Predicted memory overhead factor: " << (bpk / predicted_ideal_bpk) << std::endl;
+      std::cout << " Predicted memory overhead bits/key: " << (bpk - predicted_ideal_bpk) << std::endl;
+    }
+  }
 #endif
   if (!FLAGS_quick && !FLAGS_best_case) {
     double tolerable_rate = std::pow(2.0, -(bpk - 1.0) / (1.4 + bpk / 50.0));
@@ -460,6 +468,9 @@ void FilterBench::Go() {
     std::cout << " No FNs :)" << std::endl;
     double prelim_rate = double(fps) / outside_q_per_f / infos_.size();
     std::cout << " Prelim FP rate %: " << (100.0 * prelim_rate) << std::endl;
+    double prelim_ideal_bpk = -std::log(prelim_rate) / std::log(2.0);
+    std::cout << "  Prelim memory overhead factor: " << (bpk / prelim_ideal_bpk) << std::endl;
+    std::cout << "  Prelim memory overhead bits/key: " << (bpk - prelim_ideal_bpk) << std::endl;
 
     if (!FLAGS_allow_bad_fp_rate) {
       ALWAYS_ASSERT(prelim_rate < tolerable_rate);
