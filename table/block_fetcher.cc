@@ -59,10 +59,64 @@ inline void BlockFetcher::CheckBlockChecksum() {
             " size " + ToString(block_size_));
     }
     if (status_.ok() && actual != value) {
+      std::string possible_bit_flips;
+      // Find bit flips
+      char* mdata = const_cast<char *>(data);
+      for (size_t i = 0; i < block_size_ + 5; ++i) {
+        for (int j = 0; j < 256; ++j) {
+          char from = mdata[i];
+          char to = static_cast<char>(j);
+          if (from == to) {
+            continue;
+          }
+          mdata[i] = to;
+
+          uint32_t value2 = DecodeFixed32(data + block_size_ + 1);
+          uint32_t actual2 = 0;
+          switch (footer_.checksum()) {
+            case kNoChecksum:
+              break;
+            case kCRC32c:
+              value2 = crc32c::Unmask(value2);
+              actual2 = crc32c::Value(data, block_size_ + 1);
+              break;
+            case kxxHash:
+              actual2 = XXH32(data, static_cast<int>(block_size_) + 1, 0);
+              break;
+            case kxxHash64:
+              actual2 = static_cast<uint32_t>(
+                  XXH64(data, static_cast<int>(block_size_) + 1, 0) &
+                  uint64_t{0xffffffff});
+              break;
+            default:
+              actual2 = value2 + 1;
+              break;
+          }
+          if (actual2 == value2) {
+            const char *hex = "0123456789ABCDEF";
+            // avoid sign extension from signed char
+            if (__builtin_popcount((from & 255) ^ (to & 255)) == 1) {
+              possible_bit_flips += "; possible bit flip from 0x";
+            } else {
+              possible_bit_flips += "; possible byte change from 0x";
+            }
+            possible_bit_flips.append(1, hex[(from >> 4) & 15]);
+            possible_bit_flips.append(1, hex[from & 15]);
+            possible_bit_flips += " to 0x";
+            possible_bit_flips.append(1, hex[(to >> 4) & 15]);
+            possible_bit_flips.append(1, hex[to & 15]);
+            possible_bit_flips += " at file offset ";
+            possible_bit_flips += ToString(handle_.offset() + i);
+          }
+          mdata[i] = from;
+        }
+      }
+
       status_ = Status::Corruption(
           "block checksum mismatch: expected " + ToString(actual) + ", got " +
           ToString(value) + "  in " + file_->file_name() + " offset " +
-          ToString(handle_.offset()) + " size " + ToString(block_size_));
+          ToString(handle_.offset()) + " size " + ToString(block_size_)
+          + possible_bit_flips);
     }
   }
 }
