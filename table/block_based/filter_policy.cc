@@ -198,55 +198,86 @@ class FastLocalBloomBitsReader : public FilterBitsReader {
 };
 
 struct GaussData {
+  constexpr uint32_t group_span = 16;
+  // For higher density at each end
+  constexpr uint32_t extra_groups_each_end = 2;
+  constexpr uint32_t max_group_rows = 32;
+
+  std::vector<std::array<uint64_t, max_group_rows>> coeff_rows_by_group;
+  std::vector<std::array<uint32_t, max_group_rows>> match_rows_by_group;
+  std::vector<uint8_t> occupied_by_group;
+
+  std::vector<uint64_t> coeff_rows_by_pivot;
+  std::vector<uint32_t> match_rows_by_pivot;
+
+  uint32_t num_groups;
+  uint32_t num_output_rows;
+  uint32_t match_row_mask;
+
+  void ResetFor(uint32_t _num_output_rows, uint32_t _match_row_mask) {
+    num_output_rows = _num_output_rows;
+    match_row_mask = _match_row_mask;
+    assert(_num_output_rows % group_span == 0);
+    num_groups = (_num_output_rows - 64 + group_span) / group_span + 2 * extra_groups_each_end;
+    assert(num_groups > 4 * extra_groups_each_end);
+    coeff_rows_by_group.assign(num_groups, std::array<uint64_t, max_group_rows>());
+    match_rows_by_group.assign(num_groups, std::array<uint32_t, max_group_rows>());
+    occupied_by_group.assign(num_groups, 0);
+
+    coeff_rows_by_pivot.assign(_num_output_rows, 0);
+    match_rows_by_pivot.assign(_num_output_rows, 0);
+  }
+
+  inline bool Add(uint64_t h) {
+    uint32_t group = HashToGroup(h, num_groups);
+    size_t within_group = occupied_by_group[group]++;
+    if (within_group >= max_group_rows) {
+      // Overflow -> abort
+      return false;
+    }
+    coeff_rows_by_group[group][within_group] = HashToCoeffRow(h);
+    match_rows_by_group[group][within_group] = HashToMatchRow(h) & match_row_mask;
+  }
+
   // Contents of this row in the coefficient matrix, starting at `start`
   // (rest implicitly 0)
   // Originally based on hash, but updated in gaussian elimination.
-  uint64_t coeff_row = 0;
+  //uint64_t coeff_row = 0;
   // Full contents of (corresponding) this row in the match matrix.
   // Originally based on hash, but updated in gaussian elimination.
-  uint32_t match_row = 0;
+  //uint32_t match_row = 0;
   // The index of the first non-zero column in coeff for this row.
   // Equivalently, the starting index of output rows to be used in
   // query. Based on hash.
-  uint16_t start = 0;
+  //uint16_t start = 0;
   // A row in output, or a column in coeff.
   // Computed during gaussian elimination.
-  uint16_t pivot = 0;
+  //uint16_t pivot = 0;
 
-  // Using 20/20 was found to be most compact in some circumstances, but now
-  // 32/31 (fastest) seems most compact also.
-  static constexpr uint32_t front_smash = 32;
-  static constexpr uint32_t back_smash = 31;
+  static inline uint16_t HashToGroup(uint64_t h, uint32_t num_groups) {
+    return fastrange32(Upper32of64(h), num_groups);
+  }
 
-  static inline uint16_t HashToStart(uint64_t h, uint32_t num_output_rows) {
-    // NB: addrs == num_output_rows with 32/31 setting
-    const uint32_t addrs = num_output_rows - 63 + front_smash + back_smash;
-    uint32_t start = fastrange32(Upper32of64(h), addrs);
-    uint32_t x = front_smash; // FIXME for DEBUG_LEVEL=2
-    start = std::max(start, x);
-    start -= front_smash;
-    start = std::min(start, num_output_rows - 64);
-    assert(start < num_output_rows - 63);
-    assert(start < 0x10000U);
-    return static_cast<uint16_t>(start);
+  static inline uint16_t GroupToStart(uint16_t group, uint32_t num_groups) {
+    uint16_t start = group * group_span;
+    start -= std::min(group, 2 * extra_groups_each_end) * (group_span / 2);
+    start -= static_cast<uint16_t>(std::max(int{0}, int{group + 2 * extra_groups_each_end} - int{num_groups})) * (group_span / 2);
+    return start;
+  }
+
+  static inline uint16_t HashToStart(uint16_t group, uint32_t num_groups) {
+    return GroupToStart(HashToGroup(group, num_groups), num_groups);
   }
 
   static inline uint64_t HashToCoeffRow(uint64_t h) {
     uint64_t row = (h + (h >> 32)) * 0x9e3779b97f4a7c13;
-    row |= uint64_t{1} << 63;
+    //?? row |= uint64_t{1} << 63;
     return row;
   }
 
   static inline uint32_t HashToMatchRow(uint64_t h) {
     // NB: just h seems to cause some association affecting FP rate
     return Lower32of64(h ^ (h >> 13) ^ (h >> 26));
-  }
-
-  inline void Reset(uint64_t h, uint32_t num_output_rows, uint32_t match_row_mask) {
-    start = HashToStart(h, num_output_rows);
-    coeff_row = HashToCoeffRow(h);
-    match_row = HashToMatchRow(h) & match_row_mask;
-    pivot = 0;
   }
 
   // FIXME: better way?
@@ -433,9 +464,9 @@ struct SimpleGaussFilter {
   inline void GetQueryInfoAndPrefetch(uint32_t shard, uint64_t h, uint32_t *start_bit, uint32_t *match_bits, const uint64_t **word_data) const {
     const size_t begin_block = GetShardBeginBlock(shard);
     const size_t end_block = GetShardBeginBlock(shard + 1);
-    const uint32_t num_output_rows = static_cast<uint32_t>(end_block - begin_block) * 64;
+    const uint32_t num_groups = static_cast<uint32_t>(end_block - begin_block) * (64U / GaussData::group_span);
 
-    const uint32_t start = GaussData::HashToStart(h, num_output_rows);
+    const uint32_t start = GaussData::HashToStart(h, num_groups);
     const size_t start_block = begin_block + start / 64;
     *start_bit = start % 64;
     *match_bits = lower_match_bits + (start_block >= first_block_upper);
@@ -577,47 +608,40 @@ struct SimpleGaussFilter {
     buf->reset(data = new char[bytes]());
   }
 
-  static bool TrySolve(std::vector<GaussData> &gauss, uint32_t num_coeff_rows, uint32_t num_output_rows, const std::vector<uint64_t> &shard_hashes, const std::vector<uint64_t> &bumped_hashes, uint32_t seed, uint32_t last_section, uint32_t match_row_mask) {
-    assert(gauss.size() >= num_coeff_rows);
-    // Build gauss data with seeded hashes
-    uint32_t next_gauss_idx = 0;
+  static bool TrySolve(GaussData &gauss, uint32_t num_coeff_rows, uint32_t num_output_rows, const std::vector<uint64_t> &shard_hashes, const std::vector<uint64_t> &bumped_hashes, uint32_t seed, uint32_t last_section, uint32_t match_row_mask) {
+    gauss.ResetFor(num_output_rows, match_row_mask);
+
     for (uint64_t pre_h : shard_hashes) {
       uint32_t section = GaussData::PreHashToSection(pre_h);
       if (section <= last_section) {
         uint64_t h = GaussData::SeedPreHash(pre_h, seed);
-        GaussData &d = gauss[next_gauss_idx];
-        d.Reset(h, num_output_rows, match_row_mask);
-        assert(d.start < num_output_rows);
-        ++next_gauss_idx;
+        bool added = gauss.Add(h);
+        if (!added) {
+          fprintf("Group overflow\n");
+          return false;
+        }
       }
     }
     // ... except bumped hashes don't get the seed
     for (uint64_t h : bumped_hashes) {
-      GaussData &d = gauss[next_gauss_idx];
-      d.Reset(h, num_output_rows, match_row_mask);
-      assert(d.start < num_output_rows);
-      ++next_gauss_idx;
+      bool added = gauss.Add(h);
+      if (!added) {
+        fprintf("Group overflow\n");
+        return false;
+      }
     }
-    assert(next_gauss_idx == num_coeff_rows);
-    // Sort based on start positions
-    std::sort(gauss.begin(), gauss.begin() + num_coeff_rows, GaussData::CompareByStart);
     // Now "simple" gaussian elimination
-    for (uint32_t i = 0; i < num_coeff_rows; ++i) {
-      GaussData &di = gauss[i];
-      if (di.coeff_row == 0) {
-        // Might be a total duplicate or lucky coincidence in generating
-        // desired output. For plain (over-approximate) sets, that's just
-        // fine. Pivot of 0 is a safe fake here, because if a real row uses
-        // pivot 0, it has to be the first row and will be back-propagated
-        // last.
-        if (false && di.match_row == 0) { // FIXME: doesn't work; handle duplicates?
-          assert(di.pivot == 0);
-        } else {
+    for (uint32_t i = 0; i < gauss.num_groups; ++i) {
+      uint32_t group_start = GaussData::GroupToStart(i, gauss.num_groups);
+      for (uint32_t j = 0; j < gauss.occupied_by_group[i]; ++j) {
+        uint64_t coeff_row = gauss.coeff_rows_by_group[i][j];
+        if (UNLIKELY(coeff_row == 0)) {
           // Attempt failed
           return false;
         }
+        // IAMHERE
       }
-      int tz = CountTrailingZeroBits(di.coeff_row);
+      int tz = CountTrailingZeroBits(coeff_row);
       di.pivot = di.start + tz;
       for (uint32_t j = i + 1; j < num_coeff_rows; ++j) {
         GaussData &dj = gauss[j];
@@ -712,8 +736,7 @@ struct SimpleGaussFilter {
 
     char *shard_metadata = GetShardMetaDataStart();
 
-    std::vector<GaussData> gauss;
-    gauss.resize(avg_shard_slots + 63);
+    GaussData gauss;
 
     uint32_t match_row_mask = (uint32_t{1} << 1 << lower_match_bits) - 1;
 
