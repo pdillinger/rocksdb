@@ -670,12 +670,22 @@ bool BlockIter<TValue>::BinarySeek(const Slice& target, uint32_t left,
                                    const Comparator* comp) {
   assert(left <= right);
 
-  while (left < right) {
-    uint32_t mid = (left + right + 1) / 2;
-    uint32_t region_offset = GetRestartPoint(mid);
+  uint32_t mid = (left + right + 1) / 2;
+  const char* data_at_region = data_ + GetRestartPoint(mid);
+  PREFETCH(data_at_region, 0 /* rw */, 1 /* locality */);
+
+  while (left + 1 < right) {
+    // Prefetch for possible next iteration
+    uint32_t left_mid = (/*next left*/ mid + right + 1) / 2;
+    const char* left_data_at_region = data_ + GetRestartPoint(left_mid);
+    PREFETCH(left_data_at_region, 0 /* rw */, 1 /* locality */);
+    uint32_t right_mid = (left + /*next right + 1*/ mid) / 2;
+    const char* right_data_at_region = data_ + GetRestartPoint(right_mid);
+    PREFETCH(right_data_at_region, 0 /* rw */, 1 /* locality */);
+
     uint32_t shared, non_shared;
-    const char* key_ptr = DecodeKeyFunc()(
-        data_ + region_offset, data_ + restarts_, &shared, &non_shared);
+    const char* key_ptr = DecodeKeyFunc()(data_at_region, data_ + restarts_,
+                                          &shared, &non_shared);
     if (key_ptr == nullptr || (shared != 0)) {
       CorruptionError();
       return false;
@@ -687,15 +697,34 @@ bool BlockIter<TValue>::BinarySeek(const Slice& target, uint32_t left,
       // Key at "mid" is smaller than "target". Therefore all
       // blocks before "mid" are uninteresting.
       left = mid;
+      mid = left_mid;
+      data_at_region = left_data_at_region;
     } else if (cmp > 0) {
       // Key at "mid" is >= "target". Therefore all blocks at or
       // after "mid" are uninteresting.
       right = mid - 1;
+      mid = right_mid;
+      data_at_region = right_data_at_region;
     } else {
-      left = right = mid;
+      *index = mid;
+      return true;
     }
   }
-
+  if (left < right) {
+    uint32_t shared, non_shared;
+    const char* key_ptr = DecodeKeyFunc()(data_at_region, data_ + restarts_,
+                                          &shared, &non_shared);
+    if (key_ptr == nullptr || (shared != 0)) {
+      CorruptionError();
+      return false;
+    }
+    Slice mid_key(key_ptr, non_shared);
+    raw_key_.SetKey(mid_key, false /* copy */);
+    int cmp = comp->Compare(applied_key_.UpdateAndGetKey(), target);
+    if (cmp <= 0) {
+      left = mid;
+    }
+  }
   *index = left;
   return true;
 }
