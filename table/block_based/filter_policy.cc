@@ -577,8 +577,10 @@ struct SimpleGaussFilter {
     buf->reset(data = new char[bytes]());
   }
 
+  static constexpr uint32_t max_jump = 16;
+
   static bool TrySolve(std::vector<GaussData> &gauss, uint32_t num_coeff_rows, uint32_t num_output_rows, const std::vector<uint64_t> &shard_hashes, const std::vector<uint64_t> &bumped_hashes, uint32_t seed, uint32_t last_section, uint32_t match_row_mask) {
-    assert(gauss.size() >= num_coeff_rows);
+    assert(gauss.size() >= num_coeff_rows + max_jump);
     // Build gauss data with seeded hashes
     uint32_t next_gauss_idx = 0;
     for (uint64_t pre_h : shard_hashes) {
@@ -599,6 +601,14 @@ struct SimpleGaussFilter {
       ++next_gauss_idx;
     }
     assert(next_gauss_idx == num_coeff_rows);
+    for (; next_gauss_idx < num_coeff_rows + max_jump; ++next_gauss_idx) {
+      // stop condition in the padding
+      GaussData &d = gauss[next_gauss_idx];
+      d.coeff_row = 0;
+      d.match_row = 0;
+      d.start = uint16_t{0} - 1;
+      d.pivot = 0;
+    }
     // Sort based on start positions
     std::sort(gauss.begin(), gauss.begin() + num_coeff_rows, GaussData::CompareByStart);
     // Now "simple" gaussian elimination
@@ -619,16 +629,49 @@ struct SimpleGaussFilter {
       }
       int tz = CountTrailingZeroBits(di.coeff_row);
       di.pivot = di.start + tz;
-      for (uint32_t j = i + 1; j < num_coeff_rows; ++j) {
+      uint32_t j = i + 1;
+      /*
+      for (;; j += max_jump) {
+        GaussData &djump = gauss[j + max_jump - 1];
+        if (di.pivot < djump.start) {
+          break;
+        }
+        for (uint32_t k = 0; k < max_jump; ++k) {
+          GaussData &dj = gauss[j + k];
+          uint64_t mask = uint64_t{0} - ((dj.coeff_row >> (di.pivot - dj.start)) & 1);
+          dj.coeff_row ^= mask & (di.coeff_row >> (dj.start - di.start));
+          dj.match_row ^= static_cast<uint32_t>(mask) & di.match_row;
+        }
+      }
+      for (;; j += max_jump / 4) {
+        GaussData &djump = gauss[j + (max_jump / 4) - 1];
+        if (di.pivot < djump.start) {
+          break;
+        }
+        for (uint32_t k = 0; k < (max_jump / 4); ++k) {
+          GaussData &dj = gauss[j + k];
+          uint64_t mask = uint64_t{0} - ((dj.coeff_row >> (di.pivot - dj.start)) & 1);
+          dj.coeff_row ^= mask & (di.coeff_row >> (dj.start - di.start));
+          dj.match_row ^= static_cast<uint32_t>(mask) & di.match_row;
+        }
+      }
+      */
+      for (;; ++j) {
         GaussData &dj = gauss[j];
-        assert(dj.start >= di.start);
+        //assert(dj.start >= di.start);
+        // Might hit stop condition in padding
         if (di.pivot < dj.start) {
           break;
         }
+        uint64_t mask = uint64_t{0} - ((dj.coeff_row >> (di.pivot - dj.start)) & 1);
+        dj.coeff_row ^= mask & (di.coeff_row >> (dj.start - di.start));
+        dj.match_row ^= static_cast<uint32_t>(mask) & di.match_row;
+        /*
         if ((dj.coeff_row >> (di.pivot - dj.start)) & 1) {
           dj.coeff_row ^= (di.coeff_row >> (dj.start - di.start));
           dj.match_row ^= di.match_row;
         }
+        */
       }
     }
     // Success
@@ -713,7 +756,7 @@ struct SimpleGaussFilter {
     char *shard_metadata = GetShardMetaDataStart();
 
     std::vector<GaussData> gauss;
-    gauss.resize(avg_shard_slots + 63);
+    gauss.resize(avg_shard_slots + 63 + max_jump);
 
     uint32_t match_row_mask = (uint32_t{1} << 1 << lower_match_bits) - 1;
 
