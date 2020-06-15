@@ -367,12 +367,13 @@ std::unordered_map<std::string, OptionTypeInfo>
           OptionTypeFlags::kMutable,
           offsetof(struct MutableCFOptions, max_bytes_for_level_multiplier)}},
         {"max_bytes_for_level_multiplier_additional",
-         {offset_of(
-              &ColumnFamilyOptions::max_bytes_for_level_multiplier_additional),
-          OptionType::kVectorInt, OptionVerificationType::kNormal,
-          OptionTypeFlags::kMutable,
-          offsetof(struct MutableCFOptions,
-                   max_bytes_for_level_multiplier_additional)}},
+         OptionTypeInfo::Vector<int>(
+             offset_of(&ColumnFamilyOptions::
+                           max_bytes_for_level_multiplier_additional),
+             OptionVerificationType::kNormal, OptionTypeFlags::kMutable,
+             offsetof(struct MutableCFOptions,
+                      max_bytes_for_level_multiplier_additional),
+             {0, OptionType::kInt, 0})},
         {"max_sequential_skip_in_iterations",
          {offset_of(&ColumnFamilyOptions::max_sequential_skip_in_iterations),
           OptionType::kUInt64T, OptionVerificationType::kNormal,
@@ -393,9 +394,10 @@ std::unordered_map<std::string, OptionTypeInfo>
           OptionTypeFlags::kMutable,
           offsetof(struct MutableCFOptions, compression)}},
         {"compression_per_level",
-         {offset_of(&ColumnFamilyOptions::compression_per_level),
-          OptionType::kVectorCompressionType, OptionVerificationType::kNormal,
-          OptionTypeFlags::kNone, 0}},
+         OptionTypeInfo::Vector<CompressionType>(
+             offset_of(&ColumnFamilyOptions::compression_per_level),
+             OptionVerificationType::kNormal, OptionTypeFlags::kNone, 0,
+             {0, OptionType::kCompressionType})},
         {"bottommost_compression",
          {offset_of(&ColumnFamilyOptions::bottommost_compression),
           OptionType::kCompressionType, OptionVerificationType::kNormal,
@@ -716,6 +718,17 @@ uint64_t MaxFileSizeForLevel(const MutableCFOptions& cf_options,
     assert(level - base_level < (int)cf_options.max_file_size.size());
     return cf_options.max_file_size[level - base_level];
   }
+}
+
+size_t MaxFileSizeForL0MetaPin(const MutableCFOptions& cf_options) {
+  // We do not want to pin meta-blocks that almost certainly came from intra-L0
+  // or a former larger `write_buffer_size` value to avoid surprising users with
+  // pinned memory usage. We use a factor of 1.5 to account for overhead
+  // introduced during flush in most cases.
+  if (port::kMaxSizet / 3 < cf_options.write_buffer_size / 2) {
+    return port::kMaxSizet;
+  }
+  return cf_options.write_buffer_size / 2 * 3;
 }
 
 void MutableCFOptions::RefreshDerivedOptions(int num_levels,

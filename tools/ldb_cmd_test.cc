@@ -41,6 +41,18 @@ class LdbCmdTest : public testing::Test {
   std::shared_ptr<Env> env_guard_;
 };
 
+TEST_F(LdbCmdTest, HelpAndVersion) {
+  Options o;
+  o.env = TryLoadCustomOrDefaultEnv();
+  LDBOptions lo;
+  static const char* help[] = {"./ldb", "--help"};
+  ASSERT_EQ(0, LDBCommandRunner::RunCommand(2, help, o, lo, nullptr));
+  static const char* version[] = {"./ldb", "--version"};
+  ASSERT_EQ(0, LDBCommandRunner::RunCommand(2, version, o, lo, nullptr));
+  static const char* bad[] = {"./ldb", "--not_an_option"};
+  ASSERT_NE(0, LDBCommandRunner::RunCommand(2, bad, o, lo, nullptr));
+}
+
 TEST_F(LdbCmdTest, HexToString) {
   // map input to expected outputs.
   // odd number of "hex" half bytes doesn't make sense
@@ -642,6 +654,29 @@ TEST_F(LdbCmdTest, DisableConsistencyChecks) {
     SyncPoint::GetInstance()->ClearAllCallBacks();
     SyncPoint::GetInstance()->DisableProcessing();
   }
+}
+
+TEST_F(LdbCmdTest, TestBadDbPath) {
+  Env* base_env = TryLoadCustomOrDefaultEnv();
+  std::unique_ptr<Env> env(NewMemEnv(base_env));
+  Options opts;
+  opts.env = env.get();
+  opts.create_if_missing = true;
+
+  std::string dbname = test::TmpDir();
+  char arg1[] = "./ldb";
+  char arg2[1024];
+  snprintf(arg2, sizeof(arg2), "--db=%s/.no_such_dir", dbname.c_str());
+  char arg3[1024];
+  snprintf(arg3, sizeof(arg3), "create_column_family");
+  char arg4[] = "bad cf";
+  char* argv[] = {arg1, arg2, arg3, arg4};
+
+  ASSERT_EQ(1,
+            LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), nullptr));
+  snprintf(arg3, sizeof(arg3), "drop_column_family");
+  ASSERT_EQ(1,
+            LDBCommandRunner::RunCommand(4, argv, opts, LDBOptions(), nullptr));
 }
 }  // namespace ROCKSDB_NAMESPACE
 

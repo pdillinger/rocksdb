@@ -365,6 +365,7 @@ class FilePickerMultiGet {
         range_(range),
         batch_iter_(range->begin()),
         batch_iter_prev_(range->begin()),
+        upper_key_(range->begin()),
         maybe_repeat_key_(false),
         current_level_range_(*range, range->begin(), range->end()),
         current_file_range_(*range, range->begin(), range->end()),
@@ -481,9 +482,19 @@ class FilePickerMultiGet {
       }
       if (cmp_largest == 0) {
         // cmp_largest is 0, which means the next key will not be in this
-        // file, so stop looking further. Also don't increment megt_iter_
-        // as we may have to look for this key in the next file if we don't
-        // find it in this one
+        // file, so stop looking further. However, its possible there are
+        // duplicates in the batch, so find the upper bound for the batch
+        // in this file (upper_key_) by skipping past the duplicates. We
+        // leave batch_iter_ as is since we may have to pick up from there
+        // for the next file, if this file has a merge value rather than
+        // final value
+        upper_key_ = batch_iter_;
+        ++upper_key_;
+        while (upper_key_ != current_level_range_.end() &&
+               user_comparator_->Compare(batch_iter_->ukey, upper_key_->ukey) ==
+                   0) {
+          ++upper_key_;
+        }
         break;
       } else {
         if (curr_level_ == 0) {
@@ -503,6 +514,12 @@ class FilePickerMultiGet {
     *fd = f;
     *file_index = curr_file_index;
     *is_last_key_in_file = cmp_largest == 0;
+    if (!*is_last_key_in_file) {
+      // If the largest key in the batch overlapping the file is not the
+      // largest key in the file, upper_ley_ would not have been updated so
+      // update it here
+      upper_key_ = batch_iter_;
+    }
     return file_hit;
   }
 
@@ -524,7 +541,7 @@ class FilePickerMultiGet {
           // file regardless for all keys not found yet
           if (current_level_range_.CheckKeyDone(batch_iter_) ||
               curr_level_ == 0) {
-            ++batch_iter_;
+            batch_iter_ = upper_key_;
           }
         }
         // batch_iter_prev_ will become the start key for the next file
@@ -544,18 +561,20 @@ class FilePickerMultiGet {
                                       &is_last_key_in_file)) {
         search_ended_ = !PrepareNextLevel();
       } else {
-        MultiGetRange::Iterator upper_key = batch_iter_;
         if (is_last_key_in_file) {
           // Since cmp_largest is 0, batch_iter_ still points to the last key
           // that falls in this file, instead of the next one. Increment
-          // upper_key so we can set the range properly for SST MultiGet
-          ++upper_key;
-          ++(fp_ctx_array_[batch_iter_.index()].curr_index_in_curr_level);
+          // the file index for all keys between batch_iter_ and upper_key_
+          auto tmp_iter = batch_iter_;
+          while (tmp_iter != upper_key_) {
+            ++(fp_ctx_array_[tmp_iter.index()].curr_index_in_curr_level);
+            ++tmp_iter;
+          }
           maybe_repeat_key_ = true;
         }
         // Set the range for this file
         current_file_range_ =
-            MultiGetRange(next_file_range, batch_iter_prev_, upper_key);
+            MultiGetRange(next_file_range, batch_iter_prev_, upper_key_);
         returned_file_level_ = curr_level_;
         hit_file_level_ = curr_level_;
         is_hit_file_last_in_level_ =
@@ -607,6 +626,7 @@ class FilePickerMultiGet {
   // key found in the previous SST file, in order to serve as the start of
   // the batch key range for the next SST file
   MultiGetRange::Iterator batch_iter_prev_;
+  MultiGetRange::Iterator upper_key_;
   bool maybe_repeat_key_;
   MultiGetRange current_level_range_;
   MultiGetRange current_file_range_;
@@ -626,7 +646,7 @@ class FilePickerMultiGet {
       if (fp_ctx_array_[mget_iter.index()].curr_index_in_curr_level <
           curr_file_level_->num_files) {
         batch_iter_prev_ = current_level_range_.begin();
-        batch_iter_ = current_level_range_.begin();
+        upper_key_ = batch_iter_ = current_level_range_.begin();
         return true;
       }
     }
@@ -721,7 +741,7 @@ class FilePickerMultiGet {
       }
       if (level_contains_keys) {
         batch_iter_prev_ = current_level_range_.begin();
-        batch_iter_ = current_level_range_.begin();
+        upper_key_ = batch_iter_ = current_level_range_.begin();
         return true;
       }
       curr_level_++;
@@ -984,7 +1004,8 @@ class LevelIterator final : public InternalIterator {
         read_options_, file_options_, icomparator_, *file_meta.file_metadata,
         range_del_agg_, prefix_extractor_,
         nullptr /* don't need reference to table */, file_read_hist_, caller_,
-        /*arena=*/nullptr, skip_filters_, level_, smallest_compaction_key,
+        /*arena=*/nullptr, skip_filters_, level_,
+        /*max_file_size_for_l0_meta_pin=*/0, smallest_compaction_key,
         largest_compaction_key, allow_unprepared_value_);
   }
 
@@ -1579,10 +1600,9 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
           mutable_cf_options_.prefix_extractor.get(), nullptr,
           cfd_->internal_stats()->GetFileReadHist(0),
           TableReaderCaller::kUserIterator, arena,
-          /*skip_filters=*/false, /*level=*/0,
+          /*skip_filters=*/false, /*level=*/0, max_file_size_for_l0_meta_pin_,
           /*smallest_compaction_key=*/nullptr,
-          /*largest_compaction_key=*/nullptr,
-          allow_unprepared_value));
+          /*largest_compaction_key=*/nullptr, allow_unprepared_value));
     }
     if (should_sample) {
       // Count ones for every L0 files. This is done per iterator creation
@@ -1604,8 +1624,8 @@ void Version::AddIteratorsForLevel(const ReadOptions& read_options,
         mutable_cf_options_.prefix_extractor.get(), should_sample_file_read(),
         cfd_->internal_stats()->GetFileReadHist(level),
         TableReaderCaller::kUserIterator, IsFilterSkipped(level), level,
-        range_del_agg, /*largest_compaction_key=*/nullptr,
-        allow_unprepared_value));
+        range_del_agg,
+        /*compaction_boundaries=*/nullptr, allow_unprepared_value));
   }
 }
 
@@ -1639,7 +1659,7 @@ Status Version::OverlapWithLevelIterator(const ReadOptions& read_options,
           mutable_cf_options_.prefix_extractor.get(), nullptr,
           cfd_->internal_stats()->GetFileReadHist(0),
           TableReaderCaller::kUserIterator, &arena,
-          /*skip_filters=*/false, /*level=*/0,
+          /*skip_filters=*/false, /*level=*/0, max_file_size_for_l0_meta_pin_,
           /*smallest_compaction_key=*/nullptr,
           /*largest_compaction_key=*/nullptr,
           /*allow_unprepared_value=*/false));
@@ -1743,6 +1763,8 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
       refs_(0),
       file_options_(file_opt),
       mutable_cf_options_(mutable_cf_options),
+      max_file_size_for_l0_meta_pin_(
+          MaxFileSizeForL0MetaPin(mutable_cf_options_)),
       version_number_(version_number) {}
 
 void Version::Get(const ReadOptions& read_options, const LookupKey& k,
@@ -1806,11 +1828,11 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
         cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
         IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
                         fp.IsHitFileLastInLevel()),
-        fp.GetCurrentLevel());
+        fp.GetHitFileLevel(), max_file_size_for_l0_meta_pin_);
     // TODO: examine the behavior for corrupted key
     if (timer_enabled) {
       PERF_COUNTER_BY_LEVEL_ADD(get_from_table_nanos, timer.ElapsedNanos(),
-                                fp.GetCurrentLevel());
+                                fp.GetHitFileLevel());
     }
     if (!status->ok()) {
       return;
@@ -1946,11 +1968,11 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
         cfd_->internal_stats()->GetFileReadHist(fp.GetHitFileLevel()),
         IsFilterSkipped(static_cast<int>(fp.GetHitFileLevel()),
                         fp.IsHitFileLastInLevel()),
-        fp.GetCurrentLevel());
+        fp.GetHitFileLevel());
     // TODO: examine the behavior for corrupted key
     if (timer_enabled) {
       PERF_COUNTER_BY_LEVEL_ADD(get_from_table_nanos, timer.ElapsedNanos(),
-                                fp.GetCurrentLevel());
+                                fp.GetHitFileLevel());
     }
     if (!s.ok()) {
       // TODO: Set status for individual keys appropriately
@@ -2636,6 +2658,12 @@ void VersionStorageInfo::AddFile(int level, FileMetaData* f, Logger* info_log) {
 #endif
   f->refs++;
   level_files->push_back(f);
+
+  const uint64_t file_number = f->fd.GetNumber();
+
+  assert(file_locations_.find(file_number) == file_locations_.end());
+  file_locations_.emplace(file_number,
+                          FileLocation(level, level_files->size() - 1));
 }
 
 void VersionStorageInfo::AddBlobFile(
@@ -3896,7 +3924,8 @@ Status VersionSet::ProcessManifestWrites(
             cfd->internal_stats(), 1 /* max_threads */,
             true /* prefetch_index_and_filter_in_cache */,
             false /* is_initial_load */,
-            mutable_cf_options_ptrs[i]->prefix_extractor.get());
+            mutable_cf_options_ptrs[i]->prefix_extractor.get(),
+            MaxFileSizeForL0MetaPin(*mutable_cf_options_ptrs[i]));
         if (!s.ok()) {
           if (db_options_->paranoid_checks) {
             break;
@@ -4623,7 +4652,8 @@ Status VersionSet::Recover(
           cfd->internal_stats(), db_options_->max_file_opening_threads,
           false /* prefetch_index_and_filter_in_cache */,
           true /* is_initial_load */,
-          cfd->GetLatestMutableCFOptions()->prefix_extractor.get());
+          cfd->GetLatestMutableCFOptions()->prefix_extractor.get(),
+          MaxFileSizeForL0MetaPin(*cfd->GetLatestMutableCFOptions()));
       if (!s.ok()) {
         if (db_options_->paranoid_checks) {
           return s;
@@ -4971,7 +5001,19 @@ Status VersionSet::ReduceNumberOfLevels(const std::string& dbname,
   }
 
   if (first_nonempty_level > 0) {
-    new_files_list[new_levels - 1] = vstorage->LevelFiles(first_nonempty_level);
+    auto& new_last_level = new_files_list[new_levels - 1];
+
+    new_last_level = vstorage->LevelFiles(first_nonempty_level);
+
+    for (size_t i = 0; i < new_last_level.size(); ++i) {
+      const FileMetaData* const meta = new_last_level[i];
+      assert(meta);
+
+      const uint64_t file_number = meta->fd.GetNumber();
+
+      vstorage->file_locations_[file_number] =
+          VersionStorageInfo::FileLocation(new_levels - 1, i);
+    }
   }
 
   delete[] vstorage -> files_;
@@ -5471,7 +5513,8 @@ uint64_t VersionSet::ApproximateSize(const SizeApproximationOptions& options,
                         static_cast<uint64_t>(total_full_size * margin)) {
     total_full_size += total_intersecting_size / 2;
   } else {
-    // Estimate for all the first files, at each level
+    // Estimate for all the first files (might also be last files), at each
+    // level
     for (const auto file_ptr : first_files) {
       total_full_size += ApproximateSize(v, *file_ptr, start, end, caller);
     }
@@ -5647,13 +5690,14 @@ InternalIterator* VersionSet::MakeInputIterator(
         for (size_t i = 0; i < flevel->num_files; i++) {
           list[num++] = cfd->table_cache()->NewIterator(
               read_options, file_options_compactions,
-              cfd->internal_comparator(),
-              *flevel->files[i].file_metadata, range_del_agg,
-              c->mutable_cf_options()->prefix_extractor.get(),
+              cfd->internal_comparator(), *flevel->files[i].file_metadata,
+              range_del_agg, c->mutable_cf_options()->prefix_extractor.get(),
               /*table_reader_ptr=*/nullptr,
               /*file_read_hist=*/nullptr, TableReaderCaller::kCompaction,
               /*arena=*/nullptr,
-              /*skip_filters=*/false, /*level=*/static_cast<int>(which),
+              /*skip_filters=*/false,
+              /*level=*/static_cast<int>(c->level(which)),
+              MaxFileSizeForL0MetaPin(*c->mutable_cf_options()),
               /*smallest_compaction_key=*/nullptr,
               /*largest_compaction_key=*/nullptr,
               /*allow_unprepared_value=*/false);
@@ -5667,7 +5711,7 @@ InternalIterator* VersionSet::MakeInputIterator(
             /*should_sample=*/false,
             /*no per level latency histogram=*/nullptr,
             TableReaderCaller::kCompaction, /*skip_filters=*/false,
-            /*level=*/static_cast<int>(which), range_del_agg,
+            /*level=*/static_cast<int>(c->level(which)), range_del_agg,
             c->boundaries(which));
       }
     }
@@ -5984,7 +6028,8 @@ Status ReactiveVersionSet::Recover(
                 cfd->internal_stats(), db_options_->max_file_opening_threads,
                 false /* prefetch_index_and_filter_in_cache */,
                 true /* is_initial_load */,
-                cfd->GetLatestMutableCFOptions()->prefix_extractor.get());
+                cfd->GetLatestMutableCFOptions()->prefix_extractor.get(),
+                MaxFileSizeForL0MetaPin(*cfd->GetLatestMutableCFOptions()));
             if (!s.ok()) {
               enough = false;
               if (s.IsPathNotFound()) {
@@ -6260,7 +6305,8 @@ Status ReactiveVersionSet::ApplyOneVersionEditToBuilder(
         cfd->internal_stats(), db_options_->max_file_opening_threads,
         false /* prefetch_index_and_filter_in_cache */,
         false /* is_initial_load */,
-        cfd->GetLatestMutableCFOptions()->prefix_extractor.get());
+        cfd->GetLatestMutableCFOptions()->prefix_extractor.get(),
+        MaxFileSizeForL0MetaPin(*cfd->GetLatestMutableCFOptions()));
     TEST_SYNC_POINT_CALLBACK(
         "ReactiveVersionSet::ApplyOneVersionEditToBuilder:"
         "AfterLoadTableHandlers",
