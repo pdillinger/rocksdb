@@ -583,10 +583,11 @@ struct SimpleGaussFilter {
   //   avg_shard_slots
   void CalculatePreferredSharding(size_t keys) {
     size_t total_slots = static_cast<size_t>(1.004 * keys + 0.5);
-    // Make it a multiple of 64
+    // Make it a multiple of 64 by rounding up
     total_slots = (total_slots + 63) & ~size_t{63};
     // Find power of two number of shards that gets average slots per shard
     // closest to ~1000
+    // TODO: more generous for 1 shard overall
     this->log2_shards = 0;
     while (log2_shards + 1 < 32 && (total_slots >> log2_shards) > 1414U) {
         ++log2_shards;
@@ -623,11 +624,24 @@ struct SimpleGaussFilter {
 
   static constexpr uint32_t max_jump = 16;
 
-  static bool TrySolve(GaussData &gauss, uint32_t num_output_rows, const std::vector<uint64_t> &shard_hashes, const std::vector<uint64_t> &bumped_hashes, uint32_t seed, uint32_t last_section, uint32_t match_row_mask) {
+  static bool TrySolve(GaussData &gauss, uint32_t num_output_rows, const std::deque<uint64_t> &pinned_shard_hashes, const std::deque<uint64_t> &movable_shard_hashes, const std::deque<uint64_t> &bumped_hashes, uint32_t seed, uint32_t last_section, uint32_t match_row_mask) {
     gauss.ResetFor(num_output_rows, match_row_mask);
 
-    // Build with seeded hashes
-    for (uint64_t pre_h : shard_hashes) {
+    // Bumped hashed don't get a seed
+    for (uint64_t h : bumped_hashes) {
+      if (!gauss.Add(h)) {
+        return false;
+      }
+    }
+    // Seeded but not bumped
+    for (uint64_t pre_h : pinned_shard_hashes) {
+      uint64_t h = GaussData::SeedPreHash(pre_h, seed);
+      if (!gauss.Add(h)) {
+        return false;
+      }
+    }
+    // Maybe bumped away
+    for (uint64_t pre_h : movable_shard_hashes) {
       uint32_t section = GaussData::PreHashToSection(pre_h);
       if (section <= last_section) {
         uint64_t h = GaussData::SeedPreHash(pre_h, seed);
@@ -636,8 +650,17 @@ struct SimpleGaussFilter {
         }
       }
     }
-    // ... except bumped hashes don't get the seed
-    for (uint64_t h : bumped_hashes) {
+    // Success
+    return true;
+  }
+
+  // If whole structure is single shard
+  static bool TrySolveSolo(GaussData &gauss, uint32_t num_output_rows, const std::deque<uint64_t> &hashes, uint32_t seed, uint32_t match_row_mask) {
+    gauss.ResetFor(num_output_rows, match_row_mask);
+
+    // Build with seeded hashes
+    for (uint64_t pre_pre_h : hashes) {
+      uint64_t h = GaussData::SeedPreHash(GaussData::TweakPreHash(pre_pre_h), seed);
       if (!gauss.Add(h)) {
         return false;
       }
@@ -646,56 +669,165 @@ struct SimpleGaussFilter {
     return true;
   }
 
-  static inline void BackPropAndStoreSingle(uint32_t pivot, const GaussData &gauss, uint32_t match_bits, uint64_t *word_data) {
-    uint32_t start = pivot;
-    uint64_t coeff_row = gauss.coeff_rows_by_pivot[pivot];
-    if (coeff_row == 0) {
-      return;
+  template <size_t kMB> /* match bits */
+  inline void BackPropAndStoreOptimizedRange(char *cur_data, const GaussData &gauss, uint32_t rel_end_block, uint32_t rel_begin_block, std::array<uint64_t, kMB> &state) {
+    //printf("BPASOR %u %u %u\n", (unsigned)kMB, rel_end_block, rel_begin_block);
+    for (uint32_t block = rel_end_block; block > rel_begin_block;) {
+      --block;
+      for (uint32_t i = 0; i < 64; ++i) {
+        const uint32_t pivot = block * 64 + (63 - i);
+        const uint64_t coeff_row = gauss.coeff_rows_by_pivot[pivot];
+        uint32_t match_row = gauss.match_rows_by_pivot[pivot];
+        for (uint32_t j = 0; j < kMB; ++j) {
+          uint64_t tmp = state[j] << 1;
+          tmp |= uint64_t{BitParity(tmp & coeff_row) ^ ((match_row >> j) & 1)};
+          state[j] = tmp;
+        }
+        //printf("Pivot %u\n", pivot);
+      }
+      char *data_at_block = cur_data + (block * 8 * kMB);
+      for (uint32_t j = 0; j < kMB; ++j) {
+        //printf("Writing to %p, %lx\n", data_at_block + (j * 8), state[j]);
+        EncodeFixed64(data_at_block + (j * 8), state[j]);
+      }
     }
-    uint32_t match_row = gauss.match_rows_by_pivot[pivot];
-    //printf("BPSS %u %u %u\n", (unsigned)(size_t)word_data, start, match_bits);
+  }
 
-    for (uint32_t j = 0; j < match_bits; ++j) {
-      bool val = GaussData::DotCoeffRowWithOutputColumn(start, coeff_row, word_data, match_bits, j);
-      val ^= ((match_row >> j) & 1);
-      GaussData::StoreOutputVal(val, word_data, match_bits, pivot, j);
+  template <size_t kMB> /* match bits */
+  void BackPropAndStoreOptimized(size_t starting_block, size_t ending_block, const GaussData &gauss) {
+    //printf("BPASO %u %u %u\n", (unsigned)kMB, (unsigned)starting_block, (unsigned)ending_block);
+    std::array<uint64_t, kMB> state;
+    state.fill(0);
+
+    assert(ending_block - starting_block < 0x10000U);
+    uint32_t rem_blocks = static_cast<uint32_t>(ending_block - starting_block);
+
+    char *cur_data = GetBlockDataStart(starting_block);
+    if (first_block_upper > starting_block && first_block_upper < ending_block) {
+      // Special handling (mixed match_bits in shard)
+      uint32_t num_lower_blocks = static_cast<uint32_t>(first_block_upper - starting_block);
+      // Where the starting pointer would be if the whole thing used
+      // upper match bits and ended at the same pointer (but started
+      // before actual start).
+      char *special_data = cur_data - (num_lower_blocks * 8);
+      std::array<uint64_t, kMB + 1> ustate;
+      ustate.fill(0);
+      BackPropAndStoreOptimizedRange(special_data, gauss, rem_blocks, num_lower_blocks, ustate);
+      // fall through for lower portion
+      rem_blocks = num_lower_blocks;
+      for (uint32_t i = 0; i < kMB; ++i) {
+        state[i] = ustate[i];
+      }
     }
+    // Easy handling (consistent match_bits in shard, or lower portion)
+    BackPropAndStoreOptimizedRange(cur_data, gauss, rem_blocks, 0, state);
   }
 
   void BackPropAndStore(size_t starting_block, const GaussData &gauss, uint32_t num_output_rows) {
     size_t ending_block = starting_block + num_output_rows / 64;
     uint32_t match_bits = lower_match_bits + (starting_block >= first_block_upper);
-    int64_t i = num_output_rows - 1;
+    switch (match_bits) {
+      case 19:
+        BackPropAndStoreOptimized<19>(starting_block, ending_block, gauss);
+        break;
+      case 18:
+        BackPropAndStoreOptimized<18>(starting_block, ending_block, gauss);
+        break;
+      case 17:
+        BackPropAndStoreOptimized<17>(starting_block, ending_block, gauss);
+        break;
+      case 16:
+        BackPropAndStoreOptimized<16>(starting_block, ending_block, gauss);
+        break;
+      case 15:
+        BackPropAndStoreOptimized<15>(starting_block, ending_block, gauss);
+        break;
+      case 14:
+        BackPropAndStoreOptimized<14>(starting_block, ending_block, gauss);
+        break;
+      case 13:
+        BackPropAndStoreOptimized<13>(starting_block, ending_block, gauss);
+        break;
+      case 12:
+        BackPropAndStoreOptimized<12>(starting_block, ending_block, gauss);
+        break;
+      case 11:
+        BackPropAndStoreOptimized<11>(starting_block, ending_block, gauss);
+        break;
+      case 10:
+        BackPropAndStoreOptimized<10>(starting_block, ending_block, gauss);
+        break;
+      case 9:
+        BackPropAndStoreOptimized<9>(starting_block, ending_block, gauss);
+        break;
+      case 8:
+        BackPropAndStoreOptimized<8>(starting_block, ending_block, gauss);
+        break;
+      case 7:
+        BackPropAndStoreOptimized<7>(starting_block, ending_block, gauss);
+        break;
+      case 6:
+        BackPropAndStoreOptimized<6>(starting_block, ending_block, gauss);
+        break;
+      case 5:
+        BackPropAndStoreOptimized<5>(starting_block, ending_block, gauss);
+        break;
+      case 4:
+        BackPropAndStoreOptimized<4>(starting_block, ending_block, gauss);
+        break;
+      case 3:
+        BackPropAndStoreOptimized<3>(starting_block, ending_block, gauss);
+        break;
+      case 2:
+        BackPropAndStoreOptimized<2>(starting_block, ending_block, gauss);
+        break;
+      case 1:
+        BackPropAndStoreOptimized<1>(starting_block, ending_block, gauss);
+        break;
+      case 0:
+        BackPropAndStoreOptimized<0>(starting_block, ending_block, gauss);
+        break;
+      default:
+        fprintf(stderr, "Unimplemented: match_bits == %u\n", (unsigned)match_bits);
+        abort();
+    }
+  }
 
-    uint64_t *word_data = reinterpret_cast<uint64_t *>(GetBlockDataStart(starting_block));
-    if (first_block_upper > starting_block && first_block_upper < ending_block) {
-      // Special handling (mixed match_bits in shard)
-      uint32_t num_lower_blocks = first_block_upper - starting_block;
-      uint32_t first_start_upper = num_lower_blocks * 64;
-      // Where the starting pointer would be if the whole thing used
-      // upper match bits and ended at the same pointer (but started
-      // before actual start).
-      uint64_t *special_word_data = word_data - num_lower_blocks;
-      for (; i >= first_start_upper; --i) {
-        BackPropAndStoreSingle(i, gauss, match_bits + 1, special_word_data);
+  void BuildSoloShard(const std::deque<uint64_t> &hashes) {
+    GaussData gauss;
+    size_t shard_begin_block = GetShardBeginBlock(0);
+    uint32_t shard_slots = (total_blocks - shard_begin_block) * 64;
+    uint32_t match_row_mask = (uint32_t{1} << 1 << lower_match_bits) - 1;
+
+    uint32_t seed = 0;
+    for (; seed < /*FIXME?*/64; ++seed) {
+      if (TrySolveSolo(gauss, shard_slots, hashes, seed, match_row_mask)) {
+        BackPropAndStore(shard_begin_block, gauss, shard_slots);
+        GetShardMetaDataStart()[0] = static_cast<char>(seed);
+        return;
       }
-      // fall through for lower portion
     }
-    // Easy handling (consistent match_bits in shard, or lower portion)
-    for (; i >= 0; --i) {
-      BackPropAndStoreSingle(i, gauss, match_bits, word_data);
-    }
+    // else
+    fprintf(stderr, "Bloom fallback not yet implemented (solo). Aborting.\n");
+    abort();
   }
 
   void BuildShards(std::deque<uint64_t> *hashes) {
     assert(log2_shards < 32);
     uint32_t shards = uint32_t{1} << log2_shards;
 
-    std::unique_ptr<std::vector<uint64_t>[]> shard_hashes{new std::vector<uint64_t>[shards]};
-    std::unique_ptr<std::vector<uint64_t>[]> bumped_hashes{new std::vector<uint64_t>[shards]};
+    if (shards == 1) {
+      BuildSoloShard(*hashes);
+      hashes->clear();
+      return;
+    }
+
+    std::unique_ptr<std::deque<uint64_t>[]> pinned_shard_hashes{new std::deque<uint64_t>[shards]};
+    std::unique_ptr<std::deque<uint64_t>[]> movable_shard_hashes{new std::deque<uint64_t>[shards]};
+    std::unique_ptr<std::deque<uint64_t>[]> bumped_hashes{new std::deque<uint64_t>[shards]};
     std::unique_ptr<std::array<uint32_t, 256>[]> shard_section_counts{new std::array<uint32_t, 256>[shards]()};
 
-    // TODO: pre-allocate vector capacity?
+    // TODO: deque vs. pre-allocate vector capacity?
 
     while (!hashes->empty()) {
       uint64_t h = GaussData::TweakPreHash(hashes->front());
@@ -703,7 +835,11 @@ struct SimpleGaussFilter {
       uint32_t shard = GaussData::PreHashToShard(h, log2_shards);
       uint32_t section = GaussData::PreHashToSection(h);
       assert(section < 256U);
-      shard_hashes[shard].push_back(h);
+      if (section == 0) {
+        pinned_shard_hashes[shard].push_back(h);
+      } else {
+        movable_shard_hashes[shard].push_back(h);
+      }
       shard_section_counts[shard][section]++;
     }
 
@@ -731,7 +867,7 @@ struct SimpleGaussFilter {
       }
 
       for (; last_section > 0; --last_section) {
-        if (TrySolve(gauss, shard_slots, shard_hashes[shard], bumped_hashes[shard], /*seed*/last_section, last_section, match_row_mask)) {
+        if (TrySolve(gauss, shard_slots, pinned_shard_hashes[shard], movable_shard_hashes[shard], bumped_hashes[shard], /*seed*/last_section, last_section, match_row_mask)) {
           BackPropAndStore(shard_begin_block, gauss, shard_slots);
           break;
         }
@@ -745,7 +881,7 @@ struct SimpleGaussFilter {
         uint32_t bumped_shard_mask = bumped_shard_or - 1;
         bumped_shard_or /= 2;
         bumped_shard_mask /= 2;
-        for (uint64_t pre_h : shard_hashes[shard]) {
+        for (uint64_t pre_h : movable_shard_hashes[shard]) {
           uint32_t section = GaussData::PreHashToSection(pre_h);
           if (section > last_section) {
             // TODO: reconsider/refactor
@@ -783,7 +919,7 @@ struct SimpleGaussFilter {
         shard_slots = (shard_end_block - shard_begin_block) * 64;
         // FIXME: check bounds
       }
-      if (TrySolve(gauss, shard_slots, shard_hashes[0], bumped_hashes[0], seed, /*all*/ 255, match_row_mask)) {
+      if (TrySolve(gauss, shard_slots, pinned_shard_hashes[0], movable_shard_hashes[0], bumped_hashes[0], seed, /*all*/ 255, match_row_mask)) {
         break;
       }
     }
