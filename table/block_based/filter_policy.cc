@@ -233,8 +233,8 @@ struct GaussData {
       coeff_row ^= other;
       match_row ^= match_rows_by_pivot[start];
     }
-    // Failed
-    return false;
+    // Failed, unless by luck match_row == 0
+    return match_row == 0;
   }
   /*
   // Contents of this row in the coefficient matrix, starting at `start`
@@ -582,7 +582,7 @@ struct SimpleGaussFilter {
   //   log2_shards
   //   avg_shard_slots
   void CalculatePreferredSharding(size_t keys) {
-    size_t total_slots = static_cast<size_t>(1.004 * keys + 0.5);
+    size_t total_slots = static_cast<size_t>(1.002 * keys + 0.5);
     // Make it a multiple of 64 by rounding up
     total_slots = (total_slots + 63) & ~size_t{63};
     // Find power of two number of shards that gets average slots per shard
