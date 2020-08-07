@@ -110,6 +110,11 @@ class BlockBasedTable : public TableReader {
                       const bool need_upper_bound_check,
                       BlockCacheLookupContext* lookup_context) const;
 
+  Status ReadMetaIndexBlock(const ReadOptions& ro,
+                            FilePrefetchBuffer* prefetch_buffer,
+                            std::unique_ptr<Block>* metaindex_block,
+                            std::unique_ptr<InternalIterator>* iter);
+
   // Returns a new iterator over the table contents.
   // The result of NewIterator() is initially invalid (caller must
   // call one of the Seek methods on the iterator before using it).
@@ -406,10 +411,6 @@ class BlockBasedTable : public TableReader {
       bool force_direct_prefetch, TailPrefetchStats* tail_prefetch_stats,
       const bool prefetch_all, const bool preload_all,
       std::unique_ptr<FilePrefetchBuffer>* prefetch_buffer);
-  Status ReadMetaIndexBlock(const ReadOptions& ro,
-                            FilePrefetchBuffer* prefetch_buffer,
-                            std::unique_ptr<Block>* metaindex_block,
-                            std::unique_ptr<InternalIterator>* iter);
   Status TryReadPropertiesWithGlobalSeqno(const ReadOptions& ro,
                                           FilePrefetchBuffer* prefetch_buffer,
                                           const Slice& handle_value,

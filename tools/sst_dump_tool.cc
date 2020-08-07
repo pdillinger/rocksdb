@@ -73,6 +73,10 @@ void print_help(bool to_stderr) {
     --input_key_hex
       Can be combined with --from and --to to indicate that these values are encoded in Hex
 
+    --show_meta
+      Print meta index block info after iterating over the file when executing
+      check|scan|raw|identify
+
     --show_properties
       Print table properties after iterating over the file when executing
       check|scan|raw|identify
@@ -135,6 +139,7 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
   bool has_from = false;
   bool has_to = false;
   bool use_from_as_prefix = false;
+  bool show_meta = false;
   bool show_properties = false;
   bool show_summary = false;
   bool set_block_size = false;
@@ -186,6 +191,8 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
     } else if (strncmp(argv[i], "--prefix=", 9) == 0) {
       from_key = argv[i] + 9;
       use_from_as_prefix = true;
+    } else if (strcmp(argv[i], "--show_meta") == 0) {
+      show_meta = true;
     } else if (strcmp(argv[i], "--show_properties") == 0) {
       show_properties = true;
     } else if (strcmp(argv[i], "--show_summary") == 0) {
@@ -455,6 +462,12 @@ int SSTDumpTool::Run(int argc, char const* const* argv, Options options) {
         }
       } else {
         fprintf(stderr, "Reader unexpectedly returned null properties\n");
+      }
+    }
+    if (show_meta) {
+      st = dumper.ShowMetaIndex();
+      if (!st.ok()) {
+        fprintf(stderr, "%s: %s\n", filename.c_str(), st.ToString().c_str());
       }
     }
   }

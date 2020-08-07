@@ -31,11 +31,13 @@
 #include "table/block_based/block.h"
 #include "table/block_based/block_based_table_builder.h"
 #include "table/block_based/block_based_table_factory.h"
+#include "table/block_based/block_based_table_reader.h"
 #include "table/block_based/block_builder.h"
 #include "table/format.h"
 #include "table/meta_blocks.h"
 #include "table/plain/plain_table_factory.h"
 #include "table/table_reader.h"
+#include "util/cast_util.h"
 #include "util/compression.h"
 #include "util/random.h"
 
@@ -171,6 +173,38 @@ Status SstFileDumper::VerifyChecksum() {
   // We could pass specific readahead setting into read options if needed.
   return table_reader_->VerifyChecksum(read_options_,
                                        TableReaderCaller::kSSTDumpTool);
+}
+
+Status SstFileDumper::ShowMetaIndex() {
+  Status s;
+  if (BlockBasedTableFactory::kName == options_.table_factory->Name()) {
+    BlockBasedTable &bbt = *static_cast_with_check<BlockBasedTable>(table_reader_.get());
+    std::unique_ptr<Block> metaindex;
+    std::unique_ptr<InternalIterator> metaindex_iter;
+    ReadOptions ro;
+    s = bbt.ReadMetaIndexBlock(ro, nullptr /* prefetch buffer */, &metaindex,
+                           &metaindex_iter);
+    if (s.ok()) {
+      fprintf(stdout, "\nMeta-index entries:\n"
+                      "------------------------------\n");
+      for (metaindex_iter->SeekToFirst(); metaindex_iter->Valid(); metaindex_iter->Next()) {
+        s = metaindex_iter->status();
+        if (!s.ok()) {
+          break;
+        }
+        BlockHandle handle;
+        Slice input = metaindex_iter->value();
+        s = handle.DecodeFrom(&input);
+        if (!s.ok()) {
+          break;
+        }
+        fprintf(stdout, "  %s offset %" PRIu64 " size %" PRIu64 "\n", metaindex_iter->key().ToString().c_str(), handle.offset(), handle.size());
+      }
+    }
+  } else {
+    s = Status::NotSupported("ShowMetaIndex() only supported on block-based table");
+  }
+  return s;
 }
 
 Status SstFileDumper::DumpTable(const std::string& out_filename) {
