@@ -10,6 +10,7 @@
 
 #ifdef GFLAGS
 #include "db_stress_tool/db_stress_common.h"
+#include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
 void ThreadBody(void* v) {
@@ -57,11 +58,8 @@ void ThreadBody(void* v) {
 
 bool RunStressTest(StressTest* stress) {
   stress->InitDb();
-
   SharedState shared(db_stress_env, stress);
-  if (FLAGS_read_only) {
-    stress->InitReadonlyDb(&shared);
-  }
+  stress->FinishInitDb(&shared);
 
 #ifndef NDEBUG
   if (FLAGS_sync_fault_injection) {

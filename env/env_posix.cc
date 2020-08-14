@@ -41,7 +41,7 @@
 #include <time.h>
 #include <algorithm>
 // Get nano time includes
-#if defined(OS_LINUX) || defined(OS_FREEBSD)
+#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD)
 #elif defined(__MACH__)
 #include <Availability.h>
 #include <mach/clock.h>
@@ -167,7 +167,6 @@ class PosixEnv : public CompositeEnvWrapper {
   // provided by the search path
   Status LoadLibrary(const std::string& name, const std::string& path,
                      std::shared_ptr<DynamicLibrary>* result) override {
-    Status status;
     assert(result != nullptr);
     if (name.empty()) {
       void* hndl = dlopen(NULL, RTLD_NOW);
@@ -249,7 +248,8 @@ class PosixEnv : public CompositeEnvWrapper {
   }
 
   uint64_t NowNanos() override {
-#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_AIX)
+#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) || \
+    defined(OS_AIX)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
@@ -269,8 +269,8 @@ class PosixEnv : public CompositeEnvWrapper {
   }
 
   uint64_t NowCPUNanos() override {
-#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_AIX) || \
-    (defined(__MACH__) && defined(__MAC_10_12))
+#if defined(OS_LINUX) || defined(OS_FREEBSD) || defined(OS_GNU_KFREEBSD) || \
+    defined(OS_AIX) || (defined(__MACH__) && defined(__MAC_10_12))
     struct timespec ts;
     clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;

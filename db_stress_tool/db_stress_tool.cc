@@ -24,7 +24,7 @@
 #include "db_stress_tool/db_stress_common.h"
 #include "db_stress_tool/db_stress_driver.h"
 #ifndef NDEBUG
-#include "test_util/fault_injection_test_fs.h"
+#include "utilities/fault_injection_fs.h"
 #endif
 
 namespace ROCKSDB_NAMESPACE {
@@ -45,10 +45,11 @@ int db_stress_tool(int argc, char** argv) {
   SanitizeDoubleParam(&FLAGS_memtable_prefix_bloom_size_ratio);
   SanitizeDoubleParam(&FLAGS_max_bytes_for_level_multiplier);
 
+#ifndef NDEBUG
   if (FLAGS_mock_direct_io) {
-    test::SetupSyncPointsToMockDirectIO();
+    SetupSyncPointsToMockDirectIO();
   }
-
+#endif
   if (FLAGS_statistics) {
     dbstats = ROCKSDB_NAMESPACE::CreateDBStatistics();
     if (FLAGS_test_secondary) {
@@ -236,9 +237,19 @@ int db_stress_tool(int argc, char** argv) {
       exit(1);
     }
   }
+  if (FLAGS_enable_compaction_filter &&
+      (FLAGS_acquire_snapshot_one_in > 0 || FLAGS_compact_range_one_in > 0 ||
+       FLAGS_iterpercent > 0 || FLAGS_test_batches_snapshots ||
+       FLAGS_test_cf_consistency)) {
+    fprintf(
+        stderr,
+        "Error: acquire_snapshot_one_in, compact_range_one_in, iterpercent, "
+        "test_batches_snapshots  must all be 0 when using compaction filter\n");
+    exit(1);
+  }
 
   rocksdb_kill_odds = FLAGS_kill_random_test;
-  rocksdb_kill_prefix_blacklist = SplitString(FLAGS_kill_prefix_blacklist);
+  rocksdb_kill_exclude_prefixes = SplitString(FLAGS_kill_exclude_prefixes);
 
   unsigned int levels = FLAGS_max_key_len;
   std::vector<std::string> weights;

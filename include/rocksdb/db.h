@@ -1266,8 +1266,6 @@ class DB {
   // updated, false if user attempted to call if with seqnum <= current value.
   virtual bool SetPreserveDeletesSequenceNumber(SequenceNumber seqnum) = 0;
 
-#ifndef ROCKSDB_LITE
-
   // Prevent file deletions. Compactions will continue to occur,
   // but no obsolete files will be deleted. Calling this multiple
   // times have the same effect as calling it once.
@@ -1284,6 +1282,7 @@ class DB {
   // threads call EnableFileDeletions()
   virtual Status EnableFileDeletions(bool force = true) = 0;
 
+#ifndef ROCKSDB_LITE
   // GetLiveFiles followed by GetSortedWalFiles can generate a lossless backup
 
   // Retrieve the list of all files in the database. The files are
@@ -1354,6 +1353,9 @@ class DB {
   // and end key
   virtual void GetLiveFilesMetaData(
       std::vector<LiveFileMetaData>* /*metadata*/) {}
+
+  // Return a list of all table checksum info
+  virtual Status GetLiveFilesChecksumInfo(FileChecksumList* checksum_list) = 0;
 
   // Obtains the meta data of the specified column family of the DB.
   virtual void GetColumnFamilyMetaData(ColumnFamilyHandle* /*column_family*/,
@@ -1544,6 +1546,13 @@ class DB {
   // Returns Status::OK if identity could be set properly
   virtual Status GetDbIdentity(std::string& identity) const = 0;
 
+  // Return a unique identifier for each DB object that is opened
+  // This DB session ID should be unique among all open DB instances on all
+  // hosts, and should be unique among re-openings of the same or other DBs.
+  // (Two open DBs have the same identity from other function GetDbIdentity when
+  // one is physically copied from the other.)
+  virtual Status GetDbSessionId(std::string& session_id) const = 0;
+
   // Returns default column family handle
   virtual ColumnFamilyHandle* DefaultColumnFamily() const = 0;
 
@@ -1576,6 +1585,16 @@ class DB {
 
   virtual Status EndTrace() {
     return Status::NotSupported("EndTrace() is not implemented.");
+  }
+
+  // StartIOTrace and EndIOTrace are experimental. They are not enabled yet.
+  virtual Status StartIOTrace(Env* /*env*/, const TraceOptions& /*options*/,
+                              std::unique_ptr<TraceWriter>&& /*trace_writer*/) {
+    return Status::NotSupported("StartTrace() is not implemented.");
+  }
+
+  virtual Status EndIOTrace() {
+    return Status::NotSupported("StartTrace() is not implemented.");
   }
 
   // Trace block cache accesses. Use EndBlockCacheTrace() to stop tracing.
