@@ -6,11 +6,10 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
-#include "db/db_impl/db_impl.h"
-
 #include <cinttypes>
 
 #include "db/builder.h"
+#include "db/db_impl/db_impl.h"
 #include "db/error_handler.h"
 #include "db/event_helpers.h"
 #include "file/sst_file_manager_impl.h"
@@ -848,11 +847,15 @@ Status DBImpl::CompactRange(const CompactRangeOptions& options,
   if (options.change_level) {
     ROCKS_LOG_INFO(immutable_db_options_.info_log,
                    "[RefitLevel] waiting for background threads to stop");
+    DisableManualCompaction();
     s = PauseBackgroundWork();
     if (s.ok()) {
+      TEST_SYNC_POINT("DBImpl::CompactRange:PreRefitLevel");
       s = ReFitLevel(cfd, final_output_level, options.target_level);
+      TEST_SYNC_POINT("DBImpl::CompactRange:PostRefitLevel");
+      ContinueBackgroundWork();
     }
-    ContinueBackgroundWork();
+    EnableManualCompaction();
   }
   LogFlush(immutable_db_options_.info_log);
 
@@ -959,7 +962,7 @@ Status DBImpl::CompactFilesImpl(
   if (shutting_down_.load(std::memory_order_acquire)) {
     return Status::ShutdownInProgress();
   }
-  if (manual_compaction_paused_.load(std::memory_order_acquire)) {
+  if (manual_compaction_paused_.load(std::memory_order_acquire) > 0) {
     return Status::Incomplete(Status::SubCode::kManualCompactionPaused);
   }
 
@@ -1180,7 +1183,7 @@ void DBImpl::NotifyOnCompactionBegin(ColumnFamilyData* cfd, Compaction* c,
     return;
   }
   if (c->is_manual_compaction() &&
-      manual_compaction_paused_.load(std::memory_order_acquire)) {
+      manual_compaction_paused_.load(std::memory_order_acquire) > 0) {
     return;
   }
   Version* current = cfd->current();
@@ -1190,43 +1193,7 @@ void DBImpl::NotifyOnCompactionBegin(ColumnFamilyData* cfd, Compaction* c,
   TEST_SYNC_POINT("DBImpl::NotifyOnCompactionBegin::UnlockMutex");
   {
     CompactionJobInfo info{};
-    info.cf_name = cfd->GetName();
-    info.status = st;
-    info.thread_id = env_->GetThreadID();
-    info.job_id = job_id;
-    info.base_input_level = c->start_level();
-    info.output_level = c->output_level();
-    info.stats = job_stats;
-    info.table_properties = c->GetOutputTableProperties();
-    info.compaction_reason = c->compaction_reason();
-    info.compression = c->output_compression();
-    for (size_t i = 0; i < c->num_input_levels(); ++i) {
-      for (const auto fmd : *c->inputs(i)) {
-        const FileDescriptor& desc = fmd->fd;
-        const uint64_t file_number = desc.GetNumber();
-        auto fn = TableFileName(c->immutable_cf_options()->cf_paths,
-                                file_number, desc.GetPathId());
-        info.input_files.push_back(fn);
-        info.input_file_infos.push_back(CompactionFileInfo{
-            static_cast<int>(i), file_number, fmd->oldest_blob_file_number});
-        if (info.table_properties.count(fn) == 0) {
-          std::shared_ptr<const TableProperties> tp;
-          auto s = current->GetTableProperties(&tp, fmd, &fn);
-          if (s.ok()) {
-            info.table_properties[fn] = tp;
-          }
-        }
-      }
-    }
-    for (const auto& newf : c->edit()->GetNewFiles()) {
-      const FileMetaData& meta = newf.second;
-      const FileDescriptor& desc = meta.fd;
-      const uint64_t file_number = desc.GetNumber();
-      info.output_files.push_back(TableFileName(
-          c->immutable_cf_options()->cf_paths, file_number, desc.GetPathId()));
-      info.output_file_infos.push_back(CompactionFileInfo{
-          newf.first, file_number, meta.oldest_blob_file_number});
-    }
+    BuildCompactionJobInfo(cfd, c, st, job_stats, job_id, current, &info);
     for (auto listener : immutable_db_options_.listeners) {
       listener->OnCompactionBegin(this, info);
     }
@@ -1254,7 +1221,7 @@ void DBImpl::NotifyOnCompactionCompleted(
     return;
   }
   if (c->is_manual_compaction() &&
-      manual_compaction_paused_.load(std::memory_order_acquire)) {
+      manual_compaction_paused_.load(std::memory_order_acquire) > 0) {
     return;
   }
   Version* current = cfd->current();
@@ -1965,11 +1932,21 @@ Status DBImpl::EnableAutoCompaction(
 }
 
 void DBImpl::DisableManualCompaction() {
-  manual_compaction_paused_.store(true, std::memory_order_release);
+  InstrumentedMutexLock l(&mutex_);
+  manual_compaction_paused_.fetch_add(1, std::memory_order_release);
+  // Wait for any pending manual compactions to finish (typically through
+  // failing with `Status::Incomplete`) prior to returning. This way we are
+  // guaranteed no pending manual compaction will commit while manual
+  // compactions are "disabled".
+  while (HasPendingManualCompaction()) {
+    bg_cv_.Wait();
+  }
 }
 
 void DBImpl::EnableManualCompaction() {
-  manual_compaction_paused_.store(false, std::memory_order_release);
+  InstrumentedMutexLock l(&mutex_);
+  assert(manual_compaction_paused_ > 0);
+  manual_compaction_paused_.fetch_sub(1, std::memory_order_release);
 }
 
 void DBImpl::MaybeScheduleFlushOrCompaction() {
@@ -2528,7 +2505,7 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     if (shutting_down_.load(std::memory_order_acquire)) {
       status = Status::ShutdownInProgress();
     } else if (is_manual &&
-               manual_compaction_paused_.load(std::memory_order_acquire)) {
+               manual_compaction_paused_.load(std::memory_order_acquire) > 0) {
       status = Status::Incomplete(Status::SubCode::kManualCompactionPaused);
     }
   } else {
@@ -2570,12 +2547,13 @@ Status DBImpl::BackgroundCompaction(bool* made_progress,
     if (!c) {
       m->done = true;
       m->manual_end = nullptr;
-      ROCKS_LOG_BUFFER(log_buffer,
-                       "[%s] Manual compaction from level-%d from %s .. "
-                       "%s; nothing to do\n",
-                       m->cfd->GetName().c_str(), m->input_level,
-                       (m->begin ? m->begin->DebugString(true).c_str() : "(begin)"),
-                       (m->end ? m->end->DebugString(true).c_str() : "(end)"));
+      ROCKS_LOG_BUFFER(
+          log_buffer,
+          "[%s] Manual compaction from level-%d from %s .. "
+          "%s; nothing to do\n",
+          m->cfd->GetName().c_str(), m->input_level,
+          (m->begin ? m->begin->DebugString(true).c_str() : "(begin)"),
+          (m->end ? m->end->DebugString(true).c_str() : "(end)"));
     } else {
       // First check if we have enough room to do the compaction
       bool enough_room = EnoughRoomForCompaction(
