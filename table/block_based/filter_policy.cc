@@ -630,9 +630,9 @@ struct SimpleGaussFilter {
     *start_bit = start % 64;
     *match_bits = lower_match_bits + (start_block >= first_block_upper);
     *word_data = reinterpret_cast<const uint64_t *>(GetBlockDataStart(start_block));
-    PREFETCH(word_data, 0 /* rw */, 1 /* locality */);
+    PREFETCH(*word_data, 0 /* rw */, 1 /* locality */);
     const uint32_t maybe_offset = (*start_bit != 0) * *match_bits;
-    PREFETCH(word_data + maybe_offset + *match_bits - 1, 0 /* rw */, 1 /* locality */);
+    PREFETCH(*word_data + maybe_offset + *match_bits - 1, 0 /* rw */, 1 /* locality */);
   }
 
   // Reads:
@@ -746,6 +746,7 @@ struct SimpleGaussFilter {
   // Writes:
   //   log2_shards
   //   avg_shard_slots
+  //   bytes
   //   lower_match_bits
   //   total_blocks
   //   first_block_upper
@@ -767,8 +768,6 @@ struct SimpleGaussFilter {
     assert(bytes >= metadata_size);
     buf->reset(data = new char[bytes]());
   }
-
-  static constexpr uint32_t max_jump = 16;
 
   static bool TrySolve(GaussData &gauss, uint32_t num_output_rows, const std::deque<uint64_t> &pinned_shard_hashes, const std::deque<uint64_t> &movable_shard_hashes, const std::deque<uint64_t> &bumped_hashes, uint32_t seed, uint32_t last_section, uint32_t match_row_mask) {
     gauss.ResetFor(num_output_rows, match_row_mask);
