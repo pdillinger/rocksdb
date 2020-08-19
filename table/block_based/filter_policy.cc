@@ -555,7 +555,8 @@ struct SimpleGaussFilter {
     // Make it a multiple of 128 by rounding up
     total_slots = (total_slots + 127) & ~size_t{127};
 
-    this->total_blocks = static_cast<size_t>(total_slots / 128);
+    // TODO: check cast
+    this->total_blocks = static_cast<uint32_t>(total_slots / 128);
   }
 
   // Reads:
@@ -570,7 +571,8 @@ struct SimpleGaussFilter {
     size_t words_for_blocks = bytes_for_blocks / 16;
     this->lower_match_bits =
         static_cast<uint32_t>(std::min(uint64_t{31}, words_for_blocks / total_blocks));
-    size_t words_for_upper_extra = words_for_blocks - lower_match_bits * total_blocks;
+    uint32_t words_for_upper_extra = static_cast<uint32_t>(
+        words_for_blocks - lower_match_bits * total_blocks);
     this->first_block_upper = total_blocks - words_for_upper_extra;
     assert(words_for_blocks == (first_block_upper * lower_match_bits) +
                                ((total_blocks - first_block_upper) * (lower_match_bits + 1)));
