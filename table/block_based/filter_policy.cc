@@ -450,57 +450,60 @@ struct GaussData {
 /*
     // Not an improvement
     uint32_t versus_row = 0;
-    uint64_t column;
+    uint128_t column;
     const uint32_t maybe_offset = (start_bit != 0) * match_bits;
     // TODO: endianness
     switch (match_bits) {
       default:
+        assert(false);
+        break;
       case 10:
-        column = (word_data[9] >> start_bit) | (word_data[9 + maybe_offset] << (64 - start_bit));
+        column = (word_data[9] >> start_bit) | (word_data[9 + maybe_offset] << (128 - start_bit));
         versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 9;
         FALLTHROUGH_INTENDED;
       case 9:
-        column = (word_data[8] >> start_bit) | (word_data[8 + maybe_offset] << (64 - start_bit));
+        column = (word_data[8] >> start_bit) | (word_data[8 + maybe_offset] << (128 - start_bit));
         versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 8;
         FALLTHROUGH_INTENDED;
       case 8:
-        column = (word_data[7] >> start_bit) | (word_data[7 + maybe_offset] << (64 - start_bit));
+        column = (word_data[7] >> start_bit) | (word_data[7 + maybe_offset] << (128 - start_bit));
         versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 7;
         FALLTHROUGH_INTENDED;
       case 7:
-        column = (word_data[6] >> start_bit) | (word_data[6 + maybe_offset] << (64 - start_bit));
+        column = (word_data[6] >> start_bit) | (word_data[6 + maybe_offset] << (128 - start_bit));
         versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 6;
         FALLTHROUGH_INTENDED;
       case 6:
-        column = (word_data[5] >> start_bit) | (word_data[5 + maybe_offset] << (64 - start_bit));
+        column = (word_data[5] >> start_bit) | (word_data[5 + maybe_offset] << (128 - start_bit));
         versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 5;
         FALLTHROUGH_INTENDED;
       case 5:
-        column = (word_data[4] >> start_bit) | (word_data[4 + maybe_offset] << (64 - start_bit));
+        column = (word_data[4] >> start_bit) | (word_data[4 + maybe_offset] << (128 - start_bit));
         versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 4;
         FALLTHROUGH_INTENDED;
       case 4:
-        column = (word_data[3] >> start_bit) | (word_data[3 + maybe_offset] << (64 - start_bit));
+        column = (word_data[3] >> start_bit) | (word_data[3 + maybe_offset] << (128 - start_bit));
         versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 3;
         FALLTHROUGH_INTENDED;
       case 3:
-        column = (word_data[2] >> start_bit) | (word_data[2 + maybe_offset] << (64 - start_bit));
+        column = (word_data[2] >> start_bit) | (word_data[2 + maybe_offset] << (128 - start_bit));
         versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 2;
         FALLTHROUGH_INTENDED;
       case 2:
-        column = (word_data[1] >> start_bit) | (word_data[1 + maybe_offset] << (64 - start_bit));
+        column = (word_data[1] >> start_bit) | (word_data[1 + maybe_offset] << (128 - start_bit));
         versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 1;
         FALLTHROUGH_INTENDED;
       case 1:
-        column = (word_data[0] >> start_bit) | (word_data[0 + maybe_offset] << (64 - start_bit));
+        column = (word_data[0] >> start_bit) | (word_data[0 + maybe_offset] << (128 - start_bit));
         versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 0;
         FALLTHROUGH_INTENDED;
       case 0:
-        FALLTHROUGH_INTENDED;
+        break;
     }
     //printf("QM: %u\n", match_bits);
     return versus_row == (match_row & ((uint32_t{1} << match_bits) - 1));
-*/
+//*/
+//*
     // Simple and OK
     for (uint32_t i = 0; i < match_bits; ++i) {
       bool v = GaussData::DotCoeffRowWithOutputColumn(i, start_bit, coeff_row, word_data, match_bits);
@@ -510,6 +513,7 @@ struct GaussData {
       match_row >>= 1;
     }
     return true;
+//*/
   }
 };
 
