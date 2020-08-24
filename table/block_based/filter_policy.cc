@@ -416,105 +416,6 @@ struct GaussData {
     // NB: just h seems to cause some association affecting FP rate
     return Lower32of64(h ^ (h >> 13) ^ (h >> 26));
   }
-
-  static inline bool DotCoeffRowWithOutputColumn(uint32_t start_word, uint32_t start_bit, uint128_t coeff_row, const uint128_t *output_data, uint32_t match_bits) {
-    // TODO: endianness
-    uint128_t output_column = output_data[start_word] >> start_bit;
-    if (start_bit > 0) {
-      output_column |= output_data[start_word + match_bits] << (128 - start_bit);
-    }
-    return BitParity(output_column & coeff_row) != 0;
-  }
-
-  static inline bool DotCoeffRowWithOutputColumn(uint32_t start, uint128_t coeff_row, const uint128_t *output_data, uint32_t match_bits, uint32_t selected_match_bit) {
-    uint32_t start_word = (start / 128) * match_bits + selected_match_bit;
-    uint32_t start_bit = start % 128;
-    return DotCoeffRowWithOutputColumn(start_word, start_bit, coeff_row, output_data, match_bits);
-  }
-
-  static inline void StoreOutputVal(bool val, uint128_t *output_data, uint32_t match_bits, uint32_t start, uint32_t selected_match_bit) {
-    uint32_t selected_word = (start / 128) * match_bits + selected_match_bit;
-    uint128_t bit_selector = uint128_t{1} << (start % 128);
-
-    //printf("Storing %u @ %u.%u\n", (unsigned)val, (unsigned)(size_t)(output_data + selected_word), start % 64);
-
-    // TODO: endianness
-    if (val) {
-      output_data[selected_word] |= bit_selector;
-    } else {
-      output_data[selected_word] &= ~bit_selector;
-    }
-  }
-
-  static inline bool MayMatchQuery(const uint128_t *word_data, uint32_t start_bit, uint32_t match_bits, uint128_t coeff_row, uint32_t match_row) {
-/*
-    // Not an improvement
-    uint32_t versus_row = 0;
-    uint128_t column;
-    const uint32_t maybe_offset = (start_bit != 0) * match_bits;
-    // TODO: endianness
-    switch (match_bits) {
-      default:
-        assert(false);
-        break;
-      case 10:
-        column = (word_data[9] >> start_bit) | (word_data[9 + maybe_offset] << (128 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 9;
-        FALLTHROUGH_INTENDED;
-      case 9:
-        column = (word_data[8] >> start_bit) | (word_data[8 + maybe_offset] << (128 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 8;
-        FALLTHROUGH_INTENDED;
-      case 8:
-        column = (word_data[7] >> start_bit) | (word_data[7 + maybe_offset] << (128 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 7;
-        FALLTHROUGH_INTENDED;
-      case 7:
-        column = (word_data[6] >> start_bit) | (word_data[6 + maybe_offset] << (128 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 6;
-        FALLTHROUGH_INTENDED;
-      case 6:
-        column = (word_data[5] >> start_bit) | (word_data[5 + maybe_offset] << (128 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 5;
-        FALLTHROUGH_INTENDED;
-      case 5:
-        column = (word_data[4] >> start_bit) | (word_data[4 + maybe_offset] << (128 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 4;
-        FALLTHROUGH_INTENDED;
-      case 4:
-        column = (word_data[3] >> start_bit) | (word_data[3 + maybe_offset] << (128 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 3;
-        FALLTHROUGH_INTENDED;
-      case 3:
-        column = (word_data[2] >> start_bit) | (word_data[2 + maybe_offset] << (128 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 2;
-        FALLTHROUGH_INTENDED;
-      case 2:
-        column = (word_data[1] >> start_bit) | (word_data[1 + maybe_offset] << (128 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 1;
-        FALLTHROUGH_INTENDED;
-      case 1:
-        column = (word_data[0] >> start_bit) | (word_data[0 + maybe_offset] << (128 - start_bit));
-        versus_row |= static_cast<uint32_t>(BitParity(column & coeff_row)) << 0;
-        FALLTHROUGH_INTENDED;
-      case 0:
-        break;
-    }
-    //printf("QM: %u\n", match_bits);
-    return versus_row == (match_row & ((uint32_t{1} << match_bits) - 1));
-//*/
-//*
-    // Simple and OK
-    for (uint32_t i = 0; i < match_bits; ++i) {
-      bool v = GaussData::DotCoeffRowWithOutputColumn(i, start_bit, coeff_row, word_data, match_bits);
-      if (v != (match_row & 1)) {
-        return false;
-      }
-      match_row >>= 1;
-    }
-    return true;
-//*/
-  }
 };
 
 static inline ptrdiff_t size_t_diff(size_t a, size_t b) {
@@ -525,29 +426,30 @@ struct SimpleGaussFilter {
   static constexpr uint32_t metadata_size = 5;
 
   char* data = nullptr;
+  // block == 8 output rows
   uint32_t total_blocks = 0;
   uint32_t first_block_upper = 0;
   uint32_t lower_match_bits = 0;
   uint32_t seed = 0;
   size_t bytes = metadata_size; // incl metadata
 
-  inline void GetQueryInfoAndPrefetch(uint64_t h, uint32_t *start_bit, uint32_t *match_bits, const uint128_t **word_data) const {
-    const uint32_t num_output_rows = total_blocks * 128;
+  inline void GetQueryInfoAndPrefetch(uint64_t h, uint32_t *start_bit, uint32_t *match_bits, const uint8_t **block_data) const {
+    const uint32_t num_output_rows = total_blocks * 8;
 
     const uint32_t start = GaussData::HashToStart(h, num_output_rows);
-    const size_t start_block = start / 128;
-    uint32_t my_start_bit = start % 128;
-    const uint128_t * my_word_data = reinterpret_cast<const uint128_t *>(data);
-    my_word_data += start_block * lower_match_bits;
-    my_word_data += std::max(ptrdiff_t{0}, size_t_diff(start_block, first_block_upper));
-    PREFETCH(my_word_data, 0 /* rw */, 1 /* locality */);
+    const size_t start_block = start / 8;
+    uint32_t my_start_bit = start % 8;
+    const uint8_t * my_block_data = reinterpret_cast<const uint8_t *>(data);
+    my_block_data += start_block * lower_match_bits;
+    my_block_data += std::max(ptrdiff_t{0}, size_t_diff(start_block, first_block_upper));
+    PREFETCH(my_block_data, 0 /* rw */, 1 /* locality */);
     uint32_t my_match_bits = lower_match_bits + (start_block >= first_block_upper);
     const uint32_t maybe_offset = (my_start_bit != 0) * my_match_bits;
-    PREFETCH(my_word_data + maybe_offset + my_match_bits - 1, 0 /* rw */, 1 /* locality */);
+    PREFETCH(my_block_data + maybe_offset + my_match_bits - 1, 0 /* rw */, 1 /* locality */);
 
     *start_bit = my_start_bit;
     *match_bits = my_match_bits;
-    *word_data = my_word_data;
+    *block_data = my_block_data;
   }
 
   // Reads no fields
@@ -556,11 +458,11 @@ struct SimpleGaussFilter {
   void CalculateTotalBlocks(size_t keys) {
     // FIXME
     size_t total_slots = static_cast<size_t>(1.04 * keys + 0.5);
-    // Make it a multiple of 128 by rounding up
-    total_slots = (total_slots + 127) & ~size_t{127};
+    // Make it a multiple of 8 by rounding up
+    total_slots = (total_slots + 7) & ~size_t{7};
 
     // TODO: check cast
-    this->total_blocks = static_cast<uint32_t>(total_slots / 128);
+    this->total_blocks = static_cast<uint32_t>(total_slots / 8);
   }
 
   // Reads:
@@ -571,14 +473,12 @@ struct SimpleGaussFilter {
   //   first_block_upper
   void CalculateMatchBitSettings() {
     size_t bytes_for_blocks = bytes - metadata_size;
-    // Slots only work in 128-bit word chunks
-    size_t words_for_blocks = bytes_for_blocks / 16;
     this->lower_match_bits =
-        static_cast<uint32_t>(std::min(uint64_t{31}, words_for_blocks / total_blocks));
-    uint32_t words_for_upper_extra = static_cast<uint32_t>(
-        words_for_blocks - lower_match_bits * total_blocks);
-    this->first_block_upper = total_blocks - words_for_upper_extra;
-    assert(words_for_blocks == (first_block_upper * lower_match_bits) +
+        static_cast<uint32_t>(std::min(uint64_t{31}, bytes_for_blocks / total_blocks));
+    uint32_t bytes_for_upper_extra = static_cast<uint32_t>(
+        bytes_for_blocks - lower_match_bits * total_blocks);
+    this->first_block_upper = total_blocks - bytes_for_upper_extra;
+    assert(bytes_for_blocks == (first_block_upper * lower_match_bits) +
                                ((total_blocks - first_block_upper) * (lower_match_bits + 1)));
     //printf("%u %u %u %u\n", (unsigned) bytes, (unsigned)total_blocks, (unsigned) first_block_upper, lower_match_bits);
   }
@@ -592,8 +492,7 @@ struct SimpleGaussFilter {
   void CalculateSpace(size_t keys, int millibits_per_key) {
     CalculateTotalBlocks(keys);
     size_t ideal_bytes = static_cast<size_t>((int64_t{millibits_per_key} * keys + 7999) / 8000);
-    size_t rounded_bytes_for_blocks = ((ideal_bytes - metadata_size + 15) & ~size_t{15});
-    this->bytes = rounded_bytes_for_blocks + metadata_size;
+    this->bytes = ideal_bytes + metadata_size;
     CalculateMatchBitSettings();
   }
 
@@ -608,7 +507,7 @@ struct SimpleGaussFilter {
   }
 
   bool TrySolve(GaussData &gauss, const std::deque<uint64_t> &hashes) {
-    uint32_t num_output_rows = total_blocks * 128;
+    uint32_t num_output_rows = total_blocks * 8;
     uint32_t match_row_mask = (uint32_t{1} << 1 << lower_match_bits) - 1;
     gauss.ResetFor(num_output_rows, match_row_mask);
 
@@ -628,8 +527,8 @@ struct SimpleGaussFilter {
     //printf("BPASOR %u %u %u\n", (unsigned)kMB, rel_end_block, rel_begin_block);
     for (uint32_t block = rel_end_block; block > rel_begin_block;) {
       --block;
-      for (uint32_t i = 0; i < 128; ++i) {
-        const uint32_t pivot = block * 128 + (127 - i);
+      for (uint32_t i = 0; i < 8; ++i) {
+        const uint32_t pivot = block * 8 + (7 - i);
         const uint128_t coeff_row = gauss.coeff_rows_by_pivot[pivot];
         uint32_t match_row = gauss.match_rows_by_pivot[pivot];
         for (uint32_t j = 0; j < kMB; ++j) {
@@ -639,11 +538,10 @@ struct SimpleGaussFilter {
         }
         //printf("Pivot %u\n", pivot);
       }
-      char *data_at_block = cur_data + (block * 16 * kMB);
+      char *data_at_block = cur_data + (block * kMB);
       for (uint32_t j = 0; j < kMB; ++j) {
         //printf("Writing to %p, %lx\n", data_at_block + (j * 8), state[j]);
-        EncodeFixed64(data_at_block + (j * 16), static_cast<uint64_t>(state[j]));
-        EncodeFixed64(data_at_block + (j * 16) + 8, static_cast<uint64_t>(state[j] >> 64));
+        data_at_block[j] = static_cast<char>(state[j]);
       }
     }
   }
@@ -659,7 +557,7 @@ struct SimpleGaussFilter {
       // Where the starting pointer would be if the whole thing used
       // upper match bits and ended at the same pointer (but started
       // before actual start).
-      char *special_data = data - (first_block_upper * 16);
+      char *special_data = data - first_block_upper;
       std::array<uint128_t, kMB + 1> ustate;
       ustate.fill(0);
       BackPropAndStoreOptimizedRange(special_data, gauss, total_blocks, first_block_upper, ustate);
@@ -893,10 +791,10 @@ class SimpleGaussBitsReader : public FilterBitsReader {
 
     uint32_t start_bit;
     uint32_t match_bits;
-    const uint128_t *word_data;
-    f_.GetQueryInfoAndPrefetch(h, &start_bit, &match_bits, &word_data);
+    const uint8_t *block_data;
+    f_.GetQueryInfoAndPrefetch(h, &start_bit, &match_bits, &block_data);
 
-    return GaussData::MayMatchQuery(word_data, start_bit, match_bits, GaussData::HashToCoeffRow(h), GaussData::HashToMatchRow(h));
+    return GaussData::MayMatchQuery(block_data, start_bit, match_bits, GaussData::HashToCoeffRow(h), GaussData::HashToMatchRow(h));
   }
 
   virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
@@ -913,20 +811,20 @@ class SimpleGaussBitsReader : public FilterBitsReader {
 
       uint32_t start_bit;
       uint32_t match_bits;
-      const uint128_t *word_data;
-      f_.GetQueryInfoAndPrefetch(h, &start_bit, &match_bits, &word_data);
+      const uint8_t *block_data;
+      f_.GetQueryInfoAndPrefetch(h, &start_bit, &match_bits, &block_data);
       d.h = h;
-      d.ptr = reinterpret_cast<const char*>(word_data);
+      d.ptr = reinterpret_cast<const char*>(block_data);
       d.a = start_bit;
       d.b = match_bits;
     }
     for (int i = 0; i < num_keys; ++i) {
       MultiData &d = data[i];
       const uint64_t h = d.h;
-      const uint128_t * const word_data = reinterpret_cast<const uint128_t*>(d.ptr);
+      const uint8_t * const block_data = reinterpret_cast<const uint8_t*>(d.ptr);
       uint32_t start_bit = d.a;
       uint32_t match_bits = d.b;
-      may_match[i] = GaussData::MayMatchQuery(word_data, start_bit, match_bits, GaussData::HashToCoeffRow(h), GaussData::HashToMatchRow(h));
+      may_match[i] = GaussData::MayMatchQuery(block_data, start_bit, match_bits, GaussData::HashToCoeffRow(h), GaussData::HashToMatchRow(h));
     }
   }
 
