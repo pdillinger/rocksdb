@@ -396,15 +396,26 @@ struct GaussData {
     return match_row == 0;
   }
 
+  static inline uint64_t XXH3p_avalanche(uint64_t h64)
+  {
+      h64 ^= h64 >> 37;
+      h64 *= 0x165667B19E3779F9ULL;
+      h64 ^= h64 >> 32;
+      return h64;
+  }
+
   static inline uint64_t SeedPreHash(uint64_t pre_h, uint32_t seed) {
-    uint32_t rot = (seed * 39) & 63;
-    return ((pre_h << rot) | (pre_h >> (64 - rot))) * 0x9e3779b97f4a7c13;
+    uint32_t rot = seed & 63;
+    // TODO: confirm rot
+    return XXH3p_avalanche((pre_h << rot) | (pre_h >> (64 - rot)));
   }
 
   static inline uint32_t HashToStart(uint64_t h, uint32_t num_output_rows) {
     const uint32_t addrs = num_output_rows - 127;
     return static_cast<uint32_t>(fastrange64(h, addrs));
   }
+
+  // Note: intentional: h == 0 -> coeff_row == 0 -> match_row == 0
 
   static inline uint128_t HashToCoeffRow(uint64_t h) {
       uint128_t a = uint128_t{h} * 0x9e3779b97f4a7c13U;
@@ -554,12 +565,28 @@ struct SimpleGaussFilter {
   // Writes:
   //   total_blocks
   void CalculateTotalBlocks(size_t keys) {
-    // FIXME
-    size_t total_slots = static_cast<size_t>(1.04 * keys + 0.5);
+    // Accepting ~ 5% construction failure (re-seed) rate or less,
+    // 8k or less -> 1.020
+    // 10k -> 1.022
+    // 100k -> 1.036
+    // 1m -> 1.050
+    // 10m -> 1.064
+    // Good enough for me!  ~ +0.0042 per power of two
+
+    // How many powers of two beyond 2^12 (4k)?
+    // Using that instead of 2^13 so that the base factor setting is
+    // used through 2^13 - 1 keys.
+    int extra_pow2 = std::max(FloorLog2(keys) - 12, int{0});
+    double factor = 1.020 + extra_pow2 * 0.0042;
+    size_t total_slots = static_cast<size_t>(factor * keys + 0.5);
+
     // Make it a multiple of 128 by rounding up
+    // Note that around 12k keys, this contributes ~+1% to memory
+    // usage overhead, on top of the factor above, scaling inversely
+    // with the number of keys.
     total_slots = (total_slots + 127) & ~size_t{127};
 
-    // TODO: check cast
+    // TODO: check cast / put a hard limit
     this->total_blocks = static_cast<uint32_t>(total_slots / 128);
   }
 
@@ -748,6 +775,7 @@ struct SimpleGaussFilter {
       if (TrySolve(gauss, *hashes)) {
         BackPropAndStore(gauss);
         hashes->clear();
+        printf("seed_used: %u\n", seed);
         return;
       }
     }
