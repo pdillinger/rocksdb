@@ -348,38 +348,43 @@ using uint128_t = __uint128_t;
 struct GaussData {
   uint32_t num_output_rows;
   uint32_t match_row_mask;
+  uint32_t alloc_num_output_rows = 0;
 
+  // TODO: explore combining in a struct
   std::unique_ptr<uint128_t[]> coeff_rows_by_pivot;
   std::unique_ptr<uint32_t[]> match_rows_by_pivot;
 
   void ResetFor(uint32_t _num_output_rows, uint32_t _match_row_mask) {
     num_output_rows = _num_output_rows;
     match_row_mask = _match_row_mask;
-    // FIXME/XXX: extra for BackPropAndStore overflow read
-    coeff_rows_by_pivot.reset(new uint128_t[num_output_rows]());
-    // TODO: not strictly needed
-    match_rows_by_pivot.reset(new uint32_t[num_output_rows]());
+    if (_num_output_rows <= alloc_num_output_rows) {
+      for (uint32_t i = 0; i < _num_output_rows; ++i) {
+        coeff_rows_by_pivot[i] = 0;
+      // Note: don't strictly have to reset match_rows_by_pivot ;)
+        match_rows_by_pivot[i] = 0;
+      }
+    } else {
+      // FIXME/XXX: extra for BackPropAndStore overflow read?
+      coeff_rows_by_pivot.reset(new uint128_t[_num_output_rows]());
+      // Note: don't strictly have to zero-init match_rows_by_pivot,
+      // except possible information leakage ;)
+      match_rows_by_pivot.reset(new uint32_t[_num_output_rows]());
+      alloc_num_output_rows = _num_output_rows;
+    }
   }
 
-  bool Add(uint64_t h) {
-    uint32_t start = HashToStart(h, num_output_rows);
+  inline void PrefetchForAdd(uint64_t h, uint32_t *start) {
+    uint32_t st = HashToStart(h, num_output_rows);
+    PREFETCH(coeff_rows_by_pivot.get() + st, 1 /* rw */, 1 /* locality */);
+    PREFETCH(match_rows_by_pivot.get() + st, 1 /* rw */, 1 /* locality */);
+    *start = st;
+  }
+
+  inline bool AddPrefetched(uint64_t h, uint32_t start) {
     uint32_t match_row = HashToMatchRow(h) & match_row_mask;
     uint128_t coeff_row = HashToCoeffRow(h);
 
     for (;;) {
-      int tz;
-      if (static_cast<uint64_t>(coeff_row) == 0) {
-        if (static_cast<uint64_t>(coeff_row >> 64) == 0) {
-          // TODO: OK if match_row == 0?
-          break;
-        } else {
-          tz = 64 + CountTrailingZeroBits(static_cast<uint64_t>(coeff_row >> 64));
-        }
-      } else {
-        tz = CountTrailingZeroBits(static_cast<uint64_t>(coeff_row));
-      }
-      start += static_cast<uint32_t>(tz);
-      coeff_row >>= tz;
       assert(coeff_row & 1);
       assert(start < num_output_rows);
       uint128_t other = coeff_rows_by_pivot[start];
@@ -391,23 +396,41 @@ struct GaussData {
       assert(other & 1);
       coeff_row ^= other;
       match_row ^= match_rows_by_pivot[start];
+      int tz;
+      if (static_cast<uint64_t>(coeff_row) == 0) {
+        if (static_cast<uint64_t>(coeff_row >> 64) == 0) {
+          break;
+        } else {
+          tz = 64 + CountTrailingZeroBits(static_cast<uint64_t>(coeff_row >> 64));
+        }
+      } else {
+        tz = CountTrailingZeroBits(static_cast<uint64_t>(coeff_row));
+      }
+      start += static_cast<uint32_t>(tz);
+      coeff_row >>= tz;
     }
-    // Failed, unless by luck match_row == 0
+    // Failed, unless match_row == 0 because e.g. a duplicate add
+    // or a stock hash collision. Or we could have a full equation
+    // equal to sum of other equations, which is very possible with
+    // small match_bits.
     return match_row == 0;
   }
 
-  static inline uint64_t XXH3p_avalanche(uint64_t h64)
+  static inline uint64_t XXH3p_avalanche_ish(uint64_t h64)
   {
-      h64 ^= h64 >> 37;
+      //h64 ^= h64 >> 37;
       h64 *= 0x165667B19E3779F9ULL;
       h64 ^= h64 >> 32;
       return h64;
   }
 
   static inline uint64_t SeedPreHash(uint64_t pre_h, uint32_t seed) {
-    uint32_t rot = seed & 63;
-    // TODO: confirm rot
-    return XXH3p_avalanche((pre_h << rot) | (pre_h >> (64 - rot)));
+    // This should work reasonably nicely to mul-mix the seed in parallel
+    // with starting the avalanche on pre_h. With ~50% construction success
+    // rate, this approach is a bit more independent (closer to ideal) than
+    // simple add seed or rotate by seed.
+    pre_h ^= pre_h >> 37;
+    return XXH3p_avalanche_ish(pre_h ^ (seed * 0xC2B2AE3D27D4EB4FULL));
   }
 
   static inline uint32_t HashToStart(uint64_t h, uint32_t num_output_rows) {
@@ -415,12 +438,14 @@ struct GaussData {
     return static_cast<uint32_t>(fastrange64(h, addrs));
   }
 
-  // Note: intentional: h == 0 -> coeff_row == 0 -> match_row == 0
-
+  // Note: to be sure we do not doom a build attempt, we must ensure
+  // that if coeff_row == 0 then match_row == 0. It's a little simpler
+  // and optimizes Add (esp prefetch) if we just ensure lowest bit
+  // is 1.
   static inline uint128_t HashToCoeffRow(uint64_t h) {
       uint128_t a = uint128_t{h} * 0x9e3779b97f4a7c13U;
       uint128_t b = uint128_t{h} * 0xa4398ab94d038781U;
-      return b ^ (a << 64) ^ (a >> 64);
+      return (b ^ (a << 64) ^ (a >> 64)) | 1U;
   }
 
   static inline uint32_t HashToMatchRow(uint64_t h) {
@@ -577,6 +602,12 @@ struct SimpleGaussFilter {
     // Using that instead of 2^13 so that the base factor setting is
     // used through 2^13 - 1 keys.
     int extra_pow2 = std::max(FloorLog2(keys) - 12, int{0});
+
+    static int squeeze = getenv("SGAUSS_SQUEEZE") != nullptr ? std::atoi(getenv("SGAUSS_SQUEEZE")) : 0;
+    if (squeeze) {
+      extra_pow2 -= squeeze;
+    }
+
     double factor = 1.020 + extra_pow2 * 0.0042;
     size_t total_slots = static_cast<size_t>(factor * keys + 0.5);
 
@@ -586,7 +617,7 @@ struct SimpleGaussFilter {
     // with the number of keys.
     total_slots = (total_slots + 127) & ~size_t{127};
 
-    // TODO: check cast / put a hard limit
+    // TODO: check cast / put a hard limit and fall back to Bloom
     this->total_blocks = static_cast<uint32_t>(total_slots / 128);
   }
 
@@ -635,16 +666,32 @@ struct SimpleGaussFilter {
   }
 
   bool TrySolve(GaussData &gauss, const std::deque<uint64_t> &hashes) {
+    if (hashes.empty()) {
+      // exclude trivial case for prefetch code below
+      return true;
+    }
+
     uint32_t num_output_rows = total_blocks * 128;
     uint32_t match_row_mask = (uint32_t{1} << 1 << lower_match_bits) - 1;
     gauss.ResetFor(num_output_rows, match_row_mask);
 
-    // Build with seeded hashes
+    // Prime the pipeline with prefetch
+    uint64_t h = GaussData::SeedPreHash(hashes.back(), seed);
+    uint32_t start;
+    gauss.PrefetchForAdd(h, &start);
+
+    // Pipeline build
     for (uint64_t pre_h : hashes) {
-      uint64_t h = GaussData::SeedPreHash(pre_h, seed);
-      if (!gauss.Add(h)) {
+      uint64_t next_h = GaussData::SeedPreHash(pre_h, seed);
+      uint32_t next_start;
+      gauss.PrefetchForAdd(next_h, &next_start);
+
+      if (!gauss.AddPrefetched(h, start)) {
         return false;
       }
+
+      h = next_h;
+      start = next_start;
     }
     // Success
     return true;
