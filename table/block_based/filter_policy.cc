@@ -15,8 +15,8 @@
 #include "port/lang.h"
 #include "rocksdb/slice.h"
 #include "table/block_based/block_based_filter_block.h"
-#include "table/block_based/full_filter_block.h"
 #include "table/block_based/filter_policy_internal.h"
+#include "table/block_based/full_filter_block.h"
 #include "third-party/folly/folly/ConstexprMath.h"
 #include "util/bloom_impl.h"
 #include "util/coding.h"
@@ -443,9 +443,9 @@ struct GaussData {
   // and optimizes Add (esp prefetch) if we just ensure lowest bit
   // is 1.
   static inline uint128_t HashToCoeffRow(uint64_t h) {
-      uint128_t a = Multiply64to128(h, 0x9e3779b97f4a7c13U);
-      uint128_t b = Multiply64to128(h, 0xa4398ab94d038781U);
-      return (b ^ (a << 64) ^ (a >> 64)) | 1U;
+    uint128_t a = Multiply64to128(h, 0x9e3779b97f4a7c13U);
+    uint128_t b = Multiply64to128(h, 0xa4398ab94d038781U);
+    return (b ^ (a << 64) ^ (a >> 64)) | 1U;
   }
 
   static inline uint32_t HashToMatchRow(uint64_t h) {
