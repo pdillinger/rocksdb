@@ -21,7 +21,7 @@
 #include "util/bloom_impl.h"
 #include "util/coding.h"
 #include "util/hash.h"
-#include "util/math.h"
+#include "util/math128.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -343,7 +343,7 @@ class FastLocalBloomBitsReader : public FilterBitsReader {
   const uint32_t len_bytes_;
 };
 
-using uint128_t = __uint128_t;
+using uint128_t = Unsigned128;
 
 struct GaussData {
   uint32_t num_output_rows;
@@ -385,7 +385,7 @@ struct GaussData {
     uint128_t coeff_row = HashToCoeffRow(h);
 
     for (;;) {
-      assert(coeff_row & 1);
+      assert((coeff_row & 1) == 1);
       assert(start < num_output_rows);
       uint128_t other = coeff_rows_by_pivot[start];
       if (other == 0) {
@@ -393,18 +393,18 @@ struct GaussData {
         match_rows_by_pivot[start] = match_row;
         return true;
       }
-      assert(other & 1);
+      assert((other & 1) == 1);
       coeff_row ^= other;
       match_row ^= match_rows_by_pivot[start];
       int tz;
-      if (static_cast<uint64_t>(coeff_row) == 0) {
-        if (static_cast<uint64_t>(coeff_row >> 64) == 0) {
+      if (Lower64Of128(coeff_row) == 0) {
+        if (Upper64Of128(coeff_row) == 0) {
           break;
         } else {
-          tz = 64 + CountTrailingZeroBits(static_cast<uint64_t>(coeff_row >> 64));
+          tz = 64 + CountTrailingZeroBits(Upper64Of128(coeff_row));
         }
       } else {
-        tz = CountTrailingZeroBits(static_cast<uint64_t>(coeff_row));
+        tz = CountTrailingZeroBits(Lower64Of128(coeff_row));
       }
       start += static_cast<uint32_t>(tz);
       coeff_row >>= tz;
@@ -443,8 +443,8 @@ struct GaussData {
   // and optimizes Add (esp prefetch) if we just ensure lowest bit
   // is 1.
   static inline uint128_t HashToCoeffRow(uint64_t h) {
-      uint128_t a = uint128_t{h} * 0x9e3779b97f4a7c13U;
-      uint128_t b = uint128_t{h} * 0xa4398ab94d038781U;
+      uint128_t a = Multiply64to128(h, 0x9e3779b97f4a7c13U);
+      uint128_t b = Multiply64to128(h, 0xa4398ab94d038781U);
       return (b ^ (a << 64) ^ (a >> 64)) | 1U;
   }
 
@@ -716,8 +716,8 @@ struct SimpleGaussFilter {
       char *data_at_block = cur_data + (block * 16 * kMB);
       for (uint32_t j = 0; j < kMB; ++j) {
         //printf("Writing to %p, %lx\n", data_at_block + (j * 8), state[j]);
-        EncodeFixed64(data_at_block + (j * 16), static_cast<uint64_t>(state[j]));
-        EncodeFixed64(data_at_block + (j * 16) + 8, static_cast<uint64_t>(state[j] >> 64));
+        EncodeFixed64(data_at_block + (j * 16), Lower64Of128(state[j]));
+        EncodeFixed64(data_at_block + (j * 16) + 8, Upper64Of128(state[j]));
       }
     }
   }

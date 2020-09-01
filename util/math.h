@@ -104,8 +104,4 @@ inline int BitParity(T v) {
 #endif
 }
 
-template<> inline int BitParity(__uint128_t v) {
-  return BitParity(static_cast<uint64_t>(v)) ^ BitParity(static_cast<uint64_t>(v >> 64));
-}
-
 }  // namespace ROCKSDB_NAMESPACE
