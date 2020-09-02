@@ -396,16 +396,10 @@ struct GaussData {
       assert((other & 1) == 1);
       coeff_row ^= other;
       match_row ^= match_rows_by_pivot[start];
-      int tz;
-      if (Lower64Of128(coeff_row) == 0) {
-        if (Upper64Of128(coeff_row) == 0) {
-          break;
-        } else {
-          tz = 64 + CountTrailingZeroBits(Upper64Of128(coeff_row));
-        }
-      } else {
-        tz = CountTrailingZeroBits(Lower64Of128(coeff_row));
+      if (coeff_row == 0) {
+        break;
       }
+      int tz = CountTrailingZeroBits(coeff_row);
       start += static_cast<uint32_t>(tz);
       coeff_row >>= tz;
     }

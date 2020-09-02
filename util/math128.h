@@ -153,6 +153,15 @@ inline Unsigned128 Multiply64to128(uint64_t a, uint64_t b) {
 }
 
 template <>
+inline int CountTrailingZeroBits(Unsigned128 v) {
+  if (Lower64Of128(v) != 0) {
+    return CountTrailingZeroBits(Lower64Of128(v));
+  } else {
+    return CountTrailingZeroBits(Upper64Of128(v)) + 64;
+  }
+}
+
+template <>
 inline int BitParity(Unsigned128 v) {
   return BitParity(Lower64Of128(v)) ^ BitParity(Upper64Of128(v));
 }
