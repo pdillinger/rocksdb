@@ -5,11 +5,17 @@
 
 #pragma once
 
+#include "util/coding.h"
 #include "util/math.h"
+
+#ifdef TEST_UINT128_COMPAT
+#undef HAVE_UINT128_EXTENSION
+#endif
 
 namespace ROCKSDB_NAMESPACE {
 
-#undef HAVE_UINT128_EXTENSION
+// Unsigned128 is a 128 bit value supporting (at least) bitwise operators,
+// shifts, and comparisons. __uint128_t is not always available.
 
 #ifdef HAVE_UINT128_EXTENSION
 using Unsigned128 = __uint128_t;
@@ -45,7 +51,8 @@ inline Unsigned128 operator<<(const Unsigned128& lhs, unsigned shift) {
   } else {
     uint64_t tmp = lhs.lo;
     rv.lo = tmp << shift;
-    // Ensure shift==0 shifts away everything
+    // Ensure shift==0 shifts away everything. (This avoids another
+    // conditional branch on shift == 0.)
     tmp = tmp >> 1 >> (63 - shift);
     rv.hi = tmp | (lhs.hi << shift);
   }
@@ -112,9 +119,29 @@ inline Unsigned128 operator~(const Unsigned128& v) {
 inline bool operator==(const Unsigned128& lhs, const Unsigned128& rhs) {
   return lhs.lo == rhs.lo && lhs.hi == rhs.hi;
 }
+
+inline bool operator!=(const Unsigned128& lhs, const Unsigned128& rhs) {
+  return lhs.lo != rhs.lo || lhs.hi != rhs.hi;
+}
+
+inline bool operator>(const Unsigned128& lhs, const Unsigned128& rhs) {
+  return lhs.hi > rhs.hi || (lhs.hi == rhs.hi && lhs.lo > rhs.lo);
+}
+
+inline bool operator<(const Unsigned128& lhs, const Unsigned128& rhs) {
+  return lhs.hi < rhs.hi || (lhs.hi == rhs.hi && lhs.lo < rhs.lo);
+}
+
+inline bool operator>=(const Unsigned128& lhs, const Unsigned128& rhs) {
+  return lhs.hi > rhs.hi || (lhs.hi == rhs.hi && lhs.lo >= rhs.lo);
+}
+
+inline bool operator<=(const Unsigned128& lhs, const Unsigned128& rhs) {
+  return lhs.hi < rhs.hi || (lhs.hi == rhs.hi && lhs.lo <= rhs.lo);
+}
 #endif
 
-inline uint64_t Lower64Of128(Unsigned128 v) {
+inline uint64_t Lower64of128(Unsigned128 v) {
 #ifdef HAVE_UINT128_EXTENSION
   return static_cast<uint64_t>(v);
 #else
@@ -122,7 +149,7 @@ inline uint64_t Lower64Of128(Unsigned128 v) {
 #endif
 }
 
-inline uint64_t Upper64Of128(Unsigned128 v) {
+inline uint64_t Upper64of128(Unsigned128 v) {
 #ifdef HAVE_UINT128_EXTENSION
   return static_cast<uint64_t>(v >> 64);
 #else
@@ -130,9 +157,12 @@ inline uint64_t Upper64Of128(Unsigned128 v) {
 #endif
 }
 
+// This generally compiles down to a single fast instruction on 64-bit.
+// This doesn't really make sense as operator* because it's not a
+// general 128x128 multiply and provides more output than 64x64 multiply.
 inline Unsigned128 Multiply64to128(uint64_t a, uint64_t b) {
 #ifdef HAVE_UINT128_EXTENSION
-  return Unsigned128(a) * Unsigned128(b);
+  return Unsigned128{a} * Unsigned128{b};
 #else
   // Full decomposition
   // NOTE: GCC seems to fully understand this code as 64-bit x 64-bit
@@ -143,27 +173,51 @@ inline Unsigned128 Multiply64to128(uint64_t a, uint64_t b) {
   tmp += uint64_t{b & 0xffffFFFF} * uint64_t{a >> 32};
   // Avoid overflow: first add lower 32 of tmp2, and later upper 32
   uint64_t tmp2 = uint64_t{b >> 32} * uint64_t{a & 0xffffFFFF};
-  tmp += static_cast<uint32_t>(tmp2);
+  tmp += tmp2 & 0xffffFFFF;
   lower |= tmp << 32;
   tmp >>= 32;
-  tmp += (tmp2 >> 32);
+  tmp += tmp2 >> 32;
   tmp += uint64_t{b >> 32} * uint64_t{a >> 32};
   return Unsigned128(lower, tmp);
 #endif
 }
 
 template <>
-inline int CountTrailingZeroBits(Unsigned128 v) {
-  if (Lower64Of128(v) != 0) {
-    return CountTrailingZeroBits(Lower64Of128(v));
+inline int FloorLog2(Unsigned128 v) {
+  if (Upper64of128(v) == 0) {
+    return FloorLog2(Lower64of128(v));
   } else {
-    return CountTrailingZeroBits(Upper64Of128(v)) + 64;
+    return FloorLog2(Upper64of128(v)) + 64;
   }
 }
 
 template <>
+inline int CountTrailingZeroBits(Unsigned128 v) {
+  if (Lower64of128(v) != 0) {
+    return CountTrailingZeroBits(Lower64of128(v));
+  } else {
+    return CountTrailingZeroBits(Upper64of128(v)) + 64;
+  }
+}
+
+template <>
+inline int BitsSetToOne(Unsigned128 v) {
+  return BitsSetToOne(Lower64of128(v)) + BitsSetToOne(Upper64of128(v));
+}
+
+template <>
 inline int BitParity(Unsigned128 v) {
-  return BitParity(Lower64Of128(v)) ^ BitParity(Upper64Of128(v));
+  return BitParity(Lower64of128(v)) ^ BitParity(Upper64of128(v));
+}
+
+inline void EncodeFixed128(char* dst, Unsigned128 value) {
+  EncodeFixed64(dst, Lower64of128(value));
+  EncodeFixed64(dst + 8, Upper64of128(value));
+}
+
+inline Unsigned128 DecodeFixed128(const char* ptr) {
+  Unsigned128 rv = DecodeFixed64(ptr + 8);
+  return (rv << 64) | DecodeFixed64(ptr);
 }
 
 }  // namespace ROCKSDB_NAMESPACE

@@ -1284,8 +1284,8 @@ Status Version::GetTableProperties(std::shared_ptr<const TableProperties>* tp,
   // pass the magic number check in the footer.
   std::unique_ptr<RandomAccessFileReader> file_reader(
       new RandomAccessFileReader(
-          std::move(file), file_name, nullptr /* env */, nullptr /* stats */,
-          0 /* hist_type */, nullptr /* file_read_hist */,
+          std::move(file), file_name, nullptr /* env */, nullptr /* IOTracer */,
+          nullptr /* stats */, 0 /* hist_type */, nullptr /* file_read_hist */,
           nullptr /* rate_limiter */, ioptions->listeners));
   s = ReadTableProperties(
       file_reader.get(), file_meta->fd.GetFileSize(),
@@ -2477,9 +2477,21 @@ void VersionStorageInfo::ComputeCompactionScore(
           // Level-based involves L0->L0 compactions that can lead to oversized
           // L0 files. Take into account size as well to avoid later giant
           // compactions to the base level.
-          score = std::max(
-              score, static_cast<double>(total_size) /
-                     mutable_cf_options.max_bytes_for_level_base);
+          uint64_t l0_target_size = mutable_cf_options.max_bytes_for_level_base;
+          if (immutable_cf_options.level_compaction_dynamic_level_bytes &&
+              level_multiplier_ != 0.0) {
+            // Prevent L0 to Lbase fanout from growing larger than
+            // `level_multiplier_`. This prevents us from getting stuck picking
+            // L0 forever even when it is hurting write-amp. That could happen
+            // in dynamic level compaction's write-burst mode where the base
+            // level's target size can grow to be enormous.
+            l0_target_size =
+                std::max(l0_target_size,
+                         static_cast<uint64_t>(level_max_bytes_[base_level_] /
+                                               level_multiplier_));
+          }
+          score =
+              std::max(score, static_cast<double>(total_size) / l0_target_size);
         }
       }
     } else {
@@ -3563,6 +3575,7 @@ struct VersionSet::ManifestWriter {
         cfd(_cfd),
         mutable_cf_options(cf_options),
         edit_list(e) {}
+  ~ManifestWriter() { status.PermitUncheckedError(); }
 };
 
 Status AtomicGroupReadBuffer::AddEdit(VersionEdit* edit) {
@@ -3617,9 +3630,10 @@ VersionSet::VersionSet(const std::string& dbname,
                        WriteController* write_controller,
                        BlockCacheTracer* const block_cache_tracer,
                        const std::shared_ptr<IOTracer>& io_tracer)
-    : column_family_set_(new ColumnFamilySet(
-          dbname, _db_options, storage_options, table_cache,
-          write_buffer_manager, write_controller, block_cache_tracer)),
+    : column_family_set_(
+          new ColumnFamilySet(dbname, _db_options, storage_options, table_cache,
+                              write_buffer_manager, write_controller,
+                              block_cache_tracer, io_tracer)),
       env_(_db_options->env),
       fs_(_db_options->fs, io_tracer),
       dbname_(dbname),
@@ -3651,6 +3665,7 @@ VersionSet::~VersionSet() {
     file.DeleteMetadata();
   }
   obsolete_files_.clear();
+  io_status_.PermitUncheckedError();
 }
 
 void VersionSet::Reset() {
@@ -3658,9 +3673,9 @@ void VersionSet::Reset() {
     Cache* table_cache = column_family_set_->get_table_cache();
     WriteBufferManager* wbm = column_family_set_->write_buffer_manager();
     WriteController* wc = column_family_set_->write_controller();
-    column_family_set_.reset(new ColumnFamilySet(dbname_, db_options_,
-                                                 file_options_, table_cache,
-                                                 wbm, wc, block_cache_tracer_));
+    column_family_set_.reset(
+        new ColumnFamilySet(dbname_, db_options_, file_options_, table_cache,
+                            wbm, wc, block_cache_tracer_, io_tracer_));
   }
   db_id_.clear();
   next_file_number_.store(2);
@@ -4558,7 +4573,7 @@ Status VersionSet::Recover(
     }
     manifest_file_reader.reset(
         new SequentialFileReader(std::move(manifest_file), manifest_path,
-                                 db_options_->log_readahead_size));
+                                 db_options_->log_readahead_size, io_tracer_));
   }
 
   VersionBuilderMap builders;
@@ -4840,7 +4855,7 @@ Status VersionSet::TryRecoverFromOneManifest(
     }
     manifest_file_reader.reset(
         new SequentialFileReader(std::move(manifest_file), manifest_path,
-                                 db_options_->log_readahead_size));
+                                 db_options_->log_readahead_size, io_tracer_));
   }
 
   assert(s.ok());
@@ -4881,7 +4896,8 @@ Status VersionSet::ListColumnFamilies(std::vector<std::string>* column_families,
     if (!s.ok()) {
       return s;
   }
-  file_reader.reset(new SequentialFileReader(std::move(file), manifest_path));
+  file_reader.reset(new SequentialFileReader(std::move(file), manifest_path,
+                                             nullptr /*IOTracer*/));
   }
 
   std::map<uint32_t, std::string> column_family_names;
@@ -5070,7 +5086,7 @@ Status VersionSet::DumpManifest(Options& options, std::string& dscname,
       return s;
     }
     file_reader.reset(new SequentialFileReader(
-        std::move(file), dscname, db_options_->log_readahead_size));
+        std::move(file), dscname, db_options_->log_readahead_size, io_tracer_));
   }
 
   bool have_prev_log_number = false;
@@ -6368,9 +6384,9 @@ Status ReactiveVersionSet::MaybeSwitchManifest(
     }
     std::unique_ptr<SequentialFileReader> manifest_file_reader;
     if (s.ok()) {
-      manifest_file_reader.reset(
-          new SequentialFileReader(std::move(manifest_file), manifest_path,
-                                   db_options_->log_readahead_size));
+      manifest_file_reader.reset(new SequentialFileReader(
+          std::move(manifest_file), manifest_path,
+          db_options_->log_readahead_size, io_tracer_));
       manifest_reader->reset(new log::FragmentBufferedReader(
           nullptr, std::move(manifest_file_reader), reporter,
           true /* checksum */, 0 /* log_number */));

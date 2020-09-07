@@ -219,6 +219,13 @@ extern ROCKSDB_LIBRARY_API rocksdb_t* rocksdb_open_column_families(
     const rocksdb_options_t* const* column_family_options,
     rocksdb_column_family_handle_t** column_family_handles, char** errptr);
 
+extern ROCKSDB_LIBRARY_API rocksdb_t* rocksdb_open_column_families_with_ttl(
+    const rocksdb_options_t* options, const char* name, int num_column_families,
+    const char* const* column_family_names,
+    const rocksdb_options_t* const* column_family_options,
+    rocksdb_column_family_handle_t** column_family_handles, const int* ttls,
+    char** errptr);
+
 extern ROCKSDB_LIBRARY_API rocksdb_t*
 rocksdb_open_for_read_only_column_families(
     const rocksdb_options_t* options, const char* name, int num_column_families,
@@ -245,6 +252,11 @@ extern ROCKSDB_LIBRARY_API rocksdb_column_family_handle_t*
 rocksdb_create_column_family(rocksdb_t* db,
                              const rocksdb_options_t* column_family_options,
                              const char* column_family_name, char** errptr);
+
+extern ROCKSDB_LIBRARY_API rocksdb_column_family_handle_t*
+rocksdb_create_column_family_with_ttl(
+    rocksdb_t* db, const rocksdb_options_t* column_family_options,
+    const char* column_family_name, int ttl, char** errptr);
 
 extern ROCKSDB_LIBRARY_API void rocksdb_drop_column_family(
     rocksdb_t* db, rocksdb_column_family_handle_t* handle, char** errptr);
@@ -1454,8 +1466,12 @@ extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_destroy(
     rocksdb_readoptions_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_verify_checksums(
     rocksdb_readoptions_t*, unsigned char);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_readoptions_get_verify_checksums(rocksdb_readoptions_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_fill_cache(
     rocksdb_readoptions_t*, unsigned char);
+extern ROCKSDB_LIBRARY_API unsigned char rocksdb_readoptions_get_fill_cache(
+    rocksdb_readoptions_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_snapshot(
     rocksdb_readoptions_t*, const rocksdb_snapshot_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_iterate_upper_bound(
@@ -1464,25 +1480,44 @@ extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_iterate_lower_bound(
     rocksdb_readoptions_t*, const char* key, size_t keylen);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_read_tier(
     rocksdb_readoptions_t*, int);
+extern ROCKSDB_LIBRARY_API int rocksdb_readoptions_get_read_tier(
+    rocksdb_readoptions_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_tailing(
     rocksdb_readoptions_t*, unsigned char);
+extern ROCKSDB_LIBRARY_API unsigned char rocksdb_readoptions_get_tailing(
+    rocksdb_readoptions_t*);
 // The functionality that this option controlled has been removed.
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_managed(
     rocksdb_readoptions_t*, unsigned char);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_readahead_size(
     rocksdb_readoptions_t*, size_t);
+extern ROCKSDB_LIBRARY_API size_t
+rocksdb_readoptions_get_readahead_size(rocksdb_readoptions_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_prefix_same_as_start(
     rocksdb_readoptions_t*, unsigned char);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_readoptions_get_prefix_same_as_start(rocksdb_readoptions_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_pin_data(
     rocksdb_readoptions_t*, unsigned char);
+extern ROCKSDB_LIBRARY_API unsigned char rocksdb_readoptions_get_pin_data(
+    rocksdb_readoptions_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_total_order_seek(
     rocksdb_readoptions_t*, unsigned char);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_readoptions_get_total_order_seek(rocksdb_readoptions_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_max_skippable_internal_keys(
     rocksdb_readoptions_t*, uint64_t);
+extern ROCKSDB_LIBRARY_API uint64_t
+rocksdb_readoptions_get_max_skippable_internal_keys(rocksdb_readoptions_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_background_purge_on_iterator_cleanup(
     rocksdb_readoptions_t*, unsigned char);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_readoptions_get_background_purge_on_iterator_cleanup(
+    rocksdb_readoptions_t*);
 extern ROCKSDB_LIBRARY_API void rocksdb_readoptions_set_ignore_range_deletions(
     rocksdb_readoptions_t*, unsigned char);
+extern ROCKSDB_LIBRARY_API unsigned char
+rocksdb_readoptions_get_ignore_range_deletions(rocksdb_readoptions_t*);
 
 /* Write options */
 
