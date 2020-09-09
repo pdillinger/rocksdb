@@ -710,8 +710,7 @@ struct SimpleGaussFilter {
       char *data_at_block = cur_data + (block * 16 * kMB);
       for (uint32_t j = 0; j < kMB; ++j) {
         //printf("Writing to %p, %lx\n", data_at_block + (j * 8), state[j]);
-        EncodeFixed64(data_at_block + (j * 16), Lower64Of128(state[j]));
-        EncodeFixed64(data_at_block + (j * 16) + 8, Upper64Of128(state[j]));
+        EncodeFixed128(data_at_block + (j * 16), state[j]);
       }
     }
   }
