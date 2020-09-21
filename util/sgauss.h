@@ -199,14 +199,14 @@ bool SolveSGauss(SolverStorage *st, const std::deque<SolverStorage::Input> &inpu
 }
 */
 
-template<size_t kResultBits, typename SolverStorage>
-void BackSubstStep(std::array<SolverStorage::CoeffRow, kResultBits> *state, const SolverStorage *ss, SolverStorage::Index base_slot, SolverStorage::Index slot_count) {
+template<typename SolverStorage>
+void BackSubstStep(SolverStorage::CoeffRow *state, SolverStorage::Index result_bits, const SolverStorage *ss, SolverStorage::Index base_slot, SolverStorage::Index slot_count) {
   using SS = SolverStorage;
   for (SS::Index i = base_slot + slot_count; i > base_slot;) {
     --i;
     SS::CoeffRow cr = *ss->CoeffRowPtr(i);
     SS:ResultRow rr = *ss->ResultRowPtr(i);
-    for (SS::Index j = 0; j < kResultBits; ++j) {
+    for (SS::Index j = 0; j < result_bits; ++j) {
       SS::CoeffRow tmp = state[j] << 1;
       tmp |= SS::CoeffRow{BitParity(tmp & cr) ^ ((rr >> j) & 1)};
       state[j] = tmp;
@@ -214,38 +214,47 @@ void BackSubstStep(std::array<SolverStorage::CoeffRow, kResultBits> *state, cons
   }
 }
 
-// concept SolutionStorageHelper {
+// concept ByColumnSolutionStorage extends SGaussTypes {
 //   typename Unit;
-//   typename PtrUnit;
-//   static void Store(PtrUnit *ptr, Unit data);
-//   static Unit Load(const PtrUnit *ptr);
+//   Index GetNumColumns() const;
+//   Unit Load(Index block_num, Index column) const;
+//   void Store(Index block_num, Index column, Unit data);
 // };
 
-template<typename SolutionStorageHelper, size_t kResultBits, typename SolverStorage>
-void InterleavedBackSubstRangeK(SolutionStorageHelper::PtrUnit *ptr, std::array<SolverStorage::CoeffRow, kResultBits> *state, const SolverStorage *ss, SolverStorage::Index base_slot, SolverStorage::Index unit_count) {
+template<typename SolutionStorageHelper, typename SolverStorage>
+void ByColumnBackSubstRange(ByColumnSolutionStorage *bcss, SolverStorage::CoeffRow *state, const SolverStorage *ss, SolverStorage::Index start_block, SolverStorage::Index block_count) {
   using SS = SolverStorage;
-  using SSH = SolutionStorageHelper;
 
-  constexpr auto kUnitBits = static_cast<SS::Index>(sizeof(SSH::Unit) * 8U);
-  constexpr size_t kRatio = sizeof(SSH::Unit) / sizeof(SSH::PtrUnit)
-  static_assert(sizeof(SSH::Unit) == sizeof(SSH::PtrUnit) * kRatio, "Must evenly divide");
+  constexpr auto kUnitBits = static_cast<SS::Index>(sizeof(ByColumnSolutionStorage::Unit) * 8U);
 
-  for (SS::Index i = unit_count; i > 0;) {
+  const SS::Index result_bits = bcss->GetNumColumns();
+
+  for (SS::Index i = start_block + block_count; i > start_block;) {
     --i;
-    BackSubstStep<kResultBits>(state, ss, base_slot + i * kUnitBits, kUnitBits);
-    for (SS::Index j = 0; j < kResultBits; ++j) {
+    BackSubstStep(state, result_bits, ss, i * kUnitBits, kUnitBits);
+    for (SS::Index j = 0; j < result_bits; ++j) {
       // Extract lower bits (or all) of corresponding state
       auto v = static_cast<SSH::Unit>((*state)[j]);
       // And store in solution structure
-      SSH::Store(ptr + (i * kResultBits + j) * kRatio, v);
+      bcss->Store(i, j, v);
     }
   }
 }
 
-template<typename SolutionStorageHelper, typename Hasher>
-Hasher::ResultRow InterleavedPhsfQuery(const Hasher::Input &input, const SolutionStorageHelper::PtrUnit *ptr, SS::Index result_bits) {
+template<typename ByColumnSolutionStorage, typename Hasher>
+Hasher::ResultRow ByColumnPhsfQuery(const Hasher::Input &input, ByColumnSolutionStorage *bcss) {
 
 }
+
+
+
+
+/*
+  constexpr size_t kRatio = sizeof(SSH::Unit) / sizeof(SSH::PtrUnit)
+  static_assert(sizeof(SSH::Unit) == sizeof(SSH::PtrUnit) * kRatio, "Must evenly divide");
+
+      SSH::Store(ptr + (i * result_bits + j) * kRatio, v);
+*/
 
 
 }  // namespace SGauss
