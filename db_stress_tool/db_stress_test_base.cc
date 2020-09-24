@@ -1223,9 +1223,6 @@ Status StressTest::TestBackupRestore(
   // For debugging, get info_log from live options
   backup_opts.info_log = db_->GetDBOptions().info_log.get();
   assert(backup_opts.info_log);
-  if (thread->rand.OneIn(2)) {
-    backup_opts.file_checksum_gen_factory = options_.file_checksum_gen_factory;
-  }
   if (thread->rand.OneIn(10)) {
     backup_opts.share_table_files = false;
   } else {
@@ -1236,11 +1233,22 @@ Status StressTest::TestBackupRestore(
       backup_opts.share_files_with_checksum = true;
       if (thread->rand.OneIn(2)) {
         // old
-        backup_opts.share_files_with_checksum_naming = kChecksumAndFileSize;
+        backup_opts.share_files_with_checksum_naming =
+            BackupableDBOptions::kLegacyCrc32cAndFileSize;
       } else {
         // new
         backup_opts.share_files_with_checksum_naming =
-            kOptionalChecksumAndDbSessionId;
+            BackupableDBOptions::kUseDbSessionId;
+      }
+      if (thread->rand.OneIn(2)) {
+        backup_opts.share_files_with_checksum_naming =
+            backup_opts.share_files_with_checksum_naming |
+            BackupableDBOptions::kFlagIncludeFileSize;
+      }
+      if (thread->rand.OneIn(2)) {
+        backup_opts.share_files_with_checksum_naming =
+            backup_opts.share_files_with_checksum_naming |
+            BackupableDBOptions::kFlagMatchInterimNaming;
       }
     }
   }
@@ -1280,6 +1288,7 @@ Status StressTest::TestBackupRestore(
       from = "BackupEngine::VerifyBackup";
     }
   }
+  const bool allow_persistent = thread->tid == 0;  // not too many
   bool from_latest = false;
   if (s.ok()) {
     int count = static_cast<int>(backup_info.size());
@@ -1302,7 +1311,7 @@ Status StressTest::TestBackupRestore(
   }
   if (s.ok()) {
     uint32_t to_keep = 0;
-    if (thread->tid == 0) {
+    if (allow_persistent) {
       // allow one thread to keep up to 2 backups
       to_keep = thread->rand.Uniform(3);
     }
@@ -1313,9 +1322,12 @@ Status StressTest::TestBackupRestore(
   }
   DB* restored_db = nullptr;
   std::vector<ColumnFamilyHandle*> restored_cf_handles;
-  if (s.ok()) {
+  // Not yet implemented: opening restored BlobDB or TransactionDB
+  if (s.ok() && !FLAGS_use_txn && !FLAGS_use_blob_db) {
     Options restore_options(options_);
     restore_options.listeners.clear();
+    // Avoid dangling/shared file descriptors, for reliable destroy
+    restore_options.sst_file_manager = nullptr;
     std::vector<ColumnFamilyDescriptor> cf_descriptors;
     // TODO(ajkr): `column_family_names_` is not safe to access here when
     // `clear_column_family_one_in != 0`. But we can't easily switch to
@@ -1337,7 +1349,7 @@ Status StressTest::TestBackupRestore(
   //
   // For simplicity, currently only verifies existence/non-existence of a
   // single key
-  for (size_t i = 0; from_latest && s.ok() && i < rand_column_families.size();
+  for (size_t i = 0; restored_db && s.ok() && i < rand_column_families.size();
        ++i) {
     std::string key_str = Key(rand_keys[0]);
     Slice key = key_str;
@@ -1345,13 +1357,13 @@ Status StressTest::TestBackupRestore(
     Status get_status = restored_db->Get(
         ReadOptions(), restored_cf_handles[rand_column_families[i]], key,
         &restored_value);
-    bool exists = thread->shared->Exists(rand_column_families[i], rand_keys[i]);
+    bool exists = thread->shared->Exists(rand_column_families[i], rand_keys[0]);
     if (get_status.ok()) {
-      if (!exists) {
+      if (!exists && from_latest && ShouldAcquireMutexOnKey()) {
         s = Status::Corruption("key exists in restore but not in original db");
       }
     } else if (get_status.IsNotFound()) {
-      if (exists) {
+      if (exists && from_latest && ShouldAcquireMutexOnKey()) {
         s = Status::Corruption("key exists in original db but not in restore");
       }
     } else {
@@ -1371,6 +1383,21 @@ Status StressTest::TestBackupRestore(
     }
     delete restored_db;
     restored_db = nullptr;
+  }
+  if (s.ok()) {
+    // Preserve directories on failure, or allowed persistent backup
+    if (!allow_persistent) {
+      s = DestroyDir(db_stress_env, backup_dir);
+      if (!s.ok()) {
+        from = "Destroy backup dir";
+      }
+    }
+  }
+  if (s.ok()) {
+    s = DestroyDir(db_stress_env, restore_dir);
+    if (!s.ok()) {
+      from = "Destroy restore dir";
+    }
   }
   if (!s.ok()) {
     fprintf(stderr, "Failure in %s with: %s\n", from.c_str(),
@@ -1424,10 +1451,6 @@ Status StressTest::TestApproximateSize(
 Status StressTest::TestCheckpoint(ThreadState* thread,
                                   const std::vector<int>& rand_column_families,
                                   const std::vector<int64_t>& rand_keys) {
-  // Note the column families chosen by `rand_column_families` cannot be
-  // dropped while the locks for `rand_keys` are held. So we should not have
-  // to worry about accessing those column families throughout this function.
-  assert(rand_column_families.size() == rand_keys.size());
   std::string checkpoint_dir =
       FLAGS_db + "/.checkpoint" + ToString(thread->tid);
   Options tmp_opts(options_);
@@ -1477,6 +1500,7 @@ Status StressTest::TestCheckpoint(ThreadState* thread,
     // `clear_column_family_one_in != 0`. But we can't easily switch to
     // `ListColumnFamilies` to get names because it won't necessarily give
     // the same order as `column_family_names_`.
+    assert(FLAGS_clear_column_family_one_in == 0);
     if (FLAGS_clear_column_family_one_in == 0) {
       for (const auto& name : column_family_names_) {
         cf_descs.emplace_back(name, ColumnFamilyOptions(options));
@@ -1486,21 +1510,24 @@ Status StressTest::TestCheckpoint(ThreadState* thread,
     }
   }
   if (checkpoint_db != nullptr) {
+    // Note the column families chosen by `rand_column_families` cannot be
+    // dropped while the locks for `rand_keys` are held. So we should not have
+    // to worry about accessing those column families throughout this function.
     for (size_t i = 0; s.ok() && i < rand_column_families.size(); ++i) {
-      std::string key_str = Key(rand_keys[i]);
+      std::string key_str = Key(rand_keys[0]);
       Slice key = key_str;
       std::string value;
       Status get_status = checkpoint_db->Get(
           ReadOptions(), cf_handles[rand_column_families[i]], key, &value);
       bool exists =
-          thread->shared->Exists(rand_column_families[i], rand_keys[i]);
+          thread->shared->Exists(rand_column_families[i], rand_keys[0]);
       if (get_status.ok()) {
-        if (!exists) {
+        if (!exists && ShouldAcquireMutexOnKey()) {
           s = Status::Corruption(
               "key exists in checkpoint but not in original db");
         }
       } else if (get_status.IsNotFound()) {
-        if (exists) {
+        if (exists && ShouldAcquireMutexOnKey()) {
           s = Status::Corruption(
               "key exists in original db but not in checkpoint");
         }

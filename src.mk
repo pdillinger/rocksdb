@@ -123,11 +123,18 @@ LIB_SOURCES =                                                   \
   monitoring/thread_status_util.cc                              \
   monitoring/thread_status_util_debug.cc                        \
   options/cf_options.cc                                         \
+  options/configurable.cc                                       \
   options/db_options.cc                                         \
   options/options.cc                                            \
   options/options_helper.cc                                     \
   options/options_parser.cc                                     \
   port/port_posix.cc                                            \
+  port/win/env_default.cc                                       \
+  port/win/env_win.cc                                           \
+  port/win/io_win.cc                                            \
+  port/win/port_win.cc                                          \
+  port/win/win_logger.cc                                        \
+  port/win/win_thread.cc                                        \
   port/stack_trace.cc                                           \
   table/adaptive/adaptive_table_factory.cc                      \
   table/block_based/binary_search_index_reader.cc               \
@@ -174,6 +181,7 @@ LIB_SOURCES =                                                   \
   table/sst_file_dumper.cc                                      \
   table/sst_file_reader.cc                                      \
   table/sst_file_writer.cc                                      \
+  table/table_factory.cc                                        \
   table/table_properties.cc                                     \
   table/two_level_iterator.cc                                   \
   test_util/sync_point.cc                                       \
@@ -303,6 +311,7 @@ STRESS_LIB_SOURCES =                                            \
 
 TEST_LIB_SOURCES =                                              \
   db/db_test_util.cc                                            \
+  test_util/mock_time_env.cc                                    \
   test_util/testharness.cc                                      \
   test_util/testutil.cc                                         \
   utilities/cassandra/test_utils.cc                             \
@@ -439,6 +448,7 @@ TEST_MAIN_SOURCES =                                                     \
   monitoring/statistics_test.cc                                         \
   monitoring/stats_dump_scheduler_test.cc                               \
   monitoring/stats_history_test.cc                                      \
+  options/configurable_test.cc                                          \
   options/options_settable_test.cc                                      \
   options/options_test.cc                                               \
   table/block_based/block_based_filter_block_test.cc                    \
@@ -531,6 +541,7 @@ JNI_NATIVE_SOURCES =                                          \
   java/rocksjni/comparator.cc                                 \
   java/rocksjni/comparatorjnicallback.cc                      \
   java/rocksjni/compression_options.cc                        \
+  java/rocksjni/concurrent_task_limiter.cc                    \
   java/rocksjni/config_options.cc                             \
   java/rocksjni/env.cc                                        \
   java/rocksjni/env_options.cc                                \
