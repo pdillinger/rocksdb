@@ -17,33 +17,51 @@ namespace SGauss {
 //   typename Index;
 // };
 
-// concept Hasher extends SGaussTypes {
+// concept PhsfQueryHasher extends SGaussTypes {
 //   // For a filter, Input will be just a key. For a general PHSF, it must
 //   // include key and result it maps to (e.g. in a pair).
-//   typename Input;
+//   typename QueryInput;
 //   // Type for hashed summary of "key" part of Input. uint64_t recommended.
 //   typename Hash;
 //
-//   Hash GetHash(const Input &);
-//   Index GetStart(Hash);
-//   CoeffRow GetCoeffRow(Hash);
-//
-//   // Whether the solver can assume the lowest bit of GetCoeffRow is
-//   // always 1. When true, it should improve solver efficiency slightly.
-//   static bool kFirstCoeffAlwaysOne;
-//
-//   // Either the Input (PHSF) or the Hash (filter) may be used to get
-//   // the result row. Only one of these needs to return the value, and
-//   // the other should return constant 0.
+//   Hash GetHash(const QueryInput &) const;
+//   Index GetStart(Hash) const;
+//   CoeffRow GetCoeffRow(Hash) const;
+// };
+
+// concept FilterQueryHasher extends PhsfQueryHasher {
+//   // For building or querying a filter, this returns the expected
+//   // result row associated with a hashed input. For general PHSF,
+//   // this must return 0.
 //   //
 //   // Although not strictly required, there's a slightly better chance of
 //   // solver success if result row is masked down here to only the bits
 //   // actually needed.
-//   ResultRow GetResultRowFromInput(const Input &);
-//   ResultRow GetResultRowFromHash(const Hash &);
-// };
+//   ResultRow GetResultRowFromHash(const Hash &) const;
+// }
 
-// concept SolverStorage extends Hasher {
+// concept BuilderHasher extends FilterQueryHasher {
+//   // For a filter, this will generally be the same as QueryInput (a key).
+//   // For a general PHSF, it must either
+//   // (a) include a key and a result it maps to (e.g. in a pair), or
+//   // (b) GetResultRowFromInput looks up the result somewhere rather than
+//   // extracting it.
+//   typename BuilderInput;
+//
+//   // We don't need to directly extract QueryInput from BuilderInput, but
+//   // this is simple if BuilderInput == QueryInput.
+//   Hash GetHash(const BuilderInput &) const;
+//
+//   // For building a non-filter PHSF, this extracts or looks up the result
+//   // row to associate with an input. For filter PHSF, this must return 0.
+//   ResultRow GetResultRowFromInput(const BuilderInput &) const;
+//
+//   // Whether the solver can assume the lowest bit of GetCoeffRow is
+//   // always 1. When true, it should improve solver efficiency slightly.
+//   static bool kFirstCoeffAlwaysOne;
+// }
+
+// concept SolverStorage extends BuilderHasher {
 //   bool UsePrefetch();
 //   void Prefetch(Index i);
 //   CoeffRow* CoeffRowPtr(Index i);
@@ -100,6 +118,7 @@ bool SolverAdd(SolverStorage *ss, SolverStorage::Hash h,
   return rr == 0;
 }
 
+// Here "Input" is short for BuilderInput.
 template<typename SolverStorage, typename BacktrackStorage, typename InputIterator>
 bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, InputIterator begin, InputIterator end) {
   using SS = SolverStorage;
@@ -165,6 +184,7 @@ bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, InputIterator 
   return false;
 }
 
+// Here "Input" is short for BuilderInput.
 template<typename SolverStorage, typename InputIterator>
 bool Solve(SolverStorage *ss, InputIterator begin, InputIterator end) {
   struct NoopBacktrackStorage {
@@ -217,6 +237,7 @@ void BackSubstStep(SolverStorage::CoeffRow *state, SolverStorage::Index result_b
 // concept ByColumnSolutionStorage extends SGaussTypes {
 //   typename Unit;
 //   Index GetNumColumns() const;
+//   // Assuming little endian across blocks
 //   Unit Load(Index block_num, Index column) const;
 //   void Store(Index block_num, Index column, Unit data);
 // };
@@ -241,21 +262,61 @@ void ByColumnBackSubstRange(ByColumnSolutionStorage *bcss, SolverStorage::CoeffR
   }
 }
 
-template<typename ByColumnSolutionStorage, typename Hasher>
-Hasher::ResultRow ByColumnPhsfQuery(const Hasher::Input &input, ByColumnSolutionStorage *bcss) {
+template<typename ByColumnSolutionStorage, typename PhsfQueryHasher>
+bool ByColumnGeneralizedQuery(const PhsfQueryHasher &hasher, PhsfQueryHasher::Hash &hash, const ByColumnSolutionStorage &bcss, ByColumnSolutionStorage::Result *result, bool match) {
+  using BCSS = ByColumnSolutionStorage;
 
+  // always compile-time constants
+  constexpr auto kUnitBits = static_cast<BCSS::Index>(sizeof(BCSS::Unit) * 8U);
+  constexpr auto kCoeffBits = static_cast<BCSS::Index>(sizeof(BCSS::CoeffRow) * 8U);
+
+  // sometimes compile-time constant
+  const BCSS::Index num_columns = bcss.GetNumColumns();
+
+  // always dynamic
+  const BCSS::Index start_slot = hasher.GetStart(hash);
+  const BCSS::CoeffRow cr = hasher.GetCoeffRow(hash);
+  const BCSS::Index start_bit = start_slot % kUnitBits;
+  const BCSS::Index start_block = start_slot / kUnitBits;
+  const BCSS::Index end_block = (start_slot + kCoeffBits - 1) / kUnitBits;
+
+  for (BCSS::Index column = 0; column < num_columns; ++column) {
+    // First block is the only one that we left shift cr for.
+    // This approach makes most sense when kCoeffBits >= kUnitBits.
+    // TODO? Good impl for kCoeffBits < kUnitBits
+    BCSS::Unit val = bcss.Load(start_block, column) & static_cast<BCSS::Unit>(cr << start_bit);
+    for (BCSS::Index i = 1; start_block + i <= end_block; ++i) {
+      // The rest we right shift cr for
+      val ^= bcss.Load(start_block + i, column) & static_cast<BCSS::Unit>(cr >> (i * kUnitBits - start_bit));
+    }
+    auto bit = BCSS::ResultRow{BitParity(val)};
+    if (match) {
+      // filter behavior
+      if (((*result >> column) & 1U) != bit) {
+        return false;
+      }
+    } else {
+      // PHSF behavior
+      *result |= bit << column;
+    }
+  }
+  return true;
 }
 
+template<typename ByColumnSolutionStorage, typename PhsfQueryHasher>
+ByColumnSolutionStorage::Result ByColumnPhsfQuery(const PhsfQueryHasher::QueryInput &input, const PhsfQueryHasher &hasher, const ByColumnSolutionStorage &bcss) {
+  PhsfQueryHasher::Hash hash = hasher.GetHash(input);
+  ByColumnSolutionStorage::Result result = 0;
+  ByColumnGeneralizedQuery(hasher, hash, bcss, &result, false /*match*/);
+  return result;
+}
 
-
-
-/*
-  constexpr size_t kRatio = sizeof(SSH::Unit) / sizeof(SSH::PtrUnit)
-  static_assert(sizeof(SSH::Unit) == sizeof(SSH::PtrUnit) * kRatio, "Must evenly divide");
-
-      SSH::Store(ptr + (i * result_bits + j) * kRatio, v);
-*/
-
+template<typename ByColumnSolutionStorage, typename FilterQueryHasher>
+bool ByColumnFilterQuery(const FilterQueryHasher::QueryInput &input, const FilterQueryHasher &hasher, const ByColumnSolutionStorage &bcss) {
+  FilterQueryHasher::Hash hash = hasher.GetHash(input);
+  ByColumnSolutionStorage::Result result = hasher.GetResultRowFromHash(hash);
+  return ByColumnGeneralizedQuery(hasher, hash, bcss, &result, true /*match*/);
+}
 
 }  // namespace SGauss
 
