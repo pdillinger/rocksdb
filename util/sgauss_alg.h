@@ -37,7 +37,7 @@ namespace SGauss {
 //   // Although not strictly required, there's a slightly better chance of
 //   // solver success if result row is masked down here to only the bits
 //   // actually needed.
-//   ResultRow GetResultRowFromHash(const Hash &) const;
+//   ResultRow GetResultRowFromHash(Hash) const;
 // }
 
 // concept BuilderHasher extends FilterQueryHasher {
@@ -61,6 +61,7 @@ namespace SGauss {
 //   static bool kFirstCoeffAlwaysOne;
 // }
 
+// TODO: separate hasher
 // concept SolverStorage extends BuilderHasher {
 //   bool UsePrefetch();
 //   void Prefetch(Index i);
