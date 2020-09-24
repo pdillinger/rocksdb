@@ -18,17 +18,24 @@ namespace SGauss {
 //   typename Hash;
 //   typename Key;
 //   typename Seed;
-//   static constexpr bool kFilter;
+//   static constexpr bool kIsFilter;
 //   static constexpr bool kFirstCoeffAlwaysOne;
 //   static constexpr bool kUsePrefetch;
 //   static Hash HashFn(const Key &, Seed);
 // };
 
+// A bit of a hack to automatically construct the type for
+// BuilderInput based on a constexpr bool.
 template<class TypesAndSettings, bool IsFilter>
 class BuilderInputSelector : public TypesAndSettings {
 public:
   // For general PHSF, not filter
   using BuilderInput = std::pair<Key, ResultRow>;
+
+  inline ResultRow GetResultRowMask() const {
+    // all bits set
+    return ResultRow{0} - ResultRow{1};
+  }
 };
 
 template<class TypesAndSettings>
@@ -36,10 +43,16 @@ class BuilderInputSelector<TypesAndSettings, true /*IsFilter*/> : public TypesAn
 public:
   // For Filter
   using BuilderInput = Key;
+
+  inline ResultRow GetResultRowMask() const {
+    return rr_mask_;
+  }
+protected:
+  ResultRow rr_mask_ = ResultRow{0} - ResultRow{1};
 };
 
 template<class TypesAndSettings>
-class StandardHasher : public BuilderInputSelector<TypesAndSettings, TypesAndSettings::kFilter> {
+class StandardHasher : public BuilderInputSelector<TypesAndSettings, TypesAndSettings::kIsFilter> {
 public:
   using QueryInput = Key;
 
