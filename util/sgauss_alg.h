@@ -25,7 +25,7 @@ namespace SGauss {
 //   typename Hash;
 //
 //   Hash GetHash(const QueryInput &) const;
-//   Index GetStart(Hash) const;
+//   Index GetStart(Hash, Index num_starts) const;
 //   CoeffRow GetCoeffRow(Hash) const;
 // };
 
@@ -62,16 +62,17 @@ namespace SGauss {
 // }
 
 // concept SolverStorage extends SGaussTypes {
-//   bool UsePrefetch();
-//   void Prefetch(Index i);
+//   bool UsePrefetch() const;
+//   void Prefetch(Index i) const;
 //   CoeffRow* CoeffRowPtr(Index i);
 //   ResultRow* ResultRowPtr(Index i);
+//   Index GetNumStarts() const;
 // };
 
 // concept BacktrackStorage extends SGaussTypes {
-//   bool UseBacktrack();
+//   bool UseBacktrack() const;
 //   void BacktrackPut(Index i, Index to_save);
-//   Index BacktrackGet(Index i);
+//   Index BacktrackGet(Index i) const;
 // }
 
 template<typename SolverStorage, typename BacktrackStorage>
@@ -126,13 +127,15 @@ bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, const BuilderH
     return true;
   }
 
+  const Index num_starts = ss->GetNumStarts();
+
   InputIterator cur = begin;
   Index backtrack_pos = 0;
   if (!ss->UsePrefetch()) {
     // Simple version, no prefetch
     for (;;) {
       SS::Hash h = bh.GetHash(*cur);
-      SS::Index start = bh.GetStart(h);
+      SS::Index start = bh.GetStart(h, num_starts);
       SS::ResultRow rr = bh.GetResultRowFromInput(*cur) | bh.GetResultRowFromHash(h);
       SS::CoeffRow cr = bh.GetCoeffRow(h);
 
@@ -148,7 +151,7 @@ bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, const BuilderH
     // Pipelined w/prefetch
     // Prime the pipeline
     SS::Hash h = bh.GetHash(*cur);
-    SS::Index start = bh.GetStart(h);
+    SS::Index start = bh.GetStart(h, num_starts);
     SS::ResultRow rr = bh.GetResultRowFromInput(*cur);
     ss->Prefetch(start);
 
@@ -163,7 +166,7 @@ bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, const BuilderH
         return true;
       }
       SS::Hash next_h = bh.GetHash(*cur);
-      SS::Index next_start = bh.GetStart(h);
+      SS::Index next_start = bh.GetStart(h, num_starts);
       SS::ResultRow next_rr = bh.GetResultRowFromInput(*cur);
       ss->Prefetch(next_start);
       if (!SolverAdd(ss, h, start, rr, cr, bts, backtrack_pos)) {
@@ -188,8 +191,8 @@ bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, const BuilderH
 }
 
 // Here "Input" is short for BuilderInput.
-template<typename SolverStorage, typename InputIterator>
-bool Solve(SolverStorage *ss, InputIterator begin, InputIterator end) {
+template<typename SolverStorage, typename BuilderHasher, typename InputIterator>
+bool Solve(SolverStorage *ss, const BuilderHasher &bh, InputIterator begin, InputIterator end) {
   struct NoopBacktrackStorage {
     bool UseBacktrack() { return false; }
     void BacktrackPut(SolverStorage::Index to_save, SolverStorage::Index i) {}
@@ -240,6 +243,7 @@ void BackSubstStep(SolverStorage::CoeffRow *state, SolverStorage::Index result_b
 // concept ByColumnSolutionStorage extends SGaussTypes {
 //   typename Unit;
 //   Index GetNumColumns() const;
+//   Index GetNumStarts() const;
 //   // Assuming little endian across blocks
 //   Unit Load(Index block_num, Index column) const;
 //   void Store(Index block_num, Index column, Unit data);
@@ -277,7 +281,7 @@ bool ByColumnGeneralizedQuery(const PhsfQueryHasher &hasher, PhsfQueryHasher::Ha
   const BCSS::Index num_columns = bcss.GetNumColumns();
 
   // always dynamic
-  const BCSS::Index start_slot = hasher.GetStart(hash);
+  const BCSS::Index start_slot = hasher.GetStart(hash, bcss.GetNumStarts());
   const BCSS::CoeffRow cr = hasher.GetCoeffRow(hash);
   const BCSS::Index start_bit = start_slot % kUnitBits;
   const BCSS::Index start_block = start_slot / kUnitBits;
