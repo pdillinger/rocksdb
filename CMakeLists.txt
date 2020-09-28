@@ -391,6 +391,12 @@ if(NOT WITH_DYNAMIC_EXTENSION)
   add_definitions(-DROCKSDB_NO_DYNAMIC_EXTENSION)
 endif()
 
+option(ASSERT_STATUS_CHECKED "build with assert status checked" OFF)
+if (ASSERT_STATUS_CHECKED)
+  message(STATUS "Build with assert status checked")
+  add_definitions(-DROCKSDB_ASSERT_STATUS_CHECKED)
+endif()
+
 if(DEFINED USE_RTTI)
   if(USE_RTTI)
     message(STATUS "Enabling RTTI")
@@ -737,6 +743,7 @@ set(SOURCES
         test_util/transaction_test_util.cc
         tools/block_cache_analyzer/block_cache_trace_analyzer.cc
         tools/dump/db_dump_tool.cc
+        tools/io_tracer_parser_tool.cc
         tools/ldb_cmd.cc
         tools/ldb_tool.cc
         tools/sst_dump_tool.cc
@@ -1147,6 +1154,7 @@ if(WITH_TESTS)
         test_util/testutil_test.cc
         trace_replay/io_tracer_test.cc
         tools/block_cache_analyzer/block_cache_trace_analyzer_test.cc
+        tools/io_tracer_parser_test.cc
         tools/ldb_cmd_test.cc
         tools/reduce_levels_test.cc
         tools/sst_dump_test.cc

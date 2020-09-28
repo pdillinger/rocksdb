@@ -1625,9 +1625,11 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
     // data for the snapshot, so the reader would see neither data that was be
     // visible to the snapshot before compaction nor the newer data inserted
     // afterwards.
-    snapshot = last_seq_same_as_publish_seq_
-                   ? versions_->LastSequence()
-                   : versions_->LastPublishedSequence();
+    if (last_seq_same_as_publish_seq_) {
+      snapshot = versions_->LastSequence();
+    } else {
+      snapshot = versions_->LastPublishedSequence();
+    }
     if (get_impl_options.callback) {
       // The unprep_seqs are not published for write unprepared, so it could be
       // that max_visible_seq is larger. Seek to the std::max of the two.
@@ -1815,6 +1817,9 @@ std::vector<Status> DBImpl::MultiGet(
           read_options, nullptr, iter_deref_lambda, &multiget_cf_data,
           &consistent_seqnum);
 
+  TEST_SYNC_POINT("DBImpl::MultiGet:AfterGetSeqNum1");
+  TEST_SYNC_POINT("DBImpl::MultiGet:AfterGetSeqNum2");
+
   // Contain a list of merge operations if merge occurs.
   MergeContext merge_context;
 
@@ -1837,6 +1842,14 @@ std::vector<Status> DBImpl::MultiGet(
   size_t num_found = 0;
   size_t keys_read;
   uint64_t curr_value_size = 0;
+
+  GetWithTimestampReadCallback timestamp_read_callback(0);
+  ReadCallback* read_callback = nullptr;
+  if (read_options.timestamp && read_options.timestamp->size() > 0) {
+    timestamp_read_callback.Refresh(consistent_seqnum);
+    read_callback = &timestamp_read_callback;
+  }
+
   for (keys_read = 0; keys_read < num_keys; ++keys_read) {
     merge_context.Clear();
     Status& s = stat_list[keys_read];
@@ -1857,12 +1870,14 @@ std::vector<Status> DBImpl::MultiGet(
     bool done = false;
     if (!skip_memtable) {
       if (super_version->mem->Get(lkey, value, timestamp, &s, &merge_context,
-                                  &max_covering_tombstone_seq, read_options)) {
+                                  &max_covering_tombstone_seq, read_options,
+                                  read_callback)) {
         done = true;
         RecordTick(stats_, MEMTABLE_HIT);
-      } else if (super_version->imm->Get(
-                     lkey, value, timestamp, &s, &merge_context,
-                     &max_covering_tombstone_seq, read_options)) {
+      } else if (super_version->imm->Get(lkey, value, timestamp, &s,
+                                         &merge_context,
+                                         &max_covering_tombstone_seq,
+                                         read_options, read_callback)) {
         done = true;
         RecordTick(stats_, MEMTABLE_HIT);
       }
@@ -1870,9 +1885,11 @@ std::vector<Status> DBImpl::MultiGet(
     if (!done) {
       PinnableSlice pinnable_val;
       PERF_TIMER_GUARD(get_from_output_files_time);
-      super_version->current->Get(read_options, lkey, &pinnable_val, timestamp,
-                                  &s, &merge_context,
-                                  &max_covering_tombstone_seq);
+      super_version->current->Get(
+          read_options, lkey, &pinnable_val, timestamp, &s, &merge_context,
+          &max_covering_tombstone_seq, /*value_found=*/nullptr,
+          /*key_exists=*/nullptr,
+          /*seq=*/nullptr, read_callback);
       value->assign(pinnable_val.data(), pinnable_val.size());
       RecordTick(stats_, MEMTABLE_MISS);
     }
@@ -1969,9 +1986,11 @@ bool DBImpl::MultiCFSnapshot(
       // version because a flush happening in between may compact away data for
       // the snapshot, but the snapshot is earlier than the data overwriting it,
       // so users may see wrong results.
-      *snapshot = last_seq_same_as_publish_seq_
-                      ? versions_->LastSequence()
-                      : versions_->LastPublishedSequence();
+      if (last_seq_same_as_publish_seq_) {
+        *snapshot = versions_->LastSequence();
+      } else {
+        *snapshot = versions_->LastPublishedSequence();
+      }
     }
   } else {
     // If we end up with the same issue of memtable geting sealed during 2
@@ -2002,9 +2021,11 @@ bool DBImpl::MultiCFSnapshot(
           // acquire the lock so we're sure to succeed
           mutex_.Lock();
         }
-        *snapshot = last_seq_same_as_publish_seq_
-                        ? versions_->LastSequence()
-                        : versions_->LastPublishedSequence();
+        if (last_seq_same_as_publish_seq_) {
+          *snapshot = versions_->LastSequence();
+        } else {
+          *snapshot = versions_->LastPublishedSequence();
+        }
       } else {
         *snapshot = reinterpret_cast<const SnapshotImpl*>(read_options.snapshot)
                         ->number_;
@@ -2130,12 +2151,19 @@ void DBImpl::MultiGet(const ReadOptions& read_options, const size_t num_keys,
       read_options, nullptr, iter_deref_lambda, &multiget_cf_data,
       &consistent_seqnum);
 
+  GetWithTimestampReadCallback timestamp_read_callback(0);
+  ReadCallback* read_callback = nullptr;
+  if (read_options.timestamp && read_options.timestamp->size() > 0) {
+    timestamp_read_callback.Refresh(consistent_seqnum);
+    read_callback = &timestamp_read_callback;
+  }
+
   Status s;
   auto cf_iter = multiget_cf_data.begin();
   for (; cf_iter != multiget_cf_data.end(); ++cf_iter) {
     s = MultiGetImpl(read_options, cf_iter->start, cf_iter->num_keys,
                      &sorted_keys, cf_iter->super_version, consistent_seqnum,
-                     nullptr, nullptr);
+                     read_callback, nullptr);
     if (!s.ok()) {
       break;
     }
@@ -2298,9 +2326,16 @@ void DBImpl::MultiGetWithCallback(
     consistent_seqnum = callback->max_visible_seq();
   }
 
+  GetWithTimestampReadCallback timestamp_read_callback(0);
+  ReadCallback* read_callback = nullptr;
+  if (read_options.timestamp && read_options.timestamp->size() > 0) {
+    timestamp_read_callback.Refresh(consistent_seqnum);
+    read_callback = &timestamp_read_callback;
+  }
+
   Status s = MultiGetImpl(read_options, 0, num_keys, sorted_keys,
                           multiget_cf_data[0].super_version, consistent_seqnum,
-                          nullptr, nullptr);
+                          read_callback, nullptr);
   assert(s.ok() || s.IsTimedOut() || s.IsAborted());
   ReturnAndCleanupSuperVersion(multiget_cf_data[0].cfd,
                                multiget_cf_data[0].super_version);
@@ -2932,9 +2967,11 @@ void DBImpl::ReleaseSnapshot(const Snapshot* s) {
     snapshots_.Delete(casted_s);
     uint64_t oldest_snapshot;
     if (snapshots_.empty()) {
-      oldest_snapshot = last_seq_same_as_publish_seq_
-                            ? versions_->LastSequence()
-                            : versions_->LastPublishedSequence();
+      if (last_seq_same_as_publish_seq_) {
+        oldest_snapshot = versions_->LastSequence();
+      } else {
+        oldest_snapshot = versions_->LastPublishedSequence();
+      }
     } else {
       oldest_snapshot = snapshots_.oldest()->number_;
     }
@@ -3035,6 +3072,7 @@ FileSystem* DBImpl::GetFileSystem() const {
 
 Status DBImpl::StartIOTrace(Env* env, const TraceOptions& trace_options,
                             std::unique_ptr<TraceWriter>&& trace_writer) {
+  assert(trace_writer != nullptr);
   return io_tracer_->StartIOTrace(env, trace_options, std::move(trace_writer));
 }
 

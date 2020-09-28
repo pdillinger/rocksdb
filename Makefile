@@ -634,6 +634,12 @@ ifdef ASSERT_STATUS_CHECKED
 		version_edit_test \
 		work_queue_test \
 		write_controller_test \
+		compaction_iterator_test \
+		compaction_job_test \
+		compaction_job_stats_test \
+	        io_tracer_test \
+		merge_helper_test \
+		memtable_list_test \
 
 ifeq ($(USE_FOLLY_DISTRIBUTED_MUTEX),1)
 TESTS_PASSING_ASC += folly_synchronization_distributed_mutex_test
@@ -1895,6 +1901,12 @@ io_tracer_test: $(OBJ_DIR)/trace_replay/io_tracer_test.o $(OBJ_DIR)/trace_replay
 	$(AM_LINK)
 
 prefetch_test: $(OBJ_DIR)/file/prefetch_test.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+io_tracer_parser_test: $(OBJ_DIR)/tools/io_tracer_parser_test.o $(OBJ_DIR)/tools/io_tracer_parser_tool.o $(TEST_LIBRARY) $(LIBRARY)
+	$(AM_LINK)
+
+io_tracer_parser: $(OBJ_DIR)/tools/io_tracer_parser.o $(TOOLS_LIBRARY) $(LIBRARY)
 	$(AM_LINK)
 
 #-------------------------------------------------

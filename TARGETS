@@ -316,6 +316,7 @@ cpp_library(
         "test_util/sync_point_impl.cc",
         "test_util/transaction_test_util.cc",
         "tools/dump/db_dump_tool.cc",
+        "tools/io_tracer_parser_tool.cc",
         "tools/ldb_cmd.cc",
         "tools/ldb_tool.cc",
         "tools/sst_dump_tool.cc",
@@ -1214,6 +1215,13 @@ ROCKS_TESTS = [
         [],
     ],
     [
+        "io_tracer_parser_test",
+        "tools/io_tracer_parser_test.cc",
+        "serial",
+        [],
+        [],
+    ],
+    [
         "io_tracer_test",
         "trace_replay/io_tracer_test.cc",
         "serial",
@@ -1714,7 +1722,7 @@ ROCKS_TESTS = [
         srcs = [test_cc],
         arch_preprocessor_flags = ROCKSDB_ARCH_PREPROCESSOR_FLAGS,
         os_preprocessor_flags = ROCKSDB_OS_PREPROCESSOR_FLAGS,
-        compiler_flags = ROCKSDB_COMPILER_FLAGS,
+        compiler_flags = ROCKSDB_COMPILER_FLAGS + extra_compiler_flags,
         preprocessor_flags = ROCKSDB_PREPROCESSOR_FLAGS,
         deps = [":rocksdb_test_lib"] + extra_deps,
         external_deps = ROCKSDB_EXTERNAL_DEPS + [
