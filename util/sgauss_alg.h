@@ -179,7 +179,7 @@ bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, const BuilderH
         return true;
       }
       Hash next_h = bh.GetHash(*cur);
-      Index next_start = bh.GetStart(h, num_starts);
+      Index next_start = bh.GetStart(next_h, num_starts);
       ResultRow next_rr = bh.GetResultRowFromInput(*cur);
       ss->Prefetch(next_start);
       if (!SolverAdd(ss, start, rr, cr, bts, backtrack_pos)) {

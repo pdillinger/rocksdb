@@ -549,7 +549,7 @@ TEST(MathTest, Coding128) {
 using ROCKSDB_NAMESPACE::sgauss::StandardSolver;
 using ROCKSDB_NAMESPACE::sgauss::InMemSimpleSolution;
 
-struct MyTypesAndSettings {
+struct DefaultTypesAndSettings {
   using CoeffRow = uint64_t;
   using ResultRow = uint8_t;
   using Index = uint32_t;
@@ -559,17 +559,20 @@ struct MyTypesAndSettings {
   static constexpr bool kIsFilter = true;
   static constexpr bool kFirstCoeffAlwaysOne = true;
   static constexpr bool kUsePrefetch = true;
-  static constexpr bool kUseSmash = true;
+  static constexpr bool kUseSmash = false;
   static Hash HashFn(const Key &key, Seed seed) {
     return Hash64(key.data(), key.size(), seed);
   }
+};
+struct MyTypesAndSettings : public DefaultTypesAndSettings {
+  using CoeffRow = Unsigned128;
 };
 
 TEST(SGaussTest, Basic) {
   std::vector<std::string> keys = { "abc", "def", "ghi" };
 
   StandardSolver<MyTypesAndSettings> ss;
-  ASSERT_TRUE(ss.ResetAndFindSeedToSolve(keys.size() + 64, keys.begin(), keys.end(), 100));
+  ASSERT_TRUE(ss.ResetAndFindSeedToSolve(keys.size() + sizeof(MyTypesAndSettings::CoeffRow) * 8U, keys.begin(), keys.end(), 100));
   InMemSimpleSolution<MyTypesAndSettings> soln;
   soln.BackSubstFrom(ss);
 
