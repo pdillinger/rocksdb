@@ -15,6 +15,7 @@
 #include "test_util/testharness.h"
 #include "util/coding.h"
 #include "util/math128.h"
+#include "util/sgauss_impl.h"
 
 using ROCKSDB_NAMESPACE::EncodeFixed32;
 using ROCKSDB_NAMESPACE::GetSliceHash64;
@@ -524,6 +525,37 @@ TEST(MathTest, Coding128) {
   out[17] = '\0';
   EXPECT_EQ(std::string(in), std::string(out));
 }
+
+// Tests for sgauss
+using ROCKSDB_NAMESPACE::sgauss::StandardSolver;
+using ROCKSDB_NAMESPACE::sgauss::InMemSimpleSolution;
+
+struct MyTypesAndSettings {
+  using CoeffRow = uint64_t;
+  using ResultRow = uint8_t;
+  using Index = uint32_t;
+  using Hash = uint64_t;
+  using Key = ROCKSDB_NAMESPACE::Slice;
+  using Seed = uint32_t;
+  static constexpr bool kIsFilter = true;
+  static constexpr bool kFirstCoeffAlwaysOne = true;
+  static constexpr bool kUsePrefetch = true;
+  static constexpr bool kUseSmash = true;
+  static Hash HashFn(const Key &key, Seed seed) {
+    return Hash64(key.data(), key.size(), seed);
+  }
+};
+
+TEST(SGaussTest, Basic) {
+  std::vector<std::string> keys = { "abc", "def", "ghi" };
+
+  StandardSolver<MyTypesAndSettings> ss;
+  ASSERT_TRUE(ss.ResetAndFindSeedToSolve(keys.size() + 64, keys.begin(), keys.end(), 100));
+  InMemSimpleSolution<MyTypesAndSettings> soln;
+  soln.BackSubstFrom(ss);
+
+}
+
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);

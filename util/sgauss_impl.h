@@ -9,7 +9,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-namespace SGauss {
+namespace sgauss {
 
 // concept TypesAndSettings {
 //   typename CoeffRow;
@@ -27,39 +27,43 @@ namespace SGauss {
 
 // A bit of a hack to automatically construct the type for
 // BuilderInput based on a constexpr bool.
-template<class TypesAndSettings, bool IsFilter>
-class BuilderInputSelector : public TypesAndSettings {
-public:
+template<typename Key, typename ResultRow, bool IsFilter>
+struct BuilderInputSelector {
   // For general PHSF, not filter
-  using BuilderInput = std::pair<Key, ResultRow>;
-
-  inline ResultRow GetResultRowMask() const {
-    // all bits set
-    return ResultRow{0} - ResultRow{1};
-  }
+  using T = std::pair<Key, ResultRow>;
 };
 
-template<class TypesAndSettings>
-class BuilderInputSelector<TypesAndSettings, true /*IsFilter*/> : public TypesAndSettings {
-public:
+template<typename Key, typename ResultRow>
+struct BuilderInputSelector<Key, ResultRow, true /*IsFilter*/> {
   // For Filter
-  using BuilderInput = Key;
-
-  inline ResultRow GetResultRowMask() const {
-    return rr_mask_;
-  }
-protected:
-  ResultRow rr_mask_ = ResultRow{0} - ResultRow{1};
+  using T = Key;
 };
 
+// To avoid writing 'typename' everwhere we use types like 'Index'
+#define IMPORT_TYPES_AND_SETTINGS(TypesAndSettings) \
+  using CoeffRow = typename TypesAndSettings::CoeffRow; \
+  using ResultRow = typename TypesAndSettings::ResultRow; \
+  using Index = typename TypesAndSettings::Index; \
+  using Hash = typename TypesAndSettings::Hash; \
+  using Key = typename TypesAndSettings::Key; \
+  using Seed = typename TypesAndSettings::Seed; \
+\
+  /* Some more additions */ \
+  using QueryInput = Key; \
+  using BuilderInput = typename BuilderInputSelector<Key, ResultRow, TypesAndSettings::kIsFilter>::T; \
+  static constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U); \
+\
+  /* Export to algorithm */ \
+  static constexpr bool kFirstCoeffAlwaysOne = TypesAndSettings::kFirstCoeffAlwaysOne; \
+
+
 template<class TypesAndSettings>
-class StandardHasher : public BuilderInputSelector<TypesAndSettings, TypesAndSettings::kIsFilter> {
+class StandardHasher {
 public:
-  using QueryInput = Key;
-  constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U);
+  IMPORT_TYPES_AND_SETTINGS(TypesAndSettings);
 
   inline Hash GetHash(const Key& key) const {
-    return HashFn(key, seed_);
+    return TypesAndSettings::HashFn(key, seed_);
   };
   // For when BuilderInput == pair<Key, ResultRow> (kIsFilter == false)
   inline Hash GetHash(const std::pair<Key, ResultRow>& bi) const {
@@ -72,7 +76,7 @@ public:
     // FastRange gives us a fast and effective mapping from h to the
     // approriate range. This depends most, sometimes exclusively, on
     // upper bits of h.
-    if (kUseSmash) {
+    if (TypesAndSettings::kUseSmash) {
       // TODO: explain more
       // These seem to work well, and happen to work out to fastrange over
       // number of slots (vs. number of starts).
@@ -95,8 +99,8 @@ public:
     // of the hash data to fill CoeffRow.
     // This is not so much "critical path" code because it can be done in
     // parallel (instruction level) with memory lookup.
-    uint128_t a = Multiply64to128(h, 0x9e3779b97f4a7c13U); // FIXME: better values
-    uint128_t b = Multiply64to128(h, 0xa4398ab94d038781U);
+    Unsigned128 a = Multiply64to128(h, 0x9e3779b97f4a7c13U); // FIXME: better values
+    Unsigned128 b = Multiply64to128(h, 0xa4398ab94d038781U);
     auto cr = static_cast<CoeffRow>(b ^ (a << 64) ^ (a >> 64));
     if (kFirstCoeffAlwaysOne) {
       cr |= 1;
@@ -106,8 +110,13 @@ public:
     }
     return cr;
   }
+  inline ResultRow GetResultRowMask() const {
+    // TODO
+    // For now, all bits set
+    return ResultRow{0} - ResultRow{1};
+  }
   inline ResultRow GetResultRowFromHash(Hash h) const {
-    if (kIsFilter) {
+    if (TypesAndSettings::kIsFilter) {
       // In contrast to GetStart, here we draw primarily from lower bits,
       // but not literally, which seemed to cause FP rate hit in some cases.
       // This is not so much "critical path" code because it can be done in
@@ -151,6 +160,8 @@ protected:
 template<class TypesAndSettings>
 class StandardSolver : public StandardHasher<TypesAndSettings> {
 public:
+  IMPORT_TYPES_AND_SETTINGS(TypesAndSettings);
+
   StandardSolver(Index num_slots = 0, Index backtrack_size = 0) {
     Reset(num_slots, backtrack_size);
   }
@@ -178,16 +189,16 @@ public:
 
   // from concept SolverStorage
   inline bool UsePrefetch() const {
-    return kUsePrefetch;
+    return TypesAndSettings::kUsePrefetch;
   }
   inline void Prefetch(Index i) const {
     // TODO
   }
   inline CoeffRow* CoeffRowPtr(Index i) {
-    return coeff_rows_[i];
+    return &coeff_rows_[i];
   }
   inline ResultRow* ResultRowPtr(Index i) {
-    return result_rows_[i];
+    return &result_rows_[i];
   }
   inline Index GetNumStarts() const {
     return num_starts_;
@@ -221,14 +232,14 @@ public:
   // TODO: detail
   template<typename InputIterator>
   bool ResetAndFindSeedToSolve(Index num_slots, InputIterator begin, InputIterator end, Seed max_seed) {
-    ResetSeed();
+    StandardHasher<TypesAndSettings>::ResetSeed();
     do {
       Reset(num_slots);
       bool success = SolveMore(begin, end);
       if (success) {
         return true;
       }
-    } while (NextSeed(max_seed));
+    } while (StandardHasher<TypesAndSettings>::NextSeed(max_seed));
     // no seed through max_seed worked
     return false;
   }
@@ -244,8 +255,10 @@ protected:
 
 // Implements concept SimpleSolutionStorage
 template<class TypesAndSettings>
-class InMemSimpleSolution : public TypesAndSettings {
+class InMemSimpleSolution {
 public:
+  IMPORT_TYPES_AND_SETTINGS(TypesAndSettings);
+
   void PrepareForNumStarts(Index num_starts) {
     const Index num_slots = num_starts + kCoeffBits - 1;
     assert(num_slots >= kCoeffBits);
@@ -263,7 +276,7 @@ public:
     return solution_rows_[slot_num];
   }
   void Store(Index slot_num, ResultRow solution_row) {
-    solution_rows_[slot_num] = data;
+    solution_rows_[slot_num] = solution_row;
   }
   template<typename SolverStorage>
   void BackSubstFrom(const SolverStorage &ss) {

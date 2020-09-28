@@ -9,7 +9,7 @@
 
 namespace ROCKSDB_NAMESPACE {
 
-namespace SGauss {
+namespace sgauss {
 
 // concept SGaussTypes {
 //   typename CoeffRow;
@@ -83,23 +83,25 @@ namespace SGauss {
 // }
 
 template<typename SolverStorage, typename BacktrackStorage>
-bool SolverAdd(SolverStorage *ss, SolverStorage::Hash h,
-               SolverStorage::Index start, SolverStorage::ResultRow rr, SolverStorage::CoeffRow cr
-               BacktrackStorage *bts, SolverStorage::Index backtrack_pos) {
-  using SS = SolverStorage;
-  SS:Index i = start;
+bool SolverAdd(SolverStorage *ss, typename SolverStorage::Hash h,
+               typename SolverStorage::Index start, typename SolverStorage::ResultRow rr, typename SolverStorage::CoeffRow cr,
+               BacktrackStorage *bts, typename SolverStorage::Index backtrack_pos) {
+  using CoeffRow = typename SolverStorage::CoeffRow;
+  using Index = typename SolverStorage::Index;
 
-  if (!SS::kFirstCoeffAlwaysOne) {
+  Index i = start;
+
+  if (!SolverStorage::kFirstCoeffAlwaysOne) {
     // Requires/asserts that cr != 0
     int tz = CountTrailingZeroBits(cr);
-    i += static_cast<SS::Index>(tz);
+    i += static_cast<Index>(tz);
     cr >>= tz;
   } else {
     assert((cr & 1) == 1);
   }
 
   for (;;) {
-    SS::CoeffRow other = *(ss->CoeffRowPtr(i));
+    CoeffRow other = *(ss->CoeffRowPtr(i));
     if (other == 0) {
       *(ss->CoeffRowPtr(i)) = cr;
       *(ss->ResultRowPtr(i)) = rr;
@@ -114,7 +116,7 @@ bool SolverAdd(SolverStorage *ss, SolverStorage::Hash h,
       break;
     }
     int tz = CountTrailingZeroBits(cr);
-    i += static_cast<SS::Index>(tz);
+    i += static_cast<Index>(tz);
     cr >>= tz;
   }
     // Failed, unless result row == 0 because e.g. a duplicate input or a
@@ -128,7 +130,10 @@ bool SolverAdd(SolverStorage *ss, SolverStorage::Hash h,
 // Here "Input" is short for BuilderInput.
 template<typename SolverStorage, typename BacktrackStorage, typename BuilderHasher, typename InputIterator>
 bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, const BuilderHasher &bh, InputIterator begin, InputIterator end) {
-  using SS = SolverStorage;
+  using CoeffRow = typename SolverStorage::CoeffRow;
+  using Index = typename SolverStorage::Index;
+  using Hash = typename SolverStorage::Hash;
+  using ResultRow = typename SolverStorage::ResultRow;
 
   if (begin == end) {
     // trivial
@@ -142,10 +147,10 @@ bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, const BuilderH
   if (!ss->UsePrefetch()) {
     // Simple version, no prefetch
     for (;;) {
-      SS::Hash h = bh.GetHash(*cur);
-      SS::Index start = bh.GetStart(h, num_starts);
-      SS::ResultRow rr = bh.GetResultRowFromInput(*cur) | bh.GetResultRowFromHash(h);
-      SS::CoeffRow cr = bh.GetCoeffRow(h);
+      Hash h = bh.GetHash(*cur);
+      Index start = bh.GetStart(h, num_starts);
+      ResultRow rr = bh.GetResultRowFromInput(*cur) | bh.GetResultRowFromHash(h);
+      CoeffRow cr = bh.GetCoeffRow(h);
 
       if (!SolverAdd(ss, h, start, rr, cr, bts, backtrack_pos)) {
         break;
@@ -158,24 +163,24 @@ bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, const BuilderH
   } else {
     // Pipelined w/prefetch
     // Prime the pipeline
-    SS::Hash h = bh.GetHash(*cur);
-    SS::Index start = bh.GetStart(h, num_starts);
-    SS::ResultRow rr = bh.GetResultRowFromInput(*cur);
+    Hash h = bh.GetHash(*cur);
+    Index start = bh.GetStart(h, num_starts);
+    ResultRow rr = bh.GetResultRowFromInput(*cur);
     ss->Prefetch(start);
 
     // Pipeline
     for (;;) {
       rr |= bh.GetResultRowFromHash(h);
-      SS::CoeffRow cr = bh.GetCoeffRow(h);
+      CoeffRow cr = bh.GetCoeffRow(h);
       if ((++cur) == end) {
         if (!SolverAdd(ss, h, start, rr, cr, bts, backtrack_pos)) {
           break;
         }
         return true;
       }
-      SS::Hash next_h = bh.GetHash(*cur);
-      SS::Index next_start = bh.GetStart(h, num_starts);
-      SS::ResultRow next_rr = bh.GetResultRowFromInput(*cur);
+      Hash next_h = bh.GetHash(*cur);
+      Index next_start = bh.GetStart(h, num_starts);
+      ResultRow next_rr = bh.GetResultRowFromInput(*cur);
       ss->Prefetch(next_start);
       if (!SolverAdd(ss, h, start, rr, cr, bts, backtrack_pos)) {
         break;
@@ -201,37 +206,17 @@ bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, const BuilderH
 // Here "Input" is short for BuilderInput.
 template<typename SolverStorage, typename BuilderHasher, typename InputIterator>
 bool Solve(SolverStorage *ss, const BuilderHasher &bh, InputIterator begin, InputIterator end) {
+  using Index = typename SolverStorage::Index;
   struct NoopBacktrackStorage {
     bool UseBacktrack() { return false; }
-    void BacktrackPut(SolverStorage::Index to_save, SolverStorage::Index i) {}
-    Index BacktrackGet(SolverStorage::Index i) {
+    void BacktrackPut(Index, Index) {}
+    Index BacktrackGet(Index) {
       assert(false);
       return 0;
     }
   } nbts;
-  return BacktrackableSolve(ss, &nbts, begin, end);
+  return BacktrackableSolve(ss, &nbts, bh, begin, end);
 }
-
-/*
-//   bool NextSeed();
-//   void ResetFor(Index num_slots);
-// TODO
-template<typename SolverStorage>
-bool SolveSGauss(SolverStorage *st, const std::deque<SolverStorage::Input> &inputs, SolverStorage::Index num_slots) {
-  using SS = SolverStorage;
-  if (inputs.empty()) {
-    // trivial case
-    st->ResetFor(num_slots);
-    return true;
-  }
-  do {
-    st->ResetFor(num_slots);
-
-  } while (st->NextSeed());
-  // no more seeds
-  return false;
-}
-*/
 
 
 // TODO: add num columns after all?
@@ -245,62 +230,67 @@ bool SolveSGauss(SolverStorage *st, const std::deque<SolverStorage::Input> &inpu
 
 template<typename SimpleSolutionStorage, typename SolverStorage>
 void SimpleBackSubst(SimpleSolutionStorage *sss, const SolverStorage &ss) {
-  using SS = SolverStorage;
+  using CoeffRow = typename SolverStorage::CoeffRow;
+  using Index = typename SolverStorage::Index;
+  using ResultRow = typename SolverStorage::ResultRow;
 
-  constexpr auto kCoeffBits = static_cast<SS::Index>(sizeof(SS::CoeffRow) * 8U);
-  constexpr auto kResultBits = static_cast<SS::Index>(sizeof(SS::ResultRow) * 8U);
+  constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U);
+  constexpr auto kResultBits = static_cast<Index>(sizeof(ResultRow) * 8U);
 
   std::array<CoeffRow, kResultBits> state;
   state.fill(0);
 
-  const SS::Index num_starts = ss.GetNumStarts();
+  const Index num_starts = ss.GetNumStarts();
   sss->PrepareForNumStarts(num_starts);
-  const SS::Index num_slots = num_starts + kCoeffBits - 1;
+  const Index num_slots = num_starts + kCoeffBits - 1;
 
-  for (SS::Index i = num_slots; i > 0;) {
+  for (Index i = num_slots; i > 0;) {
     --i;
-    SS::CoeffRow cr = *ss.CoeffRowPtr(i);
-    SS:ResultRow rr = *ss.ResultRowPtr(i);
+    CoeffRow cr = *const_cast<SolverStorage&>(ss).CoeffRowPtr(i);
+    ResultRow rr = *const_cast<SolverStorage&>(ss).ResultRowPtr(i);
     // solution row
-    SS:ResultRow sr = 0;
-    for (SS::Index j = 0; j < kResultBits; ++j) {
-      SS::CoeffRow tmp = state[j] << 1;
+    ResultRow sr = 0;
+    for (Index j = 0; j < kResultBits; ++j) {
+      CoeffRow tmp = state[j] << 1;
       int bit = BitParity(tmp & cr) ^ ((rr >> j) & 1);
       // update backsubst state
-      tmp |= static_cast<SS::CoeffRow>(bit);
+      tmp |= static_cast<CoeffRow>(bit);
       state[j] = tmp;
       // add to solution row
-      sr |= static_cast<SS::ResultRow>(bit) << j;
+      sr |= static_cast<ResultRow>(bit) << j;
     }
     sss->Store(i, sr);
   }
 }
 
 template<typename SimpleSolutionStorage>
-SimpleSolutionStorage::Result SimpleQueryHelper(SimpleSolutionStorage::Index start_slot, SimpleSolutionStorage::CoeffRow cr, const SimpleSolutionStorage &sss) {
-  using SSS = SimpleSolutionStorage;
-  constexpr auto kCoeffBits = static_cast<SSS::Index>(sizeof(SSS::CoeffRow) * 8U);
+typename SimpleSolutionStorage::ResultRow SimpleQueryHelper(typename SimpleSolutionStorage::Index start_slot, typename SimpleSolutionStorage::CoeffRow cr, const SimpleSolutionStorage &sss) {
+  using CoeffRow = typename SimpleSolutionStorage::CoeffRow;
+  using Index = typename SimpleSolutionStorage::Index;
+  using ResultRow = typename SimpleSolutionStorage::ResultRow;
 
-  SSS::ResultRow result = 0;
-  for (SSS::Index i = 0; i < kCoeffBits; ++i) {
+  constexpr auto kCoeffBits = static_cast<Index>(sizeof(CoeffRow) * 8U);
+
+  ResultRow result = 0;
+  for (Index i = 0; i < kCoeffBits; ++i) {
     // Always fetch w/mask likely more efficient than conditional branch/fetch
-    SSS::ResultRow mask = SSS::ResultRow{0} - static_cast<SSS::ResultRow>((cr >> i) & 1U);
+    ResultRow mask = ResultRow{0} - static_cast<ResultRow>((cr >> i) & 1U);
     result ^= mask & sss.Load(start_slot + i);
   }
   return result;
 }
 
 template<typename SimpleSolutionStorage, typename PhsfQueryHasher>
-SimpleSolutionStorage::ResultRow SimplePhsfQuery(const PhsfQueryHasher::QueryInput &input, const PhsfQueryHasher &hasher, const SimpleSolutionStorage &sss) {
-  const PhsfQueryHasher::Hash hash = hasher.GetHash(input);
+typename SimpleSolutionStorage::ResultRow SimplePhsfQuery(const typename PhsfQueryHasher::QueryInput &input, const PhsfQueryHasher &hasher, const SimpleSolutionStorage &sss) {
+  const typename PhsfQueryHasher::Hash hash = hasher.GetHash(input);
 
   return SimpleQueryHelper(hasher.GetStart(hash, sss.GetNumStarts()), hasher.GetCoeffRow(hash), sss);
 }
 
 template<typename SimpleSolutionStorage, typename FilterQueryHasher>
-bool SimpleFilterQuery(const FilterQueryHasher::QueryInput &input, const FilterQueryHasher &hasher, const SimpleSolutionStorage &sss) {
-  const FilterQueryHasher::Hash hash = hasher.GetHash(input);
-  const SimpleSolutionStorage::ResultRow expected = hasher.GetResultRowFromHash(hash);
+bool SimpleFilterQuery(const typename FilterQueryHasher::QueryInput &input, const FilterQueryHasher &hasher, const SimpleSolutionStorage &sss) {
+  const typename FilterQueryHasher::Hash hash = hasher.GetHash(input);
+  const typename SimpleSolutionStorage::ResultRow expected = hasher.GetResultRowFromHash(hash);
 
   return expected == SimpleQueryHelper(hasher.GetStart(hash, sss.GetNumStarts()), hasher.GetCoeffRow(hash), sss);
 }
