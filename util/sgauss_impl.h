@@ -97,7 +97,14 @@ public:
     // parallel (instruction level) with memory lookup.
     uint128_t a = Multiply64to128(h, 0x9e3779b97f4a7c13U); // FIXME: better values
     uint128_t b = Multiply64to128(h, 0xa4398ab94d038781U);
-    return static_cast<CoeffRow>(b ^ (a << 64) ^ (a >> 64)) | CoeffRow{kFirstCoeffAlwaysOne ? 1 : 0};
+    auto cr = static_cast<CoeffRow>(b ^ (a << 64) ^ (a >> 64));
+    if (kFirstCoeffAlwaysOne) {
+      cr |= 1;
+    } else {
+      // Still have to ensure non-zero
+      cr |= static_cast<unsigned>(cr == 0);
+    }
+    return cr;
   }
   inline ResultRow GetResultRowFromHash(Hash h) const {
     if (kIsFilter) {
@@ -134,6 +141,9 @@ public:
   Seed GetSeed() const {
     return seed_;
   }
+  void ResetSeed() {
+    seed_ = 0;
+  }
 protected:
   Seed seed_ = 0;
 };
@@ -142,19 +152,20 @@ template<class TypesAndSettings>
 class StandardSolver : public StandardHasher<TypesAndSettings> {
 public:
   StandardSolver(Index num_slots = 0, Index backtrack_size = 0) {
-    Reset(num_slots, Index backtrack_size);
+    Reset(num_slots, backtrack_size);
   }
   void Reset(Index num_slots, Index backtrack_size = 0) {
     assert(num_slots >= kCoeffBits);
     if (num_slots > num_slots_allocated_) {
-      coeff_rows.reset(new CoeffRow[num_slots]());
+      coeff_rows_.reset(new CoeffRow[num_slots]());
       // Note: don't strictly have to zero-init result_rows,
       // except possible information leakage ;)
-      result_rows.reset(new ResultRow[num_slots]());
+      result_rows_.reset(new ResultRow[num_slots]());
       num_slots_allocated_ = num_slots;
     } else {
       for (Index i = 0; i < num_slots; ++i) {
         coeff_rows_[i] = 0;
+        // Note: don't strictly have to zero-init result_rows
         result_rows_[i] = 0;
       }
     }
@@ -193,7 +204,7 @@ public:
     return backtrack_[i];
   }
 
-  // Some useful API
+  // Some useful API, still somewhat low level
   // TODO: detail
   template<typename InputIterator>
   bool SolveMore(InputIterator begin, InputIterator end) {
@@ -206,6 +217,21 @@ public:
     return BacktrackableSolve(this, this, *this, begin, end);
   }
 
+  // High-level API
+  // TODO: detail
+  template<typename InputIterator>
+  bool ResetAndFindSeedToSolve(Index num_slots, InputIterator begin, InputIterator end, Seed max_seed) {
+    ResetSeed();
+    do {
+      Reset(num_slots);
+      bool success = SolveMore(begin, end);
+      if (success) {
+        return true;
+      }
+    } while (NextSeed(max_seed));
+    // no seed through max_seed worked
+    return false;
+  }
 protected:
   // TODO: explore combining in a struct
   std::unique_ptr<CoeffRow[]> coeff_rows_;
@@ -214,8 +240,40 @@ protected:
   Index num_slots_allocated_ = 0;
   std::unique_ptr<Index[]> backtrack_;
   Index backtrack_size_ = 0;
-}
+};
 
+// Implements concept SimpleSolutionStorage
+template<class TypesAndSettings>
+class InMemSimpleSolution : public TypesAndSettings {
+public:
+  void PrepareForNumStarts(Index num_starts) {
+    const Index num_slots = num_starts + kCoeffBits - 1;
+    assert(num_slots >= kCoeffBits);
+    if (num_slots > num_slots_allocated_) {
+      // Do not need to init the memory
+      solution_rows_.reset(new ResultRow[num_slots]);
+      num_slots_allocated_ = num_slots;
+    }
+    num_starts_ = num_starts;
+  }
+  Index GetNumStarts() const {
+    return num_starts_;
+  }
+  ResultRow Load(Index slot_num) const {
+    return solution_rows_[slot_num];
+  }
+  void Store(Index slot_num, ResultRow solution_row) {
+    solution_rows_[slot_num] = data;
+  }
+  template<typename SolverStorage>
+  void BackSubstFrom(const SolverStorage &ss) {
+    SimpleBackSubst(this, ss);
+  }
+protected:
+  Index num_starts_ = 0;
+  Index num_slots_allocated_ = 0;
+  std::unique_ptr<ResultRow[]> solution_rows_;
+};
 
 
 

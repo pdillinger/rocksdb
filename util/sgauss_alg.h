@@ -26,6 +26,13 @@ namespace SGauss {
 //
 //   Hash GetHash(const QueryInput &) const;
 //   Index GetStart(Hash, Index num_starts) const;
+//   // Must be non-zero, because that's required for a solution to exist
+//   // when mapping to non-zero result row. (Note: SolverAdd could be
+//   // modified to allow 0 coeff row if that only occurs with 0 result
+//   // row, which really only makes sense for filter implementation,
+//   // where both values are hash-derived. Or SolverAdd could reject 0 coeff
+//   // row, forcing next seed, but that has potential problems with
+//   // generality/scalability.)
 //   CoeffRow GetCoeffRow(Hash) const;
 // };
 
@@ -83,6 +90,7 @@ bool SolverAdd(SolverStorage *ss, SolverStorage::Hash h,
   SS:Index i = start;
 
   if (!SS::kFirstCoeffAlwaysOne) {
+    // Requires/asserts that cr != 0
     int tz = CountTrailingZeroBits(cr);
     i += static_cast<SS::Index>(tz);
     cr >>= tz;
@@ -225,6 +233,79 @@ bool SolveSGauss(SolverStorage *st, const std::deque<SolverStorage::Input> &inpu
 }
 */
 
+
+// TODO: add num columns after all?
+
+// concept SimpleSolutionStorage extends SGaussTypes {
+//   void PrepareForNumStarts(Index num_starts) const;
+//   Index GetNumStarts() const;
+//   ResultRow Load(Index slot_num) const;
+//   void Store(Index slot_num, ResultRow data);
+// };
+
+template<typename SimpleSolutionStorage, typename SolverStorage>
+void SimpleBackSubst(SimpleSolutionStorage *sss, const SolverStorage &ss) {
+  using SS = SolverStorage;
+
+  constexpr auto kCoeffBits = static_cast<SS::Index>(sizeof(SS::CoeffRow) * 8U);
+  constexpr auto kResultBits = static_cast<SS::Index>(sizeof(SS::ResultRow) * 8U);
+
+  std::array<CoeffRow, kResultBits> state;
+  state.fill(0);
+
+  const SS::Index num_starts = ss.GetNumStarts();
+  sss->PrepareForNumStarts(num_starts);
+  const SS::Index num_slots = num_starts + kCoeffBits - 1;
+
+  for (SS::Index i = num_slots; i > 0;) {
+    --i;
+    SS::CoeffRow cr = *ss.CoeffRowPtr(i);
+    SS:ResultRow rr = *ss.ResultRowPtr(i);
+    // solution row
+    SS:ResultRow sr = 0;
+    for (SS::Index j = 0; j < kResultBits; ++j) {
+      SS::CoeffRow tmp = state[j] << 1;
+      int bit = BitParity(tmp & cr) ^ ((rr >> j) & 1);
+      // update backsubst state
+      tmp |= static_cast<SS::CoeffRow>(bit);
+      state[j] = tmp;
+      // add to solution row
+      sr |= static_cast<SS::ResultRow>(bit) << j;
+    }
+    sss->Store(i, sr);
+  }
+}
+
+template<typename SimpleSolutionStorage>
+SimpleSolutionStorage::Result SimpleQueryHelper(SimpleSolutionStorage::Index start_slot, SimpleSolutionStorage::CoeffRow cr, const SimpleSolutionStorage &sss) {
+  using SSS = SimpleSolutionStorage;
+  constexpr auto kCoeffBits = static_cast<SSS::Index>(sizeof(SSS::CoeffRow) * 8U);
+
+  SSS::ResultRow result = 0;
+  for (SSS::Index i = 0; i < kCoeffBits; ++i) {
+    // Always fetch w/mask likely more efficient than conditional branch/fetch
+    SSS::ResultRow mask = SSS::ResultRow{0} - static_cast<SSS::ResultRow>((cr >> i) & 1U);
+    result ^= mask & sss.Load(start_slot + i);
+  }
+  return result;
+}
+
+template<typename SimpleSolutionStorage, typename PhsfQueryHasher>
+SimpleSolutionStorage::ResultRow SimplePhsfQuery(const PhsfQueryHasher::QueryInput &input, const PhsfQueryHasher &hasher, const SimpleSolutionStorage &sss) {
+  const PhsfQueryHasher::Hash hash = hasher.GetHash(input);
+
+  return SimpleQueryHelper(hasher.GetStart(hash, sss.GetNumStarts()), hasher.GetCoeffRow(hash), sss);
+}
+
+template<typename SimpleSolutionStorage, typename FilterQueryHasher>
+bool SimpleFilterQuery(const FilterQueryHasher::QueryInput &input, const FilterQueryHasher &hasher, const SimpleSolutionStorage &sss) {
+  const FilterQueryHasher::Hash hash = hasher.GetHash(input);
+  const SimpleSolutionStorage::ResultRow expected = hasher.GetResultRowFromHash(hash);
+
+  return expected == SimpleQueryHelper(hasher.GetStart(hash, sss.GetNumStarts()), hasher.GetCoeffRow(hash), sss);
+}
+
+/*
 template<typename SolverStorage>
 void BackSubstStep(SolverStorage::CoeffRow *state, SolverStorage::Index result_bits, const SolverStorage *ss, SolverStorage::Index base_slot, SolverStorage::Index slot_count) {
   using SS = SolverStorage;
@@ -239,6 +320,19 @@ void BackSubstStep(SolverStorage::CoeffRow *state, SolverStorage::Index result_b
     }
   }
 }
+*/
+
+// TODO: use InterleavedSolutionStorage here? This is difficult to get working with upper/lower bits
+
+// concept InterleavedSolutionStorage extends SGaussTypes {
+//   Index GetNumColumns() const;
+//   Index GetNumStarts() const;
+//   // Assuming little endian across blocks
+//   Unit Load(Index block_num, Index column) const;
+//   void Store(Index block_num, Index column, Unit data);
+// };
+
+
 
 // concept ByColumnSolutionStorage extends SGaussTypes {
 //   typename Unit;
@@ -248,7 +342,7 @@ void BackSubstStep(SolverStorage::CoeffRow *state, SolverStorage::Index result_b
 //   Unit Load(Index block_num, Index column) const;
 //   void Store(Index block_num, Index column, Unit data);
 // };
-
+/*
 template<typename SolutionStorageHelper, typename SolverStorage>
 void ByColumnBackSubstRange(ByColumnSolutionStorage *bcss, SolverStorage::CoeffRow *state, const SolverStorage *ss, SolverStorage::Index start_block, SolverStorage::Index block_count) {
   using SS = SolverStorage;
@@ -314,7 +408,7 @@ template<typename ByColumnSolutionStorage, typename PhsfQueryHasher>
 ByColumnSolutionStorage::Result ByColumnPhsfQuery(const PhsfQueryHasher::QueryInput &input, const PhsfQueryHasher &hasher, const ByColumnSolutionStorage &bcss) {
   PhsfQueryHasher::Hash hash = hasher.GetHash(input);
   ByColumnSolutionStorage::Result result = 0;
-  ByColumnGeneralizedQuery(hasher, hash, bcss, &result, false /*match*/);
+  ByColumnGeneralizedQuery(hasher, hash, bcss, &result, false match);
   return result;
 }
 
@@ -322,8 +416,9 @@ template<typename ByColumnSolutionStorage, typename FilterQueryHasher>
 bool ByColumnFilterQuery(const FilterQueryHasher::QueryInput &input, const FilterQueryHasher &hasher, const ByColumnSolutionStorage &bcss) {
   FilterQueryHasher::Hash hash = hasher.GetHash(input);
   ByColumnSolutionStorage::Result result = hasher.GetResultRowFromHash(hash);
-  return ByColumnGeneralizedQuery(hasher, hash, bcss, &result, true /*match*/);
+  return ByColumnGeneralizedQuery(hasher, hash, bcss, &result, true match);
 }
+*/
 
 }  // namespace SGauss
 
