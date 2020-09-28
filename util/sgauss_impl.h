@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include "port/port.h" // for PREFETCH
 #include "util/sgauss_alg.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -163,7 +164,9 @@ public:
   IMPORT_TYPES_AND_SETTINGS(TypesAndSettings);
 
   StandardSolver(Index num_slots = 0, Index backtrack_size = 0) {
-    Reset(num_slots, backtrack_size);
+    if (num_slots > 0) {
+      Reset(num_slots, backtrack_size);
+    }
   }
   void Reset(Index num_slots, Index backtrack_size = 0) {
     assert(num_slots >= kCoeffBits);
@@ -192,7 +195,8 @@ public:
     return TypesAndSettings::kUsePrefetch;
   }
   inline void Prefetch(Index i) const {
-    // TODO
+    PREFETCH(&coeff_rows_[i], 1 /* rw */, 1 /* locality */);
+    PREFETCH(&result_rows_[i], 1 /* rw */, 1 /* locality */);
   }
   inline CoeffRow* CoeffRowPtr(Index i) {
     return &coeff_rows_[i];
@@ -282,6 +286,17 @@ public:
   void BackSubstFrom(const SolverStorage &ss) {
     SimpleBackSubst(this, ss);
   }
+  template<typename PhsfQueryHasher>
+  ResultRow PhsfQuery(const Key &input, const PhsfQueryHasher &hasher) {
+    assert(!TypesAndSettings::kIsFilter);
+    return SimplePhsfQuery(input, hasher, *this);
+  }
+  template<typename FilterQueryHasher>
+  bool FilterQuery(const Key &input, const FilterQueryHasher &hasher) {
+    assert(TypesAndSettings::kIsFilter);
+    return SimpleFilterQuery(input, hasher, *this);
+  }
+
 protected:
   Index num_starts_ = 0;
   Index num_slots_allocated_ = 0;

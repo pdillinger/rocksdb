@@ -83,7 +83,7 @@ namespace sgauss {
 // }
 
 template<typename SolverStorage, typename BacktrackStorage>
-bool SolverAdd(SolverStorage *ss, typename SolverStorage::Hash h,
+bool SolverAdd(SolverStorage *ss,
                typename SolverStorage::Index start, typename SolverStorage::ResultRow rr, typename SolverStorage::CoeffRow cr,
                BacktrackStorage *bts, typename SolverStorage::Index backtrack_pos) {
   using CoeffRow = typename SolverStorage::CoeffRow;
@@ -152,7 +152,7 @@ bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, const BuilderH
       ResultRow rr = bh.GetResultRowFromInput(*cur) | bh.GetResultRowFromHash(h);
       CoeffRow cr = bh.GetCoeffRow(h);
 
-      if (!SolverAdd(ss, h, start, rr, cr, bts, backtrack_pos)) {
+      if (!SolverAdd(ss, start, rr, cr, bts, backtrack_pos)) {
         break;
       }
       if ((++cur) == end) {
@@ -173,7 +173,7 @@ bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, const BuilderH
       rr |= bh.GetResultRowFromHash(h);
       CoeffRow cr = bh.GetCoeffRow(h);
       if ((++cur) == end) {
-        if (!SolverAdd(ss, h, start, rr, cr, bts, backtrack_pos)) {
+        if (!SolverAdd(ss, start, rr, cr, bts, backtrack_pos)) {
           break;
         }
         return true;
@@ -182,7 +182,7 @@ bool BacktrackableSolve(SolverStorage *ss, BacktrackStorage *bts, const BuilderH
       Index next_start = bh.GetStart(h, num_starts);
       ResultRow next_rr = bh.GetResultRowFromInput(*cur);
       ss->Prefetch(next_start);
-      if (!SolverAdd(ss, h, start, rr, cr, bts, backtrack_pos)) {
+      if (!SolverAdd(ss, start, rr, cr, bts, backtrack_pos)) {
         break;
       }
       ++backtrack_pos;

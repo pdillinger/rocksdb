@@ -429,7 +429,7 @@ struct GaussData {
 
   static inline uint32_t HashToStart(uint64_t h, uint32_t num_output_rows) {
     const uint32_t addrs = num_output_rows - 127;
-    return static_cast<uint32_t>(fastrange64(h, addrs));
+    return static_cast<uint32_t>(FastRange64(h, addrs));
   }
 
   // Note: to be sure we do not doom a build attempt, we must ensure

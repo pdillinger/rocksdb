@@ -573,6 +573,10 @@ TEST(SGaussTest, Basic) {
   InMemSimpleSolution<MyTypesAndSettings> soln;
   soln.BackSubstFrom(ss);
 
+  for (const auto& key : keys) {
+    EXPECT_TRUE(soln.FilterQuery(key, ss));
+  }
+  EXPECT_FALSE(soln.FilterQuery("asdf", ss));
 }
 
 
