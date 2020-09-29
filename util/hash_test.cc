@@ -549,8 +549,17 @@ TEST(MathTest, Coding128) {
 using ROCKSDB_NAMESPACE::sgauss::StandardSolver;
 using ROCKSDB_NAMESPACE::sgauss::InMemSimpleSolution;
 
+template <typename TypesAndSettings>
+class SGaussTest : public ::testing::Test {
+protected:
+  using Solver = StandardSolver<TypesAndSettings>;
+  Solver solver_;
+  using SimpleSoln = InMemSimpleSolution<TypesAndSettings>;
+  SimpleSoln simple_soln_;
+};
+
 struct DefaultTypesAndSettings {
-  using CoeffRow = uint64_t;
+  using CoeffRow = Unsigned128;
   using ResultRow = uint8_t;
   using Index = uint32_t;
   using Hash = uint64_t;
@@ -561,25 +570,59 @@ struct DefaultTypesAndSettings {
   static constexpr bool kUsePrefetch = true;
   static constexpr bool kUseSmash = false;
   static Hash HashFn(const Key &key, Seed seed) {
-    return Hash64(key.data(), key.size(), seed);
+    return ROCKSDB_NAMESPACE::Hash64(key.data(), key.size(), seed);
   }
 };
-struct MyTypesAndSettings : public DefaultTypesAndSettings {
-  using CoeffRow = Unsigned128;
+
+using TypesAndSettings_Coeff128 = DefaultTypesAndSettings;
+struct TypesAndSettings_Coeff128Smash : public DefaultTypesAndSettings {
+  static constexpr bool kUseSmash = true;
+};
+struct TypesAndSettings_Coeff64 : public DefaultTypesAndSettings {
+  using CoeffRow = uint64_t;
+};
+struct TypesAndSettings_Coeff64Smash : public DefaultTypesAndSettings {
+  using CoeffRow = uint64_t;
+  static constexpr bool kUseSmash = true;
+};
+struct TypesAndSettings_Result16 : public DefaultTypesAndSettings {
+  using ResultRow = uint16_t;
+};
+struct TypesAndSettings_IndexSizeT : public DefaultTypesAndSettings {
+  using Index = size_t;
+};
+struct TypesAndSettings_Hash32 : public DefaultTypesAndSettings {
+  using Hash = uint32_t;
+  static Hash HashFn(const Key &key, Seed seed) {
+    return ROCKSDB_NAMESPACE::Hash(key.data(), key.size(), seed);
+  }
+};
+struct TypesAndSettings_KeyString : public DefaultTypesAndSettings {
+  using Key = std::string;
+};
+struct TypesAndSettings_Seed8 : public DefaultTypesAndSettings {
+  using Seed = uint8_t;
+};
+struct TypesAndSettings_NoAlwaysOne : public DefaultTypesAndSettings {
+  static constexpr bool kFirstCoeffAlwaysOne = false;
+};
+struct TypesAndSettings_NoPrefetch : public DefaultTypesAndSettings {
+  static constexpr bool kUsePrefetch = false;
 };
 
-TEST(SGaussTest, Basic) {
+using TestTypesAndSettings = ::testing::Types<TypesAndSettings_Coeff128, TypesAndSettings_Coeff128Smash, TypesAndSettings_Coeff64, TypesAndSettings_Coeff64Smash, TypesAndSettings_Result16, TypesAndSettings_IndexSizeT, TypesAndSettings_Hash32, TypesAndSettings_KeyString, TypesAndSettings_Seed8, TypesAndSettings_NoAlwaysOne, TypesAndSettings_NoPrefetch>;
+TYPED_TEST_CASE(SGaussTest, TestTypesAndSettings);
+
+TYPED_TEST(SGaussTest, Basic) {
   std::vector<std::string> keys = { "abc", "def", "ghi" };
 
-  StandardSolver<MyTypesAndSettings> ss;
-  ASSERT_TRUE(ss.ResetAndFindSeedToSolve(keys.size() + sizeof(MyTypesAndSettings::CoeffRow) * 8U, keys.begin(), keys.end(), 100));
-  InMemSimpleSolution<MyTypesAndSettings> soln;
-  soln.BackSubstFrom(ss);
+  ASSERT_TRUE(this->solver_.ResetAndFindSeedToSolve(keys.size() + sizeof(typename TypeParam::CoeffRow) * 8U, keys.begin(), keys.end(), 100));
+  this->simple_soln_.BackSubstFrom(this->solver_);
 
   for (const auto& key : keys) {
-    EXPECT_TRUE(soln.FilterQuery(key, ss));
+    EXPECT_TRUE(this->simple_soln_.FilterQuery(key, this->solver_));
   }
-  EXPECT_FALSE(soln.FilterQuery("asdf", ss));
+  EXPECT_FALSE(this->simple_soln_.FilterQuery("asdf", this->solver_));
 }
 
 
