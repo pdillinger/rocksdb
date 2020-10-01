@@ -771,6 +771,69 @@ class LevelAndStyleCustomFilterPolicy : public FilterPolicy {
   const std::unique_ptr<const FilterPolicy> policy_otherwise_;
 };
 
+// See "Monkey: Optimal Navigable Key-Value Store" for excessive detail.
+// If you were using 10 bits per key, recommend something like
+// bpk_max = 16, bpk_min = 3, level_for_min = num_levels - 1.
+// BUG: bits per key less than 1.0, including 0, are currently coerced
+// up to 1.0.
+class SimplifiedMonkeyFilterPolicy : public FilterPolicy {
+ public:
+  // Uses bpk_max bits per key at L0 and bpk_min bits per key at level
+  // level_for_min (and higher if applicable; recommend setting level_for_min
+  // to num_levels - 1), with the latter taking precedence if
+  // level_for_min == 0. Levels in between get bits-per-key settings linearly
+  // interpolated between the two.
+  explicit SimplifiedMonkeyFilterPolicy(double bpk_max, double bpk_min,
+                              int level_for_min) {
+    if (bpk_max < bpk_min) {
+      assert(false);  // violated precondition
+      // try to fix it
+      std::swap(bpk_max, bpk_min);
+    }
+    if (level_for_min < 0) {
+      assert(false);  // violated precondition
+      // try to fix it
+      level_for_min = 0;
+    }
+    assert(level_for_min >= 0);
+    for (int level = 0; level < level_for_min; level++) {
+      double bpk =
+          bpk_max - (bpk_max - bpk_min) * (level * 1.0 / level_for_min);
+      policies_.emplace_back(NewBloomFilterPolicy(bpk));
+    }
+    policies_.emplace_back(NewBloomFilterPolicy(bpk_min));
+  }
+
+  // OK to use built-in policy name because we are deferring to a
+  // built-in builder. We aren't changing the serialized format.
+  const char* Name() const override { return policies_[0]->Name(); }
+
+  FilterBitsBuilder* GetBuilderWithContext(
+      const FilterBuildingContext& context) const override {
+    // Coerce to vector index range
+    int i = std::max(context.level_at_creation, 0);
+    i = std::min(i, static_cast<int>(policies_.size() - 1));
+    return policies_[i]->GetBuilderWithContext(context);
+  }
+
+  FilterBitsReader* GetFilterBitsReader(const Slice& contents) const override {
+    // OK to defer to any of them; they all can parse built-in filters
+    // from any settings.
+    return policies_[0]->GetFilterBitsReader(contents);
+  }
+
+  // Defer just in case configuration uses block-based filter
+  void CreateFilter(const Slice* keys, int n, std::string* dst) const override {
+    policies_[0]->CreateFilter(keys, n, dst);
+  }
+  bool KeyMayMatch(const Slice& key, const Slice& filter) const override {
+    return policies_[0]->KeyMayMatch(key, filter);
+  }
+
+ private:
+  std::vector<std::unique_ptr<const FilterPolicy>> policies_;
+};
+
 class TestingContextCustomFilterPolicy
     : public LevelAndStyleCustomFilterPolicy {
  public:
