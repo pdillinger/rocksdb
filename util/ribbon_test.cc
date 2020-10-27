@@ -131,7 +131,8 @@ TYPED_TEST_CASE(RibbonTypeParamTest, TestTypesAndSettings);
 namespace {
 
 struct KeyGen {
-  KeyGen(const std::string& prefix, uint64_t id) : id_(id), str_(prefix) {
+  KeyGen(const std::string& prefix, uint64_t id) : id_(id) {
+    id_ += ROCKSDB_NAMESPACE::GetSliceHash64(prefix);
     ROCKSDB_NAMESPACE::PutFixed64(&str_, id_);
   }
 
@@ -142,9 +143,8 @@ struct KeyGen {
   }
 
   const std::string& operator*() {
-    // Use multiplication to mix things up a little in the key
     ROCKSDB_NAMESPACE::EncodeFixed64(&str_[str_.size() - 8],
-                                     id_ * uint64_t{0x1500000001});
+                                     id_ /* * uint64_t{0x1500000001} */);
     return str_;
   }
 
