@@ -347,28 +347,19 @@ using uint128_t = Unsigned128;
 
 struct GaussData {
   uint32_t num_output_rows;
-  uint32_t match_row_mask;
   uint32_t alloc_num_output_rows = 0;
 
-  // TODO: explore combining in a struct
   std::unique_ptr<uint128_t[]> coeff_rows_by_pivot;
-  std::unique_ptr<uint32_t[]> match_rows_by_pivot;
 
-  void ResetFor(uint32_t _num_output_rows, uint32_t _match_row_mask) {
+  void ResetFor(uint32_t _num_output_rows) {
     num_output_rows = _num_output_rows;
-    match_row_mask = _match_row_mask;
     if (_num_output_rows <= alloc_num_output_rows) {
       for (uint32_t i = 0; i < _num_output_rows; ++i) {
         coeff_rows_by_pivot[i] = 0;
-      // Note: don't strictly have to reset match_rows_by_pivot ;)
-        match_rows_by_pivot[i] = 0;
       }
     } else {
       // FIXME/XXX: extra for BackPropAndStore overflow read?
       coeff_rows_by_pivot.reset(new uint128_t[_num_output_rows]());
-      // Note: don't strictly have to zero-init match_rows_by_pivot,
-      // except possible information leakage ;)
-      match_rows_by_pivot.reset(new uint32_t[_num_output_rows]());
       alloc_num_output_rows = _num_output_rows;
     }
   }
@@ -376,12 +367,10 @@ struct GaussData {
   inline void PrefetchForAdd(uint64_t h, uint32_t *start) {
     uint32_t st = HashToStart(h, num_output_rows);
     PREFETCH(coeff_rows_by_pivot.get() + st, 1 /* rw */, 1 /* locality */);
-    PREFETCH(match_rows_by_pivot.get() + st, 1 /* rw */, 1 /* locality */);
     *start = st;
   }
 
-  inline bool AddPrefetched(uint64_t h, uint32_t start) {
-    uint32_t match_row = HashToMatchRow(h) & match_row_mask;
+  inline void AddPrefetched(uint64_t h, uint32_t start) {
     uint128_t coeff_row = HashToCoeffRow(h);
 
     for (;;) {
@@ -390,41 +379,17 @@ struct GaussData {
       uint128_t other = coeff_rows_by_pivot[start];
       if (other == 0) {
         coeff_rows_by_pivot[start] = coeff_row;
-        match_rows_by_pivot[start] = match_row;
-        return true;
+        return;
       }
       assert((other & 1) == 1);
       coeff_row ^= other;
-      match_row ^= match_rows_by_pivot[start];
       if (coeff_row == 0) {
-        break;
+        return;
       }
       int tz = CountTrailingZeroBits(coeff_row);
       start += static_cast<uint32_t>(tz);
       coeff_row >>= tz;
     }
-    // Failed, unless match_row == 0 because e.g. a duplicate add
-    // or a stock hash collision. Or we could have a full equation
-    // equal to sum of other equations, which is very possible with
-    // small match_bits.
-    return match_row == 0;
-  }
-
-  static inline uint64_t XXH3p_avalanche_ish(uint64_t h64)
-  {
-      //h64 ^= h64 >> 37;
-      h64 *= 0x165667B19E3779F9ULL;
-      h64 ^= h64 >> 32;
-      return h64;
-  }
-
-  static inline uint64_t SeedPreHash(uint64_t pre_h, uint32_t seed) {
-    // This should work reasonably nicely to mul-mix the seed in parallel
-    // with starting the avalanche on pre_h. With ~50% construction success
-    // rate, this approach is a bit more independent (closer to ideal) than
-    // simple add seed or rotate by seed.
-    pre_h ^= pre_h >> 37;
-    return XXH3p_avalanche_ish(pre_h ^ (seed * 0xC2B2AE3D27D4EB4FULL));
   }
 
   static inline uint32_t HashToStart(uint64_t h, uint32_t num_output_rows) {
@@ -440,11 +405,6 @@ struct GaussData {
     uint128_t a = Multiply64to128(h, 0x9e3779b97f4a7c13U);
     uint128_t b = Multiply64to128(h, 0xa4398ab94d038781U);
     return (b ^ (a << 64) ^ (a >> 64)) | 1U;
-  }
-
-  static inline uint32_t HashToMatchRow(uint64_t h) {
-    // NB: just h seems to cause some association affecting FP rate
-    return Lower32of64(h ^ (h >> 13) ^ (h >> 26));
   }
 
   static inline bool DotCoeffRowWithOutputColumn(uint32_t start_word, uint32_t start_bit, uint128_t coeff_row, const uint128_t *output_data, uint32_t match_bits) {
@@ -476,7 +436,7 @@ struct GaussData {
     }
   }
 
-  static inline bool MayMatchQuery(const uint128_t *word_data, uint32_t start_bit, uint32_t match_bits, uint128_t coeff_row, uint32_t match_row) {
+  static inline bool MayMatchQuery(const uint128_t *word_data, uint32_t start_bit, uint32_t match_bits, uint128_t coeff_row) {
 /*
     // Not an improvement
     uint32_t versus_row = 0;
@@ -537,10 +497,9 @@ struct GaussData {
     // Simple and OK
     for (uint32_t i = 0; i < match_bits; ++i) {
       bool v = GaussData::DotCoeffRowWithOutputColumn(i, start_bit, coeff_row, word_data, match_bits);
-      if (v != (match_row & 1)) {
+      if (v != false) {
         return false;
       }
-      match_row >>= 1;
     }
     return true;
 //*/
@@ -659,50 +618,46 @@ struct SimpleGaussFilter {
     buf->reset(data = new char[bytes]());
   }
 
-  bool TrySolve(GaussData &gauss, const std::deque<uint64_t> &hashes) {
+  void Solve(GaussData &gauss, const std::deque<uint64_t> &hashes) {
     if (hashes.empty()) {
       // exclude trivial case for prefetch code below
-      return true;
+      return;
     }
 
     uint32_t num_output_rows = total_blocks * 128;
-    uint32_t match_row_mask = (uint32_t{1} << 1 << lower_match_bits) - 1;
-    gauss.ResetFor(num_output_rows, match_row_mask);
+    gauss.ResetFor(num_output_rows);
 
     // Prime the pipeline with prefetch
-    uint64_t h = GaussData::SeedPreHash(hashes.back(), seed);
+    uint64_t h = hashes.back();
     uint32_t start;
     gauss.PrefetchForAdd(h, &start);
 
     // Pipeline build
-    for (uint64_t pre_h : hashes) {
-      uint64_t next_h = GaussData::SeedPreHash(pre_h, seed);
+    for (uint64_t next_h : hashes) {
       uint32_t next_start;
       gauss.PrefetchForAdd(next_h, &next_start);
 
-      if (!gauss.AddPrefetched(h, start)) {
-        return false;
-      }
+      gauss.AddPrefetched(h, start);
 
       h = next_h;
       start = next_start;
     }
-    // Success
-    return true;
   }
 
   template <size_t kMB> /* match bits */
   inline void BackPropAndStoreOptimizedRange(char *cur_data, const GaussData &gauss, uint32_t rel_end_block, uint32_t rel_begin_block, std::array<uint128_t, kMB> &state) {
     //printf("BPASOR %u %u %u\n", (unsigned)kMB, rel_end_block, rel_begin_block);
+    uint32_t randomish = 1234567895;
     for (uint32_t block = rel_end_block; block > rel_begin_block;) {
       --block;
       for (uint32_t i = 0; i < 128; ++i) {
         const uint32_t pivot = block * 128 + (127 - i);
         const uint128_t coeff_row = gauss.coeff_rows_by_pivot[pivot];
-        uint32_t match_row = gauss.match_rows_by_pivot[pivot];
+        uint32_t unused_marker = coeff_row == 0 ? 1 : 0;
+        randomish += 0x85EBCA77U;
         for (uint32_t j = 0; j < kMB; ++j) {
           uint128_t tmp = state[j] << 1;
-          tmp |= uint128_t{BitParity(tmp & coeff_row) ^ ((match_row >> j) & 1)};
+          tmp |= uint128_t{BitParity(tmp & coeff_row) ^ ((randomish >> j) & unused_marker)};
           state[j] = tmp;
         }
         //printf("Pivot %u\n", pivot);
@@ -811,17 +766,9 @@ struct SimpleGaussFilter {
     GaussData gauss;
 
     assert(seed == 0);
-    for (; seed < /*FIXME?*/64; ++seed) {
-      if (TrySolve(gauss, *hashes)) {
-        BackPropAndStore(gauss);
-        hashes->clear();
-        printf("seed_used: %u\n", seed);
-        return;
-      }
-    }
-    // else
-    fprintf(stderr, "Bloom fallback not yet implemented. Aborting.\n");
-    abort();
+    Solve(gauss, *hashes);
+    BackPropAndStore(gauss);
+    hashes->clear();
   }
 
   void StoreFilterMetadata() {
@@ -957,14 +904,14 @@ class SimpleGaussBitsReader : public FilterBitsReader {
   ~SimpleGaussBitsReader() override {}
 
   bool MayMatch(const Slice& key) override {
-    uint64_t h = GaussData::SeedPreHash(GetSliceHash64(key), f_.seed);
+    uint64_t h = GetSliceHash64(key);
 
     uint32_t start_bit;
     uint32_t match_bits;
     const uint128_t *word_data;
     f_.GetQueryInfoAndPrefetch(h, &start_bit, &match_bits, &word_data);
 
-    return GaussData::MayMatchQuery(word_data, start_bit, match_bits, GaussData::HashToCoeffRow(h), GaussData::HashToMatchRow(h));
+    return GaussData::MayMatchQuery(word_data, start_bit, match_bits, GaussData::HashToCoeffRow(h));
   }
 
   virtual void MayMatch(int num_keys, Slice** keys, bool* may_match) override {
@@ -977,7 +924,7 @@ class SimpleGaussBitsReader : public FilterBitsReader {
     std::array<MultiData, MultiGetContext::MAX_BATCH_SIZE> data;
     for (int i = 0; i < num_keys; ++i) {
       MultiData &d = data[i];
-      uint64_t h = GaussData::SeedPreHash(GetSliceHash64(*keys[i]), f_.seed);
+      uint64_t h = GetSliceHash64(*keys[i]);
 
       uint32_t start_bit;
       uint32_t match_bits;
@@ -994,7 +941,7 @@ class SimpleGaussBitsReader : public FilterBitsReader {
       const uint128_t * const word_data = reinterpret_cast<const uint128_t*>(d.ptr);
       uint32_t start_bit = d.a;
       uint32_t match_bits = d.b;
-      may_match[i] = GaussData::MayMatchQuery(word_data, start_bit, match_bits, GaussData::HashToCoeffRow(h), GaussData::HashToMatchRow(h));
+      may_match[i] = GaussData::MayMatchQuery(word_data, start_bit, match_bits, GaussData::HashToCoeffRow(h));
     }
   }
 
