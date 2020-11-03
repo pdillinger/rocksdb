@@ -815,7 +815,9 @@ struct SimpleGaussFilter {
       if (TrySolve(gauss, *hashes)) {
         BackPropAndStore(gauss);
         hashes->clear();
-        printf("seed_used: %u\n", seed);
+        if (getenv("SHOW_SEED_COUNT")) {
+          printf("seed_used: %u\n", seed);
+        }
         return;
       }
     }
