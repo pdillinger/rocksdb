@@ -53,6 +53,9 @@ DEFINE_bool(vary_key_alignment, true,
             "Whether to vary key alignment (default: at least 32-bit "
             "alignment)");
 
+DEFINE_bool(cache_misalign, false,
+            "Whether to misalign the filter with respect to CPU cache lines");
+
 DEFINE_uint32(vary_key_size_log2_interval, 5,
               "Use same key size 2^n times, then change. Key size varies from "
               "-2 to +2 bytes vs. average, unless n>=30 to fix key size.");
@@ -393,6 +396,13 @@ void FilterBench::Go() {
         builder->AddKey(kms_[0].Get(filter_id, i));
       }
       info.filter_ = builder->Finish(&info.owner_);
+      if (FLAGS_cache_misalign) {
+        std::unique_ptr<char[]> copy_owner;
+        copy_owner.reset(new char[info.filter_.size() + CACHE_LINE_SIZE/2]);
+        memcpy(copy_owner.get() + CACHE_LINE_SIZE/2, info.filter_.data(), info.filter_.size());
+        info.filter_ = Slice(copy_owner.get() + CACHE_LINE_SIZE/2, info.filter_.size());
+        info.owner_ = std::move(copy_owner);
+      }
 #ifdef PREDICT_FP_RATE
       weighted_predicted_fp_rate +=
           keys_to_add *
