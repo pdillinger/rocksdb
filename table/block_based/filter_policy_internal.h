@@ -33,9 +33,9 @@ class BuiltinFilterBitsBuilder : public FilterBitsBuilder {
   // using binary search on CalculateSpace
   size_t CalculateNumEntry(size_t bytes) override;
 
-  // Returns an estimate of the FP rate of the returned filter if
-  // `num_entries` keys are added and the filter returned by Finish
-  // is `bytes` bytes.
+  // Returns an estimate of the FP rate, >= 0.0 and <= 1.0, of the
+  // returned filter if `num_entries` keys are added and the filter
+  // returned by Finish is `bytes` bytes.
   virtual double EstimatedFpRate(size_t num_entries, size_t bytes) = 0;
 };
 
@@ -74,6 +74,9 @@ class BloomFilterPolicy : public FilterPolicy {
     // Automatically choose between kLegacyBloom and kFastLocalBloom based on
     // context at build time, including compatibility with format_version.
     kAutoBloom = 100,
+    // Always advise no filter, or generate a trivial "always true" filter
+    // if actually asked to generate one.
+    kNoFilter = 101,
   };
   // All the different underlying implementations that a BloomFilterPolicy
   // might use, as a mode that says "always use this implementation."
@@ -123,6 +126,18 @@ class BloomFilterPolicy : public FilterPolicy {
   int GetWholeBitsPerKey() const { return whole_bits_per_key_; }
   // Testing only
   Mode GetMode() const { return mode_; }
+
+  // 0.7 bits / key -> 75% FP rate. That is potentially "better than nothing"
+  // for low memory environments but it's hard to imagine higher FP rate
+  // proving "better than nothing" because at least nothing has no query and
+  // construction overhead.
+  static constexpr double kMinimumUsefulBitsPerKey = 0.7;
+  static constexpr int kMinimumUsefulMilliBitsPerKey = static_cast<int>(kMinimumUsefulBitsPerKey * 1000);
+
+  // 100 bits per key Bloom super accurate: close to storing raw 64 bit
+  // hashes. Any more is surely wasting space.
+  static constexpr double kMaximumUsefulBitsPerKey = 100.0;
+  static constexpr int kMaximumUsefulMilliBitsPerKey = static_cast<int>(kMaximumUsefulBitsPerKey * 1000);
 
  private:
   // Bits per key settings are for configuring Bloom filters.

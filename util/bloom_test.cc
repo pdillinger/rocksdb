@@ -386,12 +386,11 @@ TEST_P(FullBloomTest, FilterSize) {
   // checking that denoted and computed doubles are interpreted as expected
   // as bits_per_key values.
   bool some_computed_less_than_denoted = false;
-  // Note: enforced minimum is 1 bit per key (1000 millibits), and enforced
-  // maximum is 100 bits per key (100000 millibits).
   for (auto bpk :
-       std::vector<std::pair<double, int> >{{-HUGE_VAL, 1000},
-                                            {-INFINITY, 1000},
-                                            {0.0, 1000},
+       std::vector<std::pair<double, int> >{{-HUGE_VAL, 0},
+                                            {-INFINITY, 0},
+                                            {0.0, 0},
+                                            {0.7, 700},
                                             {1.234, 1234},
                                             {3.456, 3456},
                                             {9.5, 9500},
@@ -399,10 +398,17 @@ TEST_P(FullBloomTest, FilterSize) {
                                             {10.499, 10499},
                                             {21.345, 21345},
                                             {99.999, 99999},
-                                            {1234.0, 100000},
-                                            {HUGE_VAL, 100000},
-                                            {INFINITY, 100000},
-                                            {NAN, 100000}}) {
+                                            {1234.0, 1234000},
+                                            {HUGE_VAL, 999999999},
+                                            {INFINITY, 999999999},
+                                            {NAN, 999999999}}) {
+    if (GetParam() == BloomFilterPolicy::kNoFilter || bpk.second < BloomFilterPolicy::kMinimumUsefulMilliBitsPerKey) {
+      // Rounds down to no filter
+      bpk.second = 0.0;
+    }
+    if (bpk.second > BloomFilterPolicy::kMaximumUsefulMilliBitsPerKey) {
+      bpk.second = BloomFilterPolicy::kMaximumUsefulMilliBitsPerKey;
+    }
     ResetPolicy(bpk.first);
     auto bfp = GetBloomFilterPolicy();
     EXPECT_EQ(bpk.second, bfp->GetMillibitsPerKey());
@@ -457,11 +463,16 @@ TEST_P(FullBloomTest, FullSmall) {
   Add("world");
   ASSERT_TRUE(Matches("hello"));
   ASSERT_TRUE(Matches("world"));
-  ASSERT_TRUE(!Matches("x"));
-  ASSERT_TRUE(!Matches("foo"));
+  if (GetParam() != BloomFilterPolicy::kNoFilter) {
+    ASSERT_TRUE(!Matches("x"));
+    ASSERT_TRUE(!Matches("foo"));
+  }
 }
 
 TEST_P(FullBloomTest, FullVaryingLengths) {
+  if (GetParam() == BloomFilterPolicy::kNoFilter) {
+    return; // skip
+  }
   char buffer[sizeof(int)];
 
   // Count number of filters that significantly exceed the false positive rate
@@ -507,6 +518,9 @@ TEST_P(FullBloomTest, OptimizeForMemory) {
   if (GetParam() == BloomFilterPolicy::kStandard128Ribbon) {
     // TODO Not yet implemented
     return;
+  }
+  if (GetParam() == BloomFilterPolicy::kNoFilter) {
+    return; // skip
   }
   char buffer[sizeof(int)];
   for (bool offm : {true, false}) {
@@ -602,6 +616,9 @@ inline uint32_t SelectByCacheLineSize(uint32_t for64, uint32_t for128,
 // ability to read filters generated using other cache line sizes.
 // See RawSchema.
 TEST_P(FullBloomTest, Schema) {
+  if (GetParam() == BloomFilterPolicy::kNoFilter) {
+    return; // skip
+  }
 #define EXPECT_EQ_Bloom(a, b)                                  \
   {                                                            \
     if (GetParam() != BloomFilterPolicy::kStandard128Ribbon) { \
@@ -1171,7 +1188,8 @@ TEST_P(FullBloomTest, CorruptFilters) {
 INSTANTIATE_TEST_CASE_P(Full, FullBloomTest,
                         testing::Values(BloomFilterPolicy::kLegacyBloom,
                                         BloomFilterPolicy::kFastLocalBloom,
-                                        BloomFilterPolicy::kStandard128Ribbon));
+                                        BloomFilterPolicy::kStandard128Ribbon,
+                                        BloomFilterPolicy::kNoFilter));
 
 }  // namespace ROCKSDB_NAMESPACE
 

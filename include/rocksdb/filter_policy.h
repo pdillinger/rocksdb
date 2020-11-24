@@ -59,6 +59,24 @@ class FilterBitsBuilder {
     // RELEASE: something reasonably "safe": 2 bytes per entry
     return bytes / 2;
   }
+
+  // FilterPolicy does not have a way to say "please do not construct
+  // a filter in this case," so that capability is retrofitted here in the
+  // Builder returned by FilterPolicy. If returning true, it recommends to
+  // the caller of the FilterBitsBuilder not to generate a filter at all.
+  // For compatibility, this return value is only advisory, and
+  // AddKey+Finish might still be called.
+  //
+  // If returning true, allocating the FilterBitsBuilder was arguably
+  // wasteful, but is acceptable overhead for API compatibility.
+  //
+  // No filter can be best in cases of large numbers of keys, where hits are
+  // likely, and/or where filterable accesses are rare. The behavior of
+  // no filter is equivalent to 100% FP rate, but without access and storage
+  // overhead.
+  virtual bool IsNoFilterAdvised() {
+    return false;
+  }
 };
 
 // A class that checks if a key can be in filter

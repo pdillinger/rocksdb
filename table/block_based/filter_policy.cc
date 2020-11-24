@@ -50,6 +50,46 @@ Slice FinishAlwaysFalse(std::unique_ptr<const char[]>* /*buf*/) {
   return Slice(nullptr, 0);
 }
 
+Slice FinishAlwaysTrue(std::unique_ptr<const char[]>* buf) {
+  // Interpreted as zero probes -> 100% FP rate
+  char * mbuf = new char[6]();
+  buf->reset(mbuf);
+  return Slice(mbuf, 6);
+}
+
+class AdviseNoFilterBitsBuilder : public BuiltinFilterBitsBuilder {
+ public:
+  void AddKey(const Slice& /*key*/) override {
+    any_added_ = true;
+  }
+
+  Slice Finish(std::unique_ptr<const char[]>* buf) override {
+    if (any_added_) {
+      return FinishAlwaysTrue(buf);
+    } else {
+      return FinishAlwaysFalse(buf);
+    }
+  }
+
+  bool IsNoFilterAdvised() override {
+    return true;
+  }
+
+  size_t CalculateSpace(size_t num_entries) override {
+    return num_entries > 0 ? 6 : 0;
+  }
+
+  size_t CalculateNumEntry(size_t /*bytes*/) override {
+    return std::numeric_limits<size_t>::max();
+  }
+
+  double EstimatedFpRate(size_t /*num_entries*/, size_t /*bytes*/) override {
+    return 1.0;
+  }
+ private:
+  bool any_added_ = false;
+};
+
 // Base class for filter builders using the XXH3 preview hash,
 // also known as Hash64 or GetSliceHash64.
 class XXH3pFilterBitsBuilder : public BuiltinFilterBitsBuilder {
@@ -90,7 +130,7 @@ class FastLocalBloomBitsBuilder : public XXH3pFilterBitsBuilder {
       std::atomic<int64_t>* aggregate_rounding_balance)
       : millibits_per_key_(millibits_per_key),
         aggregate_rounding_balance_(aggregate_rounding_balance) {
-    assert(millibits_per_key >= 1000);
+    assert(millibits_per_key >= 700);
   }
 
   // No Copy allowed
@@ -851,22 +891,32 @@ const std::vector<BloomFilterPolicy::Mode> BloomFilterPolicy::kAllFixedImpls = {
     kDeprecatedBlock,
     kFastLocalBloom,
     kStandard128Ribbon,
+    kNoFilter,
 };
 
 const std::vector<BloomFilterPolicy::Mode> BloomFilterPolicy::kAllUserModes = {
     kDeprecatedBlock,
     kAutoBloom,
     kStandard128Ribbon,
+    kNoFilter,
 };
 
 BloomFilterPolicy::BloomFilterPolicy(double bits_per_key, Mode mode)
-    : mode_(mode), warned_(false), aggregate_rounding_balance_(0) {
-  // Sanitize bits_per_key
-  if (bits_per_key < 1.0) {
-    bits_per_key = 1.0;
-  } else if (!(bits_per_key < 100.0)) {  // including NaN
-    bits_per_key = 100.0;
+    : warned_(false), aggregate_rounding_balance_(0) {
+  // Sanitize bits_per_key and mode
+  if (bits_per_key < kMinimumUsefulBitsPerKey) {
+    if (mode == kDeprecatedBlock) {
+      bits_per_key = kMinimumUsefulBitsPerKey;
+    } else {
+      mode = kNoFilter;
+    }
+  } else if (!(bits_per_key < kMaximumUsefulBitsPerKey)) {  // including NaN
+    bits_per_key = kMaximumUsefulBitsPerKey;
   }
+  if (mode == kNoFilter) {
+    bits_per_key = 0.0;
+  }
+  mode_ = mode;
 
   // Includes a nudge toward rounding up, to ensure on all platforms
   // that doubles specified with three decimal digits after the decimal
@@ -966,6 +1016,8 @@ FilterBitsBuilder* BloomFilterPolicy::GetBuilderWithContext(
   // one exhaustive switch without (risky) recursion
   for (int i = 0; i < 2; ++i) {
     switch (cur) {
+      case kNoFilter:
+        return new AdviseNoFilterBitsBuilder();
       case kAutoBloom:
         if (context.table_options.format_version < 5) {
           cur = kLegacyBloom;
