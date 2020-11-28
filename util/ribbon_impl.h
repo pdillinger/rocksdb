@@ -7,6 +7,7 @@
 
 #include <cmath>
 
+#include "port/lang.h"  // for FALLTHROUGH_INTENDED
 #include "port/port.h"  // for PREFETCH
 #include "util/ribbon_alg.h"
 
@@ -48,6 +49,12 @@ namespace ribbon {
 //   // PHSF and expects std::pair<Key, ResultRow> as inputs for
 //   // construction.
 //   static constexpr bool kIsFilter;
+//
+//   // When true, enables a special "lite" filter implementation which is
+//   // slightly faster to construct, and never fails to construct though
+//   // FP rate can quickly explode in cases where corresponding non-lite
+//   // filter would fail to construct.
+//   static constexpr bool kLiteFilter;
 //
 //   // When true, adds a tiny bit more hashing logic on queries and
 //   // construction to improve utilization at the beginning and end of
@@ -201,7 +208,28 @@ class StandardHasher {
     // This is not so much "critical path" code because it can be done in
     // parallel (instruction level) with memory lookup.
     //
-    // We do not need exhaustive remixing for CoeffRow, but just enough that
+    // When we might have many entries squeezed into a single start,
+    // we need reasonably good remixing for CoeffRow.
+    if (TypesAndSettings::kUseSmash) {
+      // Reasonably good, reasonably fast, reasonably general.
+      // Probably not 1:1 but probably close enough.
+      // TODO: verify against with Hash64
+      Unsigned128 a = Multiply64to128(h, 0x876f170be4f1fcb9U);
+      Unsigned128 b = Multiply64to128(h, 0xf0433a4aecda4c5fU);
+      auto cr = static_cast<CoeffRow>(b ^ (a << 64) ^ (a >> 64));
+
+      // Now ensure the value is non-zero
+      if (kFirstCoeffAlwaysOne) {
+        cr |= 1;
+      } else {
+        // Still have to ensure some bit is non-zero
+        cr |= (cr == 0) ? 1 : 0;
+      }
+      return cr;
+    }
+    // If not kUseSmash, we ensure we're not squeezing many entries into a
+    // single start, in part by ensuring num_starts > num_slots / 2. Thus,
+    // here we do not need good remixing for CoeffRow, but just enough that
     // (a) every bit is reasonably independent from Start.
     // (b) every Hash-length bit subsequence of the CoeffRow has full or
     // nearly full entropy from h.
@@ -220,25 +248,29 @@ class StandardHasher {
     // even with a (likely) different multiplier here.
     Hash a = h * kCoeffAndResultFactor;
 
-    // If that's big enough, we're done. If not, we have to expand it,
-    // maybe up to 4x size.
-    uint64_t b = a;
     static_assert(
         sizeof(Hash) == sizeof(uint64_t) || sizeof(Hash) == sizeof(uint32_t),
         "Supported sizes");
+    // If that's big enough, we're done. If not, we have to expand it,
+    // maybe up to 4x size.
+    uint64_t b;
     if (sizeof(Hash) < sizeof(uint64_t)) {
       // Almost-trivial hash expansion (OK - see above), favoring roughly
       // equal number of 1's and 0's in result
-      b = (b << 32) ^ b ^ kCoeffXor32;
+      b = (uint64_t{a} << 32) ^ (a ^ kCoeffXor32);
+    } else {
+      b = a;
     }
-    Unsigned128 c = b;
     static_assert(sizeof(CoeffRow) == sizeof(uint64_t) ||
                       sizeof(CoeffRow) == sizeof(Unsigned128),
                   "Supported sizes");
+    Unsigned128 c;
     if (sizeof(uint64_t) < sizeof(CoeffRow)) {
       // Almost-trivial hash expansion (OK - see above), favoring roughly
       // equal number of 1's and 0's in result
-      c = (c << 64) ^ c ^ kCoeffXor64;
+      c = (Unsigned128{b} << 64) ^ (b ^ kCoeffXor64);
+    } else {
+      c = b;
     }
     auto cr = static_cast<CoeffRow>(c);
 
@@ -261,7 +293,7 @@ class StandardHasher {
     return static_cast<ResultRow>(~ResultRow{0});
   }
   inline ResultRow GetResultRowFromHash(Hash h) const {
-    if (TypesAndSettings::kIsFilter) {
+    if (TypesAndSettings::kIsFilter && !TypesAndSettings::kLiteFilter) {
       // This is not so much "critical path" code because it can be done in
       // parallel (instruction level) with memory lookup.
       //
@@ -270,12 +302,17 @@ class StandardHasher {
       // comparable to number of hash bits or kCoeffBits. If !kUseSmash
       // and num_starts > kCoeffBits, it is safe and efficient to draw from
       // the same bits computed for CoeffRow, which are reasonably
-      // independent from Start. (Inlining and common subexpression
-      // elimination with GetCoeffRow should make this
-      // a single shared multiplication in generated code.)
-      //
-      // TODO: fix & test the kUseSmash case with very small num_starts
-      Hash a = h * kCoeffAndResultFactor;
+      // independent from Start.
+      Hash a;
+      if (TypesAndSettings::kUseSmash) {
+        // Independent-ish of CoeffRow
+        a = h * kAltResultFactor;
+      } else {
+        // Shared with CoeffRow (Inlining and common subexpression
+        // elimination with GetCoeffRow should make this
+        // a single shared multiplication in generated code.)
+        a = h * kCoeffAndResultFactor;
+      }
       // The bits here that are *most* independent of Start are the highest
       // order bits (as in Knuth multiplicative hash). To make those the
       // most preferred for use in the result row, we do a bswap here.
@@ -337,6 +374,8 @@ class StandardHasher {
   // large random prime
   static constexpr Hash kCoeffAndResultFactor =
       static_cast<Hash>(0xc28f82822b650bedULL);
+  static constexpr Hash kAltResultFactor =
+      static_cast<Hash>(0x5094393ff7fa1fd9ULL);
   // random-ish data
   static constexpr uint32_t kCoeffXor32 = 0xa6293635U;
   static constexpr uint64_t kCoeffXor64 = 0xc367844a6e52731dU;
@@ -426,6 +465,17 @@ double ExpectedCollisionFpRate(const Hasher& /*hasher*/, double added) {
   return added / std::pow(256.0, sizeof(typename Hasher::Hash));
 }
 
+// Represents a chosen chance of successful Ribbon construction for a single
+// seed. Allowing higher chance of failed construction can reduce space
+// overhead but takes extra time in construction.
+enum ConstructionSuccess {
+  k50Percent,
+  k95Percent,
+  // ~1 in a million failure or less. Recommended, arguably essential,
+  // when using kLiteFilter==true
+  kAlmostSure,
+};
+
 // StandardBanding: a canonical implementation of BandingStorage and
 // BacktrackStorage, with convenience API for banding (solving with on-the-fly
 // Gaussian elimination) with and without backtracking.
@@ -447,15 +497,20 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
       assert(num_slots >= kCoeffBits);
       if (num_slots > num_slots_allocated_) {
         coeff_rows_.reset(new CoeffRow[num_slots]());
-        // Note: don't strictly have to zero-init result_rows,
-        // except possible information leakage ;)
-        result_rows_.reset(new ResultRow[num_slots]());
+        if (!TypesAndSettings::kLiteFilter) {
+          // Note: don't strictly have to zero-init result_rows,
+          // except possible information leakage, etc ;)
+          result_rows_.reset(new ResultRow[num_slots]());
+        }
         num_slots_allocated_ = num_slots;
       } else {
         for (Index i = 0; i < num_slots; ++i) {
           coeff_rows_[i] = 0;
-          // Note: don't strictly have to zero-init result_rows
-          result_rows_[i] = 0;
+          if (!TypesAndSettings::kLiteFilter) {
+            // Note: don't strictly have to zero-init result_rows,
+            // except possible information leakage, etc ;)
+            result_rows_[i] = 0;
+          }
         }
       }
       num_starts_ = num_slots - kCoeffBits + 1;
@@ -480,10 +535,32 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   }
   inline void Prefetch(Index i) const {
     PREFETCH(&coeff_rows_[i], 1 /* rw */, 1 /* locality */);
-    PREFETCH(&result_rows_[i], 1 /* rw */, 1 /* locality */);
+    if (!TypesAndSettings::kLiteFilter) {
+      PREFETCH(&result_rows_[i], 1 /* rw */, 1 /* locality */);
+    }
   }
-  inline CoeffRow* CoeffRowPtr(Index i) { return &coeff_rows_[i]; }
-  inline ResultRow* ResultRowPtr(Index i) { return &result_rows_[i]; }
+  inline void LoadRow(Index i, CoeffRow* cr, ResultRow* rr,
+                      bool for_back_subst) const {
+    *cr = coeff_rows_[i];
+    if (TypesAndSettings::kLiteFilter) {
+      if (for_back_subst && *cr == 0) {
+        // Cheap pseudorandom data to fill unconstrained solution rows
+        *rr = static_cast<ResultRow>(i * 0x9E3779B185EBCA87ULL);
+      } else {
+        *rr = 0;
+      }
+    } else {
+      *rr = result_rows_[i];
+    }
+  }
+  inline void StoreRow(Index i, CoeffRow cr, ResultRow rr) {
+    coeff_rows_[i] = cr;
+    if (TypesAndSettings::kLiteFilter) {
+      assert(rr == 0);
+    } else {
+      result_rows_[i] = rr;
+    }
+  }
   inline Index GetNumStarts() const { return num_starts_; }
 
   // from concept BacktrackStorage, for when backtracking is used
@@ -611,19 +688,24 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   // ********************************************************************
   // Static high-level API
 
+  static constexpr ConstructionSuccess kDefaultSuccess =
+      TypesAndSettings::kLiteFilter ? kAlmostSure : k95Percent;
+
   // Based on data from FindOccupancyForSuccessRate in ribbon_test,
   // returns a number of slots for a given number of entries to add
-  // that should have roughly 95% or better chance of successful
-  // construction per seed. Does NOT do rounding for InterleavedSoln;
-  // call RoundUpNumSlots for that.
+  // that should have roughly the specified chance of successful
+  // construction per seed, or better. Does NOT do rounding for
+  // InterleavedSoln; call RoundUpNumSlots for that.
   //
   // num_to_add should not exceed roughly 2/3rds of the maximum value
   // of the Index type to avoid overflow.
-  static Index GetNumSlotsFor95PctSuccess(Index num_to_add) {
+  static Index GetNumSlots(Index num_to_add,
+                           ConstructionSuccess min_success = kDefaultSuccess) {
+    assert(!TypesAndSettings::kLiteFilter || min_success == kAlmostSure);
     if (num_to_add == 0) {
       return 0;
     }
-    double factor = GetFactorFor95PctSuccess(num_to_add);
+    double factor = GetOverheadFactor(num_to_add, min_success);
     Index num_slots = static_cast<Index>(num_to_add * factor);
     assert(num_slots >= num_to_add);
     return num_slots;
@@ -631,29 +713,46 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
 
   // Based on data from FindOccupancyForSuccessRate in ribbon_test,
   // given a number of entries to add, returns a space overhead factor
-  // (slots divided by num_to_add) that should have roughly 95% or better
-  // chance of successful construction per seed. Does NOT do rounding for
-  // InterleavedSoln; call RoundUpNumSlots for that.
+  // (slots divided by num_to_add) that should have roughly the specified
+  // chance of successful construction per seed, or better. Does NOT do
+  // rounding for InterleavedSoln; call RoundUpNumSlots for that.
   //
   // The reason that num_to_add is needed is that Ribbon filters of a
   // particular CoeffRow size do not scale infinitely.
-  static double GetFactorFor95PctSuccess(Index num_to_add) {
+  static double GetOverheadFactor(
+      Index num_to_add, ConstructionSuccess min_success = kDefaultSuccess) {
+    static_assert(kCoeffBits == 64 || kCoeffBits == 128, "Supported sizes");
+    constexpr bool c64 = kCoeffBits == 64;
+    constexpr bool smash = TypesAndSettings::kUseSmash;
     double log2_num_to_add = std::log(num_to_add) * 1.442695;
-    if (kCoeffBits == 64) {
-      if (TypesAndSettings::kUseSmash) {
-        return 1.02 + std::max(log2_num_to_add - 8.5, 0.0) * 0.009;
-      } else {
-        return 1.05 + std::max(log2_num_to_add - 11.0, 0.0) * 0.009;
-      }
-    } else {
-      // Currently only support 64 and 128
-      assert(kCoeffBits == 128);
-      if (TypesAndSettings::kUseSmash) {
-        return 1.01 + std::max(log2_num_to_add - 10.0, 0.0) * 0.0042;
-      } else {
-        return 1.02 + std::max(log2_num_to_add - 12.0, 0.0) * 0.0042;
-      }
+    double base;
+    double pivot;
+    double slope;
+    switch (min_success) {
+      case k50Percent:
+        base = c64 ? (smash ? 1.003 : 1.021) : (smash ? 1.0005 : 1.009);
+        pivot = c64 ? (smash ? 10.0 : 12.0) : (smash ? 12.0 : 14.0);
+        slope = c64 ? 0.009 : 0.0041;
+        break;
+      case k95Percent:
+        base = c64 ? (smash ? 1.02 : 1.05) : (smash ? 1.01 : 1.02);
+        pivot = c64 ? (smash ? 8.5 : 11.0) : (smash ? 10.0 : 12.0);
+        slope = c64 ? 0.009 : 0.0042;
+        break;
+      default:
+        assert(false);
+        FALLTHROUGH_INTENDED;
+      case kAlmostSure:
+        // smash apparently irrelevant in c128 case here
+        // FIXME: FindOccupancyForSuccessRate suggested 1.052 would be fine
+        // for c128 here but 1.055 seems to be requried to (largely) avoid
+        // the FP rate penalty in Ribbon lite
+        base = c64 ? (smash ? 1.055 : 1.07) : 1.055;
+        pivot = c64 ? (smash ? 9.5 : 11.0) : 17.0;
+        slope = c64 ? 0.009 : 0.004;
+        break;
     }
+    return base + std::max(log2_num_to_add - pivot, 0.0) * slope;
   }
 
  protected:
@@ -750,6 +849,20 @@ class InMemSimpleSolution {
 
     // Each result (solution) bit (column) cuts FP rate in half
     return std::pow(0.5, 8U * sizeof(ResultRow));
+  }
+
+  // ********************************************************************
+  // Static high-level API
+
+  // Round up to a number of slots supported by this structure. Note that
+  // this needs to be must be taken into account for the banding if this
+  // solution layout/storage is to be used.
+  static Index RoundUpNumSlots(Index num_slots) {
+    // Must be at least kCoeffBits for at least one start
+    // Or if not smash, even more because hashing not equipped
+    // for stacking up so many entries on a single start location
+    auto min_slots = kCoeffBits * (TypesAndSettings::kUseSmash ? 1 : 2);
+    return std::max(num_slots, static_cast<Index>(min_slots));
   }
 
  protected:

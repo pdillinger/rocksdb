@@ -394,6 +394,7 @@ struct Standard128RibbonRehasherTypesAndSettings {
   // These are schema-critical. Any change almost certainly changes
   // underlying data.
   static constexpr bool kIsFilter = true;
+  static constexpr bool kLiteFilter = false;
   static constexpr bool kFirstCoeffAlwaysOne = true;
   static constexpr bool kUseSmash = false;
   using CoeffRow = ROCKSDB_NAMESPACE::Unsigned128;
@@ -442,7 +443,7 @@ class Standard128RibbonBitsBuilder : public XXH3pFilterBitsBuilder {
       return FinishAlwaysFalse(buf);
     }
     uint32_t num_entries = static_cast<uint32_t>(hash_entries_.size());
-    uint32_t num_slots = BandingType::GetNumSlotsFor95PctSuccess(num_entries);
+    uint32_t num_slots = BandingType::GetNumSlots(num_entries);
     num_slots = SolnType::RoundUpNumSlots(num_slots);
 
     uint32_t entropy = 0;
@@ -540,7 +541,7 @@ class Standard128RibbonBitsBuilder : public XXH3pFilterBitsBuilder {
   using BandingType = ribbon::StandardBanding<TS>;
 
   static uint32_t NumEntriesToNumSlots(uint32_t num_entries) {
-    uint32_t num_slots1 = BandingType::GetNumSlotsFor95PctSuccess(num_entries);
+    uint32_t num_slots1 = BandingType::GetNumSlots(num_entries);
     return SolnType::RoundUpNumSlots(num_slots1);
   }
 
