@@ -756,7 +756,7 @@ Status BlobDBImpl::CreateWriterLocked(const std::shared_ptr<BlobFile>& bfile) {
 
   bfile->log_writer_ = std::make_shared<BlobLogWriter>(
       std::move(fwriter), env_, statistics_, bfile->file_number_,
-      bdb_options_.bytes_per_sync, db_options_.use_fsync, boffset);
+      db_options_.use_fsync, boffset);
   bfile->log_writer_->last_elem_type_ = et;
 
   return s;
@@ -1148,25 +1148,26 @@ Slice BlobDBImpl::GetCompressedSlice(const Slice& raw,
 Status BlobDBImpl::DecompressSlice(const Slice& compressed_value,
                                    CompressionType compression_type,
                                    PinnableSlice* value_output) const {
-  if (compression_type != kNoCompression) {
-    BlockContents contents;
-    auto cfh = static_cast<ColumnFamilyHandleImpl*>(DefaultColumnFamily());
+  assert(compression_type != kNoCompression);
 
-    {
-      StopWatch decompression_sw(env_, statistics_,
-                                 BLOB_DB_DECOMPRESSION_MICROS);
-      UncompressionContext context(compression_type);
-      UncompressionInfo info(context, UncompressionDict::GetEmptyDict(),
-                             compression_type);
-      Status s = UncompressBlockContentsForCompressionType(
-          info, compressed_value.data(), compressed_value.size(), &contents,
-          kBlockBasedTableVersionFormat, *(cfh->cfd()->ioptions()));
-      if (!s.ok()) {
-        return Status::Corruption("Unable to decompress blob.");
-      }
+  BlockContents contents;
+  auto cfh = static_cast<ColumnFamilyHandleImpl*>(DefaultColumnFamily());
+
+  {
+    StopWatch decompression_sw(env_, statistics_, BLOB_DB_DECOMPRESSION_MICROS);
+    UncompressionContext context(compression_type);
+    UncompressionInfo info(context, UncompressionDict::GetEmptyDict(),
+                           compression_type);
+    Status s = UncompressBlockContentsForCompressionType(
+        info, compressed_value.data(), compressed_value.size(), &contents,
+        kBlockBasedTableVersionFormat, *(cfh->cfd()->ioptions()));
+    if (!s.ok()) {
+      return Status::Corruption("Unable to decompress blob.");
     }
-    value_output->PinSelf(contents.data);
   }
+
+  value_output->PinSelf(contents.data);
+
   return Status::OK();
 }
 
@@ -1685,35 +1686,30 @@ std::pair<bool, int64_t> BlobDBImpl::SanityCheck(bool aborted) {
 
   for (auto blob_file_pair : blob_files_) {
     auto blob_file = blob_file_pair.second;
-    char buf[1000];
-    int pos = snprintf(buf, sizeof(buf),
-                       "Blob file %" PRIu64 ", size %" PRIu64
-                       ", blob count %" PRIu64 ", immutable %d",
-                       blob_file->BlobFileNumber(), blob_file->GetFileSize(),
-                       blob_file->BlobCount(), blob_file->Immutable());
+    std::ostringstream buf;
+
+    buf << "Blob file " << blob_file->BlobFileNumber() << ", size "
+        << blob_file->GetFileSize() << ", blob count " << blob_file->BlobCount()
+        << ", immutable " << blob_file->Immutable();
+
     if (blob_file->HasTTL()) {
       ExpirationRange expiration_range;
-
       {
         ReadLock file_lock(&blob_file->mutex_);
         expiration_range = blob_file->GetExpirationRange();
       }
+      buf << ", expiration range (" << expiration_range.first << ", "
+          << expiration_range.second << ")";
 
-      pos += snprintf(buf + pos, sizeof(buf) - pos,
-                      ", expiration range (%" PRIu64 ", %" PRIu64 ")",
-                      expiration_range.first, expiration_range.second);
       if (!blob_file->Obsolete()) {
-        pos += snprintf(buf + pos, sizeof(buf) - pos,
-                        ", expire in %" PRIu64 " seconds",
-                        expiration_range.second - now);
+        buf << ", expire in " << (expiration_range.second - now) << "seconds";
       }
     }
     if (blob_file->Obsolete()) {
-      pos += snprintf(buf + pos, sizeof(buf) - pos, ", obsolete at %" PRIu64,
-                      blob_file->GetObsoleteSequence());
+      buf << ", obsolete at " << blob_file->GetObsoleteSequence();
     }
-    snprintf(buf + pos, sizeof(buf) - pos, ".");
-    ROCKS_LOG_INFO(db_options_.info_log, "%s", buf);
+    buf << ".";
+    ROCKS_LOG_INFO(db_options_.info_log, "%s", buf.str().c_str());
   }
 
   // reschedule
@@ -2044,7 +2040,7 @@ Iterator* BlobDBImpl::NewIterator(const ReadOptions& read_options) {
   }
   auto* iter = db_impl_->NewIteratorImpl(
       read_options, cfd, snapshot->GetSequenceNumber(),
-      nullptr /*read_callback*/, true /*allow_blob*/);
+      nullptr /*read_callback*/, true /*expose_blob_index*/);
   return new BlobDBIterator(own_snapshot, iter, this, env_, statistics_);
 }
 

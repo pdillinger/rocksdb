@@ -20,7 +20,6 @@
 #include <vector>
 
 #include "db/blob/blob_log_format.h"
-#include "db/blob/blob_log_reader.h"
 #include "db/blob/blob_log_writer.h"
 #include "db/db_iter.h"
 #include "rocksdb/compaction_filter.h"
@@ -240,8 +239,9 @@ class BlobDBImpl : public BlobDB {
   // Close a file by appending a footer, and removes file from open files list.
   // REQUIRES: lock held on write_mutex_, write lock held on both the db mutex_
   // and the blob file's mutex_. If called on a blob file which is visible only
-  // to a single thread (like in the case of new files written during GC), the
-  // locks on write_mutex_ and the blob file's mutex_ can be avoided.
+  // to a single thread (like in the case of new files written during
+  // compaction/GC), the locks on write_mutex_ and the blob file's mutex_ can be
+  // avoided.
   Status CloseBlobFile(std::shared_ptr<BlobFile> bfile);
 
   // Close a file if its size exceeds blob_file_size

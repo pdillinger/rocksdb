@@ -46,7 +46,13 @@ class ForwardLevelIterator : public InternalIterator {
         file_iter_(nullptr),
         pinned_iters_mgr_(nullptr),
         prefix_extractor_(prefix_extractor),
-        allow_unprepared_value_(allow_unprepared_value) {}
+        allow_unprepared_value_(allow_unprepared_value) {
+    /*
+    NOTE needed for ASSERT_STATUS_CHECKED
+    in MergeOperatorPinningTest/MergeOperatorPinningTest.TailingIterator
+    */
+    status_.PermitUncheckedError();
+  }
 
   ~ForwardLevelIterator() override {
     // Reset current pointer
@@ -661,8 +667,10 @@ void ForwardIterator::RebuildIterators(bool refresh_sv) {
         sv_->mem->NewRangeTombstoneIterator(
             read_options_, sv_->current->version_set()->LastSequence()));
     range_del_agg.AddTombstones(std::move(range_del_iter));
-    sv_->imm->AddRangeTombstoneIterators(read_options_, &arena_,
-                                         &range_del_agg);
+    // Always return Status::OK().
+    Status temp_s = sv_->imm->AddRangeTombstoneIterators(read_options_, &arena_,
+                                                         &range_del_agg);
+    assert(temp_s.ok());
   }
   has_iter_trimmed_for_upper_bound_ = false;
 
@@ -724,8 +732,10 @@ void ForwardIterator::RenewIterators() {
         svnew->mem->NewRangeTombstoneIterator(
             read_options_, sv_->current->version_set()->LastSequence()));
     range_del_agg.AddTombstones(std::move(range_del_iter));
-    svnew->imm->AddRangeTombstoneIterators(read_options_, &arena_,
-                                           &range_del_agg);
+    // Always return Status::OK().
+    Status temp_s = svnew->imm->AddRangeTombstoneIterators(
+        read_options_, &arena_, &range_del_agg);
+    assert(temp_s.ok());
   }
 
   const auto* vstorage = sv_->current->storage_info();

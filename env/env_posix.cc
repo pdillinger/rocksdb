@@ -6,6 +6,9 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors
+
+#if !defined(OS_WIN)
+
 #include <dirent.h>
 #ifndef ROCKSDB_NO_DYNAMIC_EXTENSION
 #include <dlfcn.h>
@@ -13,9 +16,6 @@
 #include <errno.h>
 #include <fcntl.h>
 
-#if defined(OS_LINUX)
-#include <linux/fs.h>
-#endif
 #if defined(ROCKSDB_IOURING_PRESENT)
 #include <liburing.h>
 #endif
@@ -24,13 +24,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #if defined(OS_LINUX) || defined(OS_SOLARIS) || defined(OS_ANDROID)
 #include <sys/statfs.h>
-#include <sys/syscall.h>
-#include <sys/sysmacros.h>
 #endif
 #include <sys/statvfs.h>
 #include <sys/time.h>
@@ -55,7 +52,6 @@
 
 #include "env/composite_env_wrapper.h"
 #include "env/io_posix.h"
-#include "logging/logging.h"
 #include "logging/posix_logger.h"
 #include "monitoring/iostats_context_imp.h"
 #include "monitoring/thread_status_updater.h"
@@ -167,7 +163,6 @@ class PosixEnv : public CompositeEnvWrapper {
   // provided by the search path
   Status LoadLibrary(const std::string& name, const std::string& path,
                      std::shared_ptr<DynamicLibrary>* result) override {
-    Status status;
     assert(result != nullptr);
     if (name.empty()) {
       void* hndl = dlopen(NULL, RTLD_NOW);
@@ -468,11 +463,12 @@ void PosixEnv::WaitForJoin() {
 
 std::string Env::GenerateUniqueId() {
   std::string uuid_file = "/proc/sys/kernel/random/uuid";
+  std::shared_ptr<FileSystem> fs = FileSystem::Default();
 
-  Status s = FileExists(uuid_file);
+  Status s = fs->FileExists(uuid_file, IOOptions(), nullptr);
   if (s.ok()) {
     std::string uuid;
-    s = ReadFileToString(this, uuid_file, &uuid);
+    s = ReadFileToString(fs.get(), uuid_file, &uuid);
     if (s.ok()) {
       return uuid;
     }
@@ -518,3 +514,5 @@ std::unique_ptr<Env> NewCompositeEnv(std::shared_ptr<FileSystem> fs) {
 }
 
 }  // namespace ROCKSDB_NAMESPACE
+
+#endif

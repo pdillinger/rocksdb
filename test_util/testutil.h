@@ -22,9 +22,7 @@
 #include "rocksdb/options.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/table.h"
-#include "table/block_based/block_based_table_factory.h"
 #include "table/internal_iterator.h"
-#include "table/plain/plain_table_factory.h"
 #include "util/mutexlock.h"
 
 namespace ROCKSDB_NAMESPACE {
@@ -55,9 +53,10 @@ class ErrorEnv : public EnvWrapper {
   bool writable_file_error_;
   int num_writable_file_errors_;
 
-  ErrorEnv() : EnvWrapper(Env::Default()),
-               writable_file_error_(false),
-               num_writable_file_errors_(0) { }
+  ErrorEnv(Env* _target)
+      : EnvWrapper(_target),
+        writable_file_error_(false),
+        num_writable_file_errors_(0) {}
 
   virtual Status NewWritableFile(const std::string& fname,
                                  std::unique_ptr<WritableFile>* result,
@@ -391,6 +390,10 @@ class NullLogger : public Logger {
 extern void CorruptKeyType(InternalKey* ikey);
 
 extern std::string KeyStr(const std::string& user_key,
+                          const SequenceNumber& seq, const ValueType& t,
+                          bool corrupt = false);
+
+extern std::string KeyStr(uint64_t ts, const std::string& user_key,
                           const SequenceNumber& seq, const ValueType& t,
                           bool corrupt = false);
 
@@ -800,8 +803,15 @@ size_t GetLinesCount(const std::string& fname, const std::string& pattern);
 // Tries to set TEST_TMPDIR to a directory supporting direct IO.
 void ResetTmpDirForDirectIO();
 
+Status CorruptFile(Env* env, const std::string& fname, int offset,
+                   int bytes_to_corrupt, bool verify_checksum = true);
+Status TruncateFile(Env* env, const std::string& fname, uint64_t length);
 
-void CorruptFile(const std::string& fname, int offset, int bytes_to_corrupt);
+// Try and delete a directory if it exists
+Status TryDeleteDir(Env* env, const std::string& dirname);
+
+// Delete a directory if it exists
+void DeleteDir(Env* env, const std::string& dirname);
 
 }  // namespace test
 }  // namespace ROCKSDB_NAMESPACE

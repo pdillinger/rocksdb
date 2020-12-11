@@ -27,7 +27,6 @@
 #include <sys/types.h>
 #ifdef OS_LINUX
 #include <sys/statfs.h>
-#include <sys/syscall.h>
 #include <sys/sysmacros.h>
 #endif
 #include "monitoring/iostats_context_imp.h"
@@ -990,7 +989,8 @@ PosixMmapFile::PosixMmapFile(const std::string& fname, int fd, size_t page_size,
 
 PosixMmapFile::~PosixMmapFile() {
   if (fd_ >= 0) {
-    PosixMmapFile::Close(IOOptions(), nullptr);
+    IOStatus s = PosixMmapFile::Close(IOOptions(), nullptr);
+    s.PermitUncheckedError();
   }
 }
 
@@ -1152,7 +1152,8 @@ PosixWritableFile::PosixWritableFile(const std::string& fname, int fd,
 
 PosixWritableFile::~PosixWritableFile() {
   if (fd_ >= 0) {
-    PosixWritableFile::Close(IOOptions(), nullptr);
+    IOStatus s = PosixWritableFile::Close(IOOptions(), nullptr);
+    s.PermitUncheckedError();
   }
 }
 
@@ -1394,7 +1395,8 @@ PosixRandomRWFile::PosixRandomRWFile(const std::string& fname, int fd,
 
 PosixRandomRWFile::~PosixRandomRWFile() {
   if (fd_ >= 0) {
-    Close(IOOptions(), nullptr);
+    IOStatus s = Close(IOOptions(), nullptr);
+    s.PermitUncheckedError();
   }
 }
 

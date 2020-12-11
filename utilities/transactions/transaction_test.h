@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "db/db_impl/db_impl.h"
+#include "db/db_test_util.h"
 #include "port/port.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
@@ -40,6 +41,7 @@ enum WriteOrdering : bool { kOrderedWrite, kUnorderedWrite };
 class TransactionTestBase : public ::testing::Test {
  public:
   TransactionDB* db;
+  SpecialEnv special_env;
   FaultInjectionTestEnv* env;
   std::string dbname;
   Options options;
@@ -50,19 +52,23 @@ class TransactionTestBase : public ::testing::Test {
   TransactionTestBase(bool use_stackable_db, bool two_write_queue,
                       TxnDBWritePolicy write_policy,
                       WriteOrdering write_ordering)
-      : db(nullptr), env(nullptr), use_stackable_db_(use_stackable_db) {
+      : db(nullptr),
+        special_env(Env::Default()),
+        env(nullptr),
+        use_stackable_db_(use_stackable_db) {
     options.create_if_missing = true;
     options.max_write_buffer_number = 2;
     options.write_buffer_size = 4 * 1024;
     options.unordered_write = write_ordering == kUnorderedWrite;
     options.level0_file_num_compaction_trigger = 2;
     options.merge_operator = MergeOperators::CreateFromStringId("stringappend");
-    env = new FaultInjectionTestEnv(Env::Default());
+    special_env.skip_fsync_ = true;
+    env = new FaultInjectionTestEnv(&special_env);
     options.env = env;
     options.two_write_queues = two_write_queue;
     dbname = test::PerThreadDBPath("transaction_testdb");
 
-    DestroyDB(dbname, options);
+    EXPECT_OK(DestroyDB(dbname, options));
     txn_db_options.transaction_lock_timeout = 0;
     txn_db_options.default_lock_timeout = 0;
     txn_db_options.write_policy = write_policy;
@@ -79,7 +85,7 @@ class TransactionTestBase : public ::testing::Test {
     } else {
       s = OpenWithStackableDB();
     }
-    assert(s.ok());
+    EXPECT_OK(s);
   }
 
   ~TransactionTestBase() {
@@ -90,7 +96,7 @@ class TransactionTestBase : public ::testing::Test {
     // unlink-ed files. By using the default fs we simply ignore errors resulted
     // from attempting to delete such files in DestroyDB.
     options.env = Env::Default();
-    DestroyDB(dbname, options);
+    EXPECT_OK(DestroyDB(dbname, options));
     delete env;
   }
 
@@ -385,7 +391,7 @@ class TransactionTestBase : public ::testing::Test {
     if (txn_db_options.write_policy == WRITE_COMMITTED) {
       options.unordered_write = false;
     }
-    ReOpen();
+    ASSERT_OK(ReOpen());
 
     for (int i = 0; i < 1024; i++) {
       auto istr = std::to_string(index);
@@ -404,9 +410,9 @@ class TransactionTestBase : public ::testing::Test {
         case 1: {
           WriteBatch wb;
           committed_kvs[k] = v;
-          wb.Put(k, v);
+          ASSERT_OK(wb.Put(k, v));
           committed_kvs[k] = v2;
-          wb.Put(k, v2);
+          ASSERT_OK(wb.Put(k, v2));
           ASSERT_OK(db->Write(write_options, &wb));
 
         } break;
@@ -426,7 +432,7 @@ class TransactionTestBase : public ::testing::Test {
           delete txn;
           break;
         default:
-          assert(0);
+          FAIL();
       }
 
       index++;
@@ -439,9 +445,9 @@ class TransactionTestBase : public ::testing::Test {
     auto db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
     // Before upgrade/downgrade the WAL must be emptied
     if (empty_wal) {
-      db_impl->TEST_FlushMemTable();
+      ASSERT_OK(db_impl->TEST_FlushMemTable());
     } else {
-      db_impl->FlushWAL(true);
+      ASSERT_OK(db_impl->FlushWAL(true));
     }
     auto s = ReOpenNoDelete();
     if (empty_wal) {
@@ -455,7 +461,7 @@ class TransactionTestBase : public ::testing::Test {
     db_impl = static_cast_with_check<DBImpl>(db->GetRootDB());
     // Check that WAL is empty
     VectorLogPtr log_files;
-    db_impl->GetSortedWalFiles(log_files);
+    ASSERT_OK(db_impl->GetSortedWalFiles(log_files));
     ASSERT_EQ(0, log_files.size());
 
     for (auto& kv : committed_kvs) {
