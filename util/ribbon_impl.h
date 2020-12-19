@@ -261,8 +261,7 @@ class StandardHasher {
     } else {
       b = a;
     }
-    static_assert(sizeof(CoeffRow) == sizeof(uint64_t) ||
-                      sizeof(CoeffRow) == sizeof(Unsigned128),
+    static_assert(sizeof(CoeffRow) <= sizeof(Unsigned128),
                   "Supported sizes");
     Unsigned128 c;
     if (sizeof(uint64_t) < sizeof(CoeffRow)) {
@@ -727,7 +726,8 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   // particular CoeffRow size do not scale infinitely.
   static double GetOverheadFactor(
       Index num_to_add, ConstructionSuccess min_success = kDefaultSuccess) {
-    static_assert(kCoeffBits == 64 || kCoeffBits == 128, "Supported sizes");
+    static_assert(/*TODO*/ kCoeffBits == 16 || kCoeffBits == 32 ||
+                  kCoeffBits == 64 || kCoeffBits == 128, "Supported sizes");
     constexpr bool c64 = kCoeffBits == 64;
     constexpr bool smash = TypesAndSettings::kUseSmash;
     double log2_num_to_add = std::log(num_to_add) * 1.442695;

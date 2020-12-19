@@ -320,6 +320,19 @@ struct TypesAndSettings_Hash32_SmallKeyGen : public TypesAndSettings_Hash32 {
   // SmallKeyGen stresses the independence of different hash seeds
   using KeyGen = SmallKeyGen;
 };
+struct TypesAndSettings_Coeff32 : public DefaultTypesAndSettings {
+  using CoeffRow = uint32_t;
+};
+struct TypesAndSettings_Coeff32Smash : public TypesAndSettings_Coeff32 {
+  static constexpr bool kUseSmash = true;
+};
+struct TypesAndSettings_Coeff16 : public DefaultTypesAndSettings {
+  using CoeffRow = uint16_t;
+};
+struct TypesAndSettings_Coeff16Smash : public TypesAndSettings_Coeff16 {
+  static constexpr bool kUseSmash = true;
+};
+
 
 using TestTypesAndSettings = ::testing::Types<
     TypesAndSettings_Coeff128, TypesAndSettings_Coeff128Smash,
@@ -335,7 +348,8 @@ using TestTypesAndSettings = ::testing::Types<
     TypesAndSettings_Rehasher_Result16, TypesAndSettings_Rehasher_Result32,
     TypesAndSettings_Rehasher_Seed64, TypesAndSettings_Rehasher32,
     TypesAndSettings_Rehasher32_Coeff64, TypesAndSettings_SmallKeyGen,
-    TypesAndSettings_Hash32_SmallKeyGen>;
+    TypesAndSettings_Hash32_SmallKeyGen, TypesAndSettings_Coeff32, TypesAndSettings_Coeff32Smash,
+    TypesAndSettings_Coeff16, TypesAndSettings_Coeff16Smash>;
 TYPED_TEST_CASE(RibbonTypeParamTest, TestTypesAndSettings);
 
 namespace {
@@ -379,6 +393,11 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
   IMPORT_RIBBON_TYPES_AND_SETTINGS(TypeParam);
   IMPORT_RIBBON_IMPL_TYPES(TypeParam);
   using KeyGen = typename TypeParam::KeyGen;
+
+  if (sizeof(CoeffRow) < 8) {
+    ROCKSDB_GTEST_SKIP("Not fully supported");
+    return;
+  }
 
   const auto log2_thoroughness =
       static_cast<uint32_t>(ROCKSDB_NAMESPACE::FloorLog2(FLAGS_thoroughness));
