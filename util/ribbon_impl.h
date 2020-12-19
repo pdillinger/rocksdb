@@ -232,8 +232,7 @@ class StandardHasher {
       b = (b << 32) ^ b ^ kCoeffXor32;
     }
     Unsigned128 c = b;
-    static_assert(sizeof(CoeffRow) == sizeof(uint64_t) ||
-                      sizeof(CoeffRow) == sizeof(Unsigned128),
+    static_assert(sizeof(CoeffRow) <= sizeof(Unsigned128),
                   "Supported sizes");
     if (sizeof(uint64_t) < sizeof(CoeffRow)) {
       // Almost-trivial hash expansion (OK - see above), favoring roughly

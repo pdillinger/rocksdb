@@ -260,6 +260,15 @@ struct TypesAndSettings_Hash32_SmallKeyGen : public TypesAndSettings_Hash32 {
   // SmallKeyGen stresses the independence of different hash seeds
   using KeyGen = SmallKeyGen;
 };
+struct TypesAndSettings_Coeff32Smash : public DefaultTypesAndSettings {
+  using CoeffRow = uint32_t;
+  static constexpr bool kUseSmash = true;
+};
+struct TypesAndSettings_Coeff16Smash : public DefaultTypesAndSettings {
+  using CoeffRow = uint16_t;
+  static constexpr bool kUseSmash = true;
+};
+
 
 using TestTypesAndSettings = ::testing::Types<
     TypesAndSettings_Coeff128, TypesAndSettings_Coeff128Smash,
@@ -273,7 +282,8 @@ using TestTypesAndSettings = ::testing::Types<
     TypesAndSettings_Rehasher_Result16, TypesAndSettings_Rehasher_Result32,
     TypesAndSettings_Rehasher_Seed64, TypesAndSettings_Rehasher32,
     TypesAndSettings_Rehasher32_Coeff64, TypesAndSettings_SmallKeyGen,
-    TypesAndSettings_Hash32_SmallKeyGen>;
+    TypesAndSettings_Hash32_SmallKeyGen, TypesAndSettings_Coeff32Smash,
+    TypesAndSettings_Coeff16Smash>;
 TYPED_TEST_CASE(RibbonTypeParamTest, TestTypesAndSettings);
 
 namespace {
