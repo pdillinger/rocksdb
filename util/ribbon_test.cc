@@ -886,8 +886,8 @@ TEST(RibbonTest, PartialReseed) {
   using KeyGen = typename TypesAndSettings_Reseed::KeyGen;
 
   const uint32_t num_to_add = 1000000;
-  const uint32_t group_mask = 1023;
-  const double overhead = 0.05;
+  const uint32_t group_mask = (uint32_t{1} << 14) - 1;
+  const double overhead = 0.02;
 
   for (uint32_t i = 0; i < FLAGS_thoroughness; ++i) {
     fprintf(stderr, "\nIteration %u\n", (unsigned)i);
@@ -919,13 +919,14 @@ TEST(RibbonTest, PartialReseed) {
           std::max(max_group_size, static_cast<uint32_t>(group.size()));
     }
 
-    std::unique_ptr<uint8_t[]> seed_data(new uint8_t[(group_mask + 1) / 32]());
+    std::unique_ptr<uint8_t[]> seed_data(new uint8_t[group_mask + 1]());
 
     Banding banding;
     banding.Reset(num_to_add + static_cast<uint32_t>(overhead * num_to_add),
                   max_group_size);
 
     uint32_t cur_group = 0;
+    uint32_t total_reseed = 0;
     while (cur_group <= group_mask) {
       banding.SetOrdinalSeed(seed_data[cur_group]);
 
@@ -941,9 +942,11 @@ TEST(RibbonTest, PartialReseed) {
         ++cur_group;
       } else {
         ++seed_data[cur_group];
+        ++total_reseed;
         assert(seed_data[cur_group] != 0);
       }
     }
+    fprintf(stderr, "Average partial re-seed: %g\n", 1.0 * total_reseed / (group_mask + 1));
   }
 }
 
