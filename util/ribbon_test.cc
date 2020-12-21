@@ -4,6 +4,7 @@
 //  (found in the LICENSE.Apache file in the root directory).
 
 #include <cmath>
+#include <deque>
 
 #include "test_util/testharness.h"
 #include "util/bloom_impl.h"
@@ -870,6 +871,79 @@ TEST(RibbonTest, PhsfBasic) {
   for (PhsfInputGen cur = begin; cur != end; ++cur) {
     ASSERT_EQ(cur->second, soln.PhsfQuery(cur->first, hasher));
     ASSERT_EQ(cur->second, isoln.PhsfQuery(cur->first, hasher));
+  }
+}
+
+struct TypesAndSettings_Reseed
+    : public StandardRehasherAdapter<TypesAndSettings_Coeff64> {
+  using KeyGen = Hash64KeyGenWrapper<StandardKeyGen>;
+  using ResultRow = uint32_t;
+};
+
+TEST(RibbonTest, PartialReseed) {
+  IMPORT_RIBBON_TYPES_AND_SETTINGS(TypesAndSettings_Reseed);
+  IMPORT_RIBBON_IMPL_TYPES(TypesAndSettings_Reseed);
+  using KeyGen = typename TypesAndSettings_Reseed::KeyGen;
+
+  const uint32_t num_to_add = 1000000;
+  const uint32_t group_mask = 1023;
+  const double overhead = 0.05;
+
+  for (uint32_t i = 0; i < FLAGS_thoroughness; ++i) {
+    fprintf(stderr, "\nIteration %u\n", (unsigned)i);
+    std::string prefix;
+    ROCKSDB_NAMESPACE::PutFixed32(&prefix, i);
+    std::string added_str = prefix + "added";
+    KeyGen keys_begin(added_str, 0);
+    KeyGen keys_end(added_str, num_to_add);
+
+    std::vector<std::deque<uint64_t>> prehashes_by_group;
+    prehashes_by_group.resize(group_mask + 1);
+
+    for (KeyGen j = keys_begin; j != keys_end; ++j) {
+      uint64_t prehash = *j;
+      uint32_t group =
+          std::min(ROCKSDB_NAMESPACE::Lower32of64(prehash) & group_mask,
+                   ROCKSDB_NAMESPACE::Upper32of64(prehash) & group_mask);
+      group =
+          std::min(group, static_cast<uint32_t>(prehash >> 16) & group_mask);
+      group = std::min(
+          group, static_cast<uint32_t>((prehash >> 48) | (prehash << 16)) &
+                     group_mask);
+      prehashes_by_group[group].push_back(prehash);
+    }
+
+    uint32_t max_group_size = 0;
+    for (const auto& group : prehashes_by_group) {
+      max_group_size =
+          std::max(max_group_size, static_cast<uint32_t>(group.size()));
+    }
+
+    std::unique_ptr<uint8_t[]> seed_data(new uint8_t[(group_mask + 1) / 32]());
+
+    Banding banding;
+    banding.Reset(num_to_add + static_cast<uint32_t>(overhead * num_to_add),
+                  max_group_size);
+
+    uint32_t cur_group = 0;
+    while (cur_group <= group_mask) {
+      banding.SetOrdinalSeed(seed_data[cur_group]);
+
+      bool success =
+          banding.AddRangeOrRollBack(prehashes_by_group[cur_group].begin(),
+                                     prehashes_by_group[cur_group].end());
+      if (success) {
+        if (seed_data[cur_group] > 0) {
+          fprintf(stderr, "Seed %u for group %u (size %u)\n",
+                  (unsigned)seed_data[cur_group], (unsigned)cur_group,
+                  (unsigned)prehashes_by_group[cur_group].size());
+        }
+        ++cur_group;
+      } else {
+        ++seed_data[cur_group];
+        assert(seed_data[cur_group] != 0);
+      }
+    }
   }
 }
 
