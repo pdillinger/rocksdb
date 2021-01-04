@@ -631,6 +631,12 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
     return count;
   }
 
+  // Returns whether a row is "occupied" in the banding (non-zero
+  // coefficients stored)
+  bool IsOccupied(Index i) {
+    return coeff_rows_[i] != 0;
+  }
+
   // ********************************************************************
   // High-level API
 

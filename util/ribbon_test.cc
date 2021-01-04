@@ -11,6 +11,7 @@
 #include "util/hash.h"
 #include "util/ribbon_impl.h"
 #include "util/stop_watch.h"
+#include "util/string_util.h"
 
 #ifndef GFLAGS
 uint32_t FLAGS_thoroughness = 5;
@@ -19,13 +20,12 @@ uint32_t FLAGS_min_check = 4000;
 uint32_t FLAGS_max_check = 100000;
 bool FLAGS_verbose = false;
 bool FLAGS_find_occ = false;
-double FLAGS_find_next_factor = 1.414;
-double FLAGS_find_success = 0.95;
-double FLAGS_find_delta_start = 0.01;
-double FLAGS_find_delta_end = 0.0001;
-double FLAGS_find_delta_shrink = 0.99;
+bool FLAGS_find_slot_occ = false;
+double FLAGS_find_next_factor = 1.618;
+double FLAGS_find_granularity = 0.0001;
+uint32_t FLAGS_find_iters = 10000;
 uint32_t FLAGS_find_min_slots = 128;
-uint32_t FLAGS_find_max_slots = 12800000;
+uint32_t FLAGS_find_max_slots = 1000000;
 #else
 #include "util/gflags_compat.h"
 using GFLAGS_NAMESPACE::ParseCommandLineFlags;
@@ -45,16 +45,17 @@ DEFINE_bool(verbose, false, "Print extra details");
 // than a test.
 DEFINE_bool(find_occ, false,
             "whether to run the FindOccupancyForSuccessRate tool");
-DEFINE_double(find_next_factor, 1.414,
+DEFINE_bool(find_slot_occ, false,
+            "whether to show individual slot occupancies with FindOccupancyForSuccessRate tool");
+DEFINE_double(find_next_factor, 1.618,
+              "factor to next num_slots for FindOccupancyForSuccessRate");
+DEFINE_double(find_granularity, 0.0001,
               "target success rate for FindOccupancyForSuccessRate");
-DEFINE_double(find_success, 0.95,
-              "target success rate for FindOccupancyForSuccessRate");
-DEFINE_double(find_delta_start, 0.01, " for FindOccupancyForSuccessRate");
-DEFINE_double(find_delta_end, 0.0001, " for FindOccupancyForSuccessRate");
-DEFINE_double(find_delta_shrink, 0.99, " for FindOccupancyForSuccessRate");
+DEFINE_uint32(find_iters, 10000,
+              "number of samples for FindOccupancyForSuccessRate");
 DEFINE_uint32(find_min_slots, 128,
               "number of slots for FindOccupancyForSuccessRate");
-DEFINE_uint32(find_max_slots, 12800000,
+DEFINE_uint32(find_max_slots, 1000000,
               "number of slots for FindOccupancyForSuccessRate");
 #endif  // GFLAGS
 
@@ -212,10 +213,10 @@ struct TypesAndSettings_Coeff128Smash : public DefaultTypesAndSettings {
 struct TypesAndSettings_Coeff64 : public DefaultTypesAndSettings {
   using CoeffRow = uint64_t;
 };
-struct TypesAndSettings_Coeff64Smash1 : public TypesAndSettings_Coeff64 {
+struct TypesAndSettings_Coeff64Smash : public TypesAndSettings_Coeff64 {
   static constexpr bool kUseSmash = true;
 };
-struct TypesAndSettings_Coeff64Smash0 : public TypesAndSettings_Coeff64Smash1 {
+struct TypesAndSettings_Coeff64Smash0 : public TypesAndSettings_Coeff64Smash {
   static constexpr bool kFirstCoeffAlwaysOne = false;
 };
 
@@ -322,8 +323,8 @@ struct TypesAndSettings_Hash32_SmallKeyGen : public TypesAndSettings_Hash32 {
 
 using TestTypesAndSettings = ::testing::Types<
     TypesAndSettings_Coeff128, TypesAndSettings_Coeff128Smash,
-    TypesAndSettings_Coeff64, TypesAndSettings_Coeff64Smash0,
-    TypesAndSettings_Coeff64Smash1, TypesAndSettings_Coeff128_Lite,
+    TypesAndSettings_Coeff64, TypesAndSettings_Coeff64Smash,
+    TypesAndSettings_Coeff64Smash0, TypesAndSettings_Coeff128_Lite,
     TypesAndSettings_Coeff128Smash_Lite, TypesAndSettings_Coeff64_Lite,
     TypesAndSettings_Coeff64Smash_Lite, TypesAndSettings_Result16,
     TypesAndSettings_Result32, TypesAndSettings_IndexSizeT,
@@ -1024,34 +1025,97 @@ TYPED_TEST(RibbonTypeParamTest, FindOccupancyForSuccessRate) {
     return;
   }
 
-  KeyGen cur("blah", 0);
+  KeyGen cur(ROCKSDB_NAMESPACE::ToString(testing::UnitTest::GetInstance()->random_seed()), 0);
 
   Banding banding;
   Index num_slots = InterleavedSoln::RoundUpNumSlots(FLAGS_find_min_slots);
-  while (num_slots < FLAGS_find_max_slots) {
-    double factor = 0.95;
-    double delta = FLAGS_find_delta_start;
-    while (delta > FLAGS_find_delta_end) {
-      Index num_to_add = static_cast<Index>(factor * num_slots);
-      KeyGen end = cur;
-      end += num_to_add;
-      bool success = banding.ResetAndFindSeedToSolve(num_slots, cur, end, 0, 0);
-      cur = end;  // fresh keys
-      if (success) {
-        factor += delta * (1.0 - FLAGS_find_success);
-        factor = std::min(factor, 1.0);
-      } else {
-        factor -= delta * FLAGS_find_success;
-        factor = std::max(factor, 0.0);
+  Index max_slots = InterleavedSoln::RoundUpNumSlots(FLAGS_find_max_slots);
+  while (num_slots <= max_slots) {
+    std::map<int32_t, uint32_t> occ_histogram;
+    std::map<Index, uint32_t> slot_histogram;
+    if (FLAGS_find_slot_occ) {
+      for (Index i = 0; i < kCoeffBits; ++i) {
+        slot_histogram[i] = 0;
+        slot_histogram[num_slots - 1 - i] = 0;
+        slot_histogram[num_slots / 2 - kCoeffBits / 2 + i] = 0;
       }
-      delta *= FLAGS_find_delta_shrink;
-      fprintf(stderr,
-              "slots: %u log2_slots: %g target_success: %g ->overhead: %g\r",
-              static_cast<unsigned>(num_slots),
-              std::log(num_slots * 1.0) / std::log(2.0), FLAGS_find_success,
-              1.0 / factor);
     }
-    fprintf(stderr, "\n");
+    uint64_t total_added = 0;
+    for (uint32_t i = 0; i < FLAGS_find_iters; ++i) {
+      banding.Reset(num_slots);
+      uint32_t j = 0;
+      KeyGen end = cur;
+      end += num_slots + num_slots / 10;
+      for (; cur != end; ++cur) {
+        if (banding.Add(*cur)) {
+          ++j;
+        } else {
+          break;
+        }
+      }
+      total_added += j;
+      for (auto &slot : slot_histogram) {
+        slot.second += banding.IsOccupied(slot.first);
+      }
+
+      double factor = 1.0 * num_slots / j;
+      int32_t bucket = static_cast<int32_t>((factor - 1.0) / FLAGS_find_granularity);
+      occ_histogram[bucket]++;
+      if (FLAGS_verbose) {
+        fprintf(stderr,
+                "num_slots: %u i: %u / %u avg_overhead: %g\r",
+                static_cast<unsigned>(num_slots),
+                static_cast<unsigned>(i),
+                static_cast<unsigned>(FLAGS_find_iters),
+                1.0 * (i + 1) * num_slots / total_added);
+      }
+    }
+    if (FLAGS_verbose) {
+      fprintf(stderr, "\n");
+    }
+
+    uint32_t cumulative = 0;
+
+    double p50 = 0;
+    double p95 = 0;
+    double p99_9 = 0;
+
+    for (auto& h : occ_histogram) {
+      double before = 1.0 * cumulative / FLAGS_find_iters;
+      double not_after = 1.0 * (cumulative + h.second) / FLAGS_find_iters;
+      if (FLAGS_verbose) {
+        fprintf(stderr, "overhead: %g before: %g not_after: %g\n",
+                h.first * FLAGS_find_granularity + 1.0,
+                before,
+                not_after);
+      }
+      cumulative += h.second;
+      if (before < 0.5 && 0.5 <= not_after) {
+        // fake it with linear interpolation
+        double portion = (0.5 - before) / (not_after - before);
+        p50 = (h.first + portion) * FLAGS_find_granularity + 1.0;
+      } else if (before < 0.95 && 0.95 <= not_after) {
+        // fake it with linear interpolation
+        double portion = (0.95 - before) / (not_after - before);
+        p95 = (h.first + portion) * FLAGS_find_granularity + 1.0;
+      } else if (before < 0.999 && 0.999 <= not_after) {
+        // fake it with linear interpolation
+        double portion = (0.999 - before) / (not_after - before);
+        p99_9 = (h.first + portion) * FLAGS_find_granularity + 1.0;
+      }
+    }
+    for (auto& slot : slot_histogram) {
+      fprintf(stderr, "slot[%u] occupied: %g\n",
+              (unsigned)slot.first,
+              1.0 * slot.second / FLAGS_find_iters);
+    }
+
+    fprintf(stderr,
+            "num_slots: %u iters: %u mean: %g p50: %g p95: %g p99.9: %g\n",
+            static_cast<unsigned>(num_slots),
+            static_cast<unsigned>(FLAGS_find_iters),
+            1.0 * FLAGS_find_iters * num_slots / total_added,
+            p50, p95, p99_9);
 
     num_slots = std::max(
         num_slots + 1, static_cast<Index>(num_slots * FLAGS_find_next_factor));
