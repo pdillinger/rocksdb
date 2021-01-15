@@ -1,10 +1,38 @@
 # Rocksdb Change Log
 ## Unreleased
 ### Behavior Changes
+* When verifying full file checksum with `DB::VerifyFileChecksums()`, we now fail with `Status::InvalidArgument` if the name of the checksum generator used for verification does not match the name of the checksum generator used for protecting the file when it was created.
+* Since RocksDB does not continue write the same file if a file write fails for any reason, the file scope write IO error is treated the same as retryable IO error. More information about error handling of file scope IO error is included in `ErrorHandler::SetBGError`.
+
+### Public API Change
+* Add a public API WriteBufferManager::dummy_entries_in_cache_usage() which reports the size of dummy entries stored in cache (passed to WriteBufferManager). Dummy entries are used to account for DataBlocks.
+
+## 6.16.0 (12/18/2020)
+### Behavior Changes
 * Attempting to write a merge operand without explicitly configuring `merge_operator` now fails immediately, causing the DB to enter read-only mode. Previously, failure was deferred until the `merge_operator` was needed by a user read or a background operation.
 
+### API Changes
+* `rocksdb_approximate_sizes` and `rocksdb_approximate_sizes_cf` in the C API now requires an error pointer (`char** errptr`) for receiving any error.
+* All overloads of DB::GetApproximateSizes now return Status, so that any failure to obtain the sizes is indicated to the caller.
+
 ### Bug Fixes
+* Truncated WALs ending in incomplete records can no longer produce gaps in the recovered data when `WALRecoveryMode::kPointInTimeRecovery` is used. Gaps are still possible when WALs are truncated exactly on record boundaries; for complete protection, users should enable `track_and_verify_wals_in_manifest`.
+* Fix a bug where compressed blocks read by MultiGet are not inserted into the compressed block cache when use_direct_reads = true.
+* Fixed the issue of full scanning on obsolete files when there are too many outstanding compactions with ConcurrentTaskLimiter enabled.
 * Fixed the logic of populating native data structure for `read_amp_bytes_per_bit` during OPTIONS file parsing on big-endian architecture. Without this fix, original code introduced in PR7659, when running on big-endian machine, can mistakenly store read_amp_bytes_per_bit (an uint32) in little endian format. Future access to `read_amp_bytes_per_bit` will give wrong values. Little endian architecture is not affected.
+* Fixed prefix extractor with timestamp issues.
+* Fixed a bug in atomic flush: in two-phase commit mode, the minimum WAL log number to keep is incorrect.
+* Fixed a bug related to checkpoint in PR7789: if there are multiple column families, and the checkpoint is not opened as read only, then in rare cases, data loss may happen in the checkpoint. Since backup engine relies on checkpoint, it may also be affected.
+* When ldb --try_load_options is used with the --column_family option, the ColumnFamilyOptions for the specified column family was not loaded from the OPTIONS file. Fix it so its loaded from OPTIONS and then overridden with command line overrides.
+
+### New Features
+* User defined timestamp feature supports `CompactRange` and `GetApproximateSizes`.
+* Support getting aggregated table properties (kAggregatedTableProperties and kAggregatedTablePropertiesAtLevel) with DB::GetMapProperty, for easier access to the data in a structured format.
+* Experimental option BlockBasedTableOptions::optimize_filters_for_memory now works with experimental Ribbon filter (as well as Bloom filter).
+
+### Public API Change
+* Deprecated public but rarely-used FilterBitsBuilder::CalculateNumEntry, which is replaced with ApproximateNumEntries taking a size_t parameter and returning size_t.
+* To improve portability the functions `Env::GetChildren` and `Env::GetChildrenFileAttributes` will no longer return entries for the special directories `.` or `..`.
 
 ## 6.15.0 (11/13/2020)
 ### Bug Fixes
