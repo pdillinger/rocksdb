@@ -53,7 +53,8 @@ namespace ribbon {
 //   // When true, enables a special "lite" filter implementation which is
 //   // slightly faster to construct, and never fails to construct though
 //   // FP rate can quickly explode in cases where corresponding non-lite
-//   // filter would fail to construct.
+//   // filter would fail to construct. Thus, we recommend
+//   // ConstructionFailureChance smaller than desired FP rate.
 //   static constexpr bool kLiteFilter;
 //
 //   // When true, adds a tiny bit more hashing logic on queries and
@@ -467,12 +468,13 @@ double ExpectedCollisionFpRate(const Hasher& /*hasher*/, double added) {
 // Represents a chosen chance of successful Ribbon construction for a single
 // seed. Allowing higher chance of failed construction can reduce space
 // overhead but takes extra time in construction.
-enum ConstructionSuccess {
-  k50Percent,
-  k95Percent,
-  // ~1 in a million failure or less. Recommended, arguably essential,
-  // when using kLiteFilter==true
-  kAlmostSure,
+enum ConstructionFailureChance {
+  kOneIn2,
+  kOneIn20,
+  // When using kLiteFilter==true, construction failure chance should
+  // not generally exceed target FP rate, so this is often (but not always)
+  // the best choice with Ribbon Lite.
+  kOneIn1000,
 };
 
 // StandardBanding: a canonical implementation of BandingStorage and
@@ -631,7 +633,7 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   }
 
   // Returns whether a row is "occupied" in the banding (non-zero
-  // coefficients stored)
+  // coefficients stored). (Only recommended for debug/test)
   bool IsOccupied(Index i) {
     return coeff_rows_[i] != 0;
   }
@@ -693,8 +695,8 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   // ********************************************************************
   // Static high-level API
 
-  static constexpr ConstructionSuccess kDefaultSuccess =
-      TypesAndSettings::kLiteFilter ? kAlmostSure : k95Percent;
+  static constexpr ConstructionFailureChance kDefaultFailureChance =
+      TypesAndSettings::kLiteFilter ? kOneIn1000 : kOneIn20;
 
   // Based on data from FindOccupancyForSuccessRate in ribbon_test,
   // returns a number of slots for a given number of entries to add
@@ -705,13 +707,13 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   // num_to_add should not exceed roughly 2/3rds of the maximum value
   // of the Index type to avoid overflow.
   static Index GetNumSlots(Index num_to_add,
-                           ConstructionSuccess min_success = kDefaultSuccess) {
-    assert(!TypesAndSettings::kLiteFilter || min_success == kAlmostSure);
+                           ConstructionFailureChance max_failure = kDefaultFailureChance) {
+    assert(!TypesAndSettings::kLiteFilter || max_failure == kOneIn1000);
     if (num_to_add == 0) {
       return 0;
     }
-    double factor = GetOverheadFactor(num_to_add, min_success);
-    Index num_slots = static_cast<Index>(num_to_add * factor);
+    double factor = GetOverheadFactor(num_to_add, max_failure);
+    Index num_slots = static_cast<Index>(num_to_add * factor + 0.999);
     assert(num_slots >= num_to_add);
     return num_slots;
   }
@@ -725,22 +727,22 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   // The reason that num_to_add is needed is that Ribbon filters of a
   // particular CoeffRow size do not scale infinitely.
   static double GetOverheadFactor(
-      Index num_to_add, ConstructionSuccess min_success = kDefaultSuccess) {
-    static_assert(/*TODO*/ kCoeffBits == 16 || kCoeffBits == 32 ||
-                  kCoeffBits == 64 || kCoeffBits == 128, "Supported sizes");
+      Index num_to_add, ConstructionFailureChance max_failure = kDefaultFailureChance) {
+    // Supported sizes for now
+    assert(kCoeffBits == 64 || kCoeffBits == 128);
     constexpr bool c64 = kCoeffBits == 64;
     constexpr bool smash = TypesAndSettings::kUseSmash;
     double log2_num_to_add = std::log(num_to_add) * 1.442695;
     double base;
     double pivot;
     double slope;
-    switch (min_success) {
-      case k50Percent:
-        base = c64 ? (smash ? 1.003 : 1.021) : (smash ? 1.0005 : 1.009);
+    switch (max_failure) {
+      case kOneIn2:
+        base = c64 ? (smash ? 1.003 : 1.021) : (smash ? 1.0005 : 1.010);
         pivot = c64 ? (smash ? 10.0 : 12.0) : (smash ? 12.0 : 14.0);
         slope = c64 ? 0.009 : 0.0041;
         break;
-      case k95Percent:
+      case kOneIn20:
         base = c64 ? (smash ? 1.02 : 1.05) : (smash ? 1.01 : 1.02);
         pivot = c64 ? (smash ? 8.5 : 11.0) : (smash ? 10.0 : 12.0);
         slope = c64 ? 0.009 : 0.0042;
@@ -748,12 +750,12 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
       default:
         assert(false);
         FALLTHROUGH_INTENDED;
-      case kAlmostSure:
+      case kOneIn1000:
         // smash apparently irrelevant in c128 case here
         // FIXME: FindOccupancyForSuccessRate suggested 1.052 would be fine
         // for c128 here but 1.055 seems to be requried to (largely) avoid
         // the FP rate penalty in Ribbon lite
-        base = c64 ? (smash ? 1.055 : 1.07) : 1.055;
+        base = c64 ? (smash ? 1.055 : 1.09) : 1.055;
         pivot = c64 ? (smash ? 9.5 : 11.0) : 17.0;
         slope = c64 ? 0.009 : 0.004;
         break;
