@@ -9,6 +9,7 @@
 #include "util/bloom_impl.h"
 #include "util/coding.h"
 #include "util/hash.h"
+#include "util/ribbon_config.h"
 #include "util/ribbon_impl.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
@@ -45,7 +46,8 @@ DEFINE_bool(verbose, false, "Print extra details");
 DEFINE_bool(find_occ, false,
             "whether to run the FindOccupancyForSuccessRate tool");
 DEFINE_bool(find_slot_occ, false,
-            "whether to show individual slot occupancies with FindOccupancyForSuccessRate tool");
+            "whether to show individual slot occupancies with "
+            "FindOccupancyForSuccessRate tool");
 DEFINE_double(find_next_factor, 1.618,
               "factor to next num_slots for FindOccupancyForSuccessRate");
 DEFINE_uint32(find_iters, 10000,
@@ -168,8 +170,7 @@ const std::vector<ConstructionFailureChance> kFailureOnlyRare = {
     ROCKSDB_NAMESPACE::ribbon::kOneIn1000};
 
 const std::vector<ConstructionFailureChance> kFailureAll = {
-    ROCKSDB_NAMESPACE::ribbon::kOneIn2,
-    ROCKSDB_NAMESPACE::ribbon::kOneIn20,
+    ROCKSDB_NAMESPACE::ribbon::kOneIn2, ROCKSDB_NAMESPACE::ribbon::kOneIn20,
     ROCKSDB_NAMESPACE::ribbon::kOneIn1000};
 
 }  // namespace
@@ -186,7 +187,7 @@ struct DefaultTypesAndSettings {
   using Seed = uint32_t;
   using Key = ROCKSDB_NAMESPACE::Slice;
   static constexpr bool kIsFilter = true;
-  static constexpr bool kLiteFilter = false;
+  static constexpr bool kHomogeneous = false;
   static constexpr bool kFirstCoeffAlwaysOne = true;
   static constexpr bool kUseSmash = false;
   static constexpr bool kAllowZeroStarts = false;
@@ -217,27 +218,27 @@ struct TypesAndSettings_Coeff64Smash0 : public TypesAndSettings_Coeff64Smash {
   static constexpr bool kFirstCoeffAlwaysOne = false;
 };
 
-// Ribbon Lite configurations
-struct TypesAndSettings_Coeff128_Lite : public DefaultTypesAndSettings {
-  static constexpr bool kLiteFilter = true;
+// Homogeneous Ribbon configurations
+struct TypesAndSettings_Coeff128_Homog : public DefaultTypesAndSettings {
+  static constexpr bool kHomogeneous = true;
   // Since our best construction success setting still has 1/1000 failure
   // rate, the best FP rate we test is 1/256
   using ResultRow = uint8_t;
-  // Lite only makes sense with sufficient slots for equivalent of almost
-  // sure construction success
+  // Homogeneous only makes sense with sufficient slots for equivalent of
+  // almost sure construction success
   static const std::vector<ConstructionFailureChance>& FailureChanceToTest() {
     return kFailureOnlyRare;
   }
 };
-struct TypesAndSettings_Coeff128Smash_Lite
-    : public TypesAndSettings_Coeff128_Lite {
+struct TypesAndSettings_Coeff128Smash_Homog
+    : public TypesAndSettings_Coeff128_Homog {
   static constexpr bool kUseSmash = true;
 };
-struct TypesAndSettings_Coeff64_Lite : public TypesAndSettings_Coeff128_Lite {
+struct TypesAndSettings_Coeff64_Homog : public TypesAndSettings_Coeff128_Homog {
   using CoeffRow = uint64_t;
 };
-struct TypesAndSettings_Coeff64Smash_Lite
-    : public TypesAndSettings_Coeff64_Lite {
+struct TypesAndSettings_Coeff64Smash_Homog
+    : public TypesAndSettings_Coeff64_Homog {
   static constexpr bool kUseSmash = true;
 };
 
@@ -331,13 +332,12 @@ struct TypesAndSettings_Coeff16Smash : public TypesAndSettings_Coeff16 {
   static constexpr bool kUseSmash = true;
 };
 
-
 using TestTypesAndSettings = ::testing::Types<
     TypesAndSettings_Coeff128, TypesAndSettings_Coeff128Smash,
     TypesAndSettings_Coeff64, TypesAndSettings_Coeff64Smash,
-    TypesAndSettings_Coeff64Smash0, TypesAndSettings_Coeff128_Lite,
-    TypesAndSettings_Coeff128Smash_Lite, TypesAndSettings_Coeff64_Lite,
-    TypesAndSettings_Coeff64Smash_Lite, TypesAndSettings_Result16,
+    TypesAndSettings_Coeff64Smash0, TypesAndSettings_Coeff128_Homog,
+    TypesAndSettings_Coeff128Smash_Homog, TypesAndSettings_Coeff64_Homog,
+    TypesAndSettings_Coeff64Smash_Homog, TypesAndSettings_Result16,
     TypesAndSettings_Result32, TypesAndSettings_IndexSizeT,
     TypesAndSettings_Hash32, TypesAndSettings_Hash32_Result16,
     TypesAndSettings_KeyString, TypesAndSettings_Seed8,
@@ -346,8 +346,9 @@ using TestTypesAndSettings = ::testing::Types<
     TypesAndSettings_Rehasher_Result16, TypesAndSettings_Rehasher_Result32,
     TypesAndSettings_Rehasher_Seed64, TypesAndSettings_Rehasher32,
     TypesAndSettings_Rehasher32_Coeff64, TypesAndSettings_SmallKeyGen,
-    TypesAndSettings_Hash32_SmallKeyGen, TypesAndSettings_Coeff32, TypesAndSettings_Coeff32Smash,
-    TypesAndSettings_Coeff16, TypesAndSettings_Coeff16Smash>;
+    TypesAndSettings_Hash32_SmallKeyGen, TypesAndSettings_Coeff32,
+    TypesAndSettings_Coeff32Smash, TypesAndSettings_Coeff16,
+    TypesAndSettings_Coeff16Smash>;
 TYPED_TEST_CASE(RibbonTypeParamTest, TestTypesAndSettings);
 
 namespace {
@@ -391,25 +392,25 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
   IMPORT_RIBBON_TYPES_AND_SETTINGS(TypeParam);
   IMPORT_RIBBON_IMPL_TYPES(TypeParam);
   using KeyGen = typename TypeParam::KeyGen;
+  using ConfigHelper =
+      ROCKSDB_NAMESPACE::ribbon::BandingConfigHelper<TypeParam>;
 
   if (sizeof(CoeffRow) < 8) {
     ROCKSDB_GTEST_SKIP("Not fully supported");
     return;
   }
-  /*
-  if (TypeParam::kLiteFilter) {
+  if (TypeParam::kHomogeneous && TypeParam::kUseSmash) {
     ROCKSDB_GTEST_SKIP("Not fully supported");
     return;
   }
-  */
 
   const auto log2_thoroughness =
       static_cast<uint32_t>(ROCKSDB_NAMESPACE::FloorLog2(FLAGS_thoroughness));
 
   const uint32_t log2_max_add =
-      FLAGS_log2_max_add > 0
-          ? FLAGS_log2_max_add
-          : 6U + static_cast<uint32_t>(kCoeffBits / 16) + log2_thoroughness;
+      FLAGS_log2_max_add > 0 ? FLAGS_log2_max_add
+                             : 6U + static_cast<uint32_t>(kCoeffBits / 16) +
+                                   std::max(log2_thoroughness, uint32_t{5});
 
   const uint32_t log2_min_add =
       static_cast<uint32_t>(ROCKSDB_NAMESPACE::FloorLog2(
@@ -437,7 +438,9 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
     }
 
     uint64_t total_reseeds = 0;
+    uint64_t total_singles = 0;
     uint64_t total_single_failures = 0;
+    uint64_t total_batch = 0;
     uint64_t total_batch_successes = 0;
     uint64_t total_fp_count = 0;
     uint64_t total_added = 0;
@@ -473,7 +476,7 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
       --num_to_add;
       for (;;) {
         Index next_num_slots = SimpleSoln::RoundUpNumSlots(
-            Banding::GetNumSlots(num_to_add + 1, cs));
+            ConfigHelper::GetNumSlots(num_to_add + 1, cs));
         if (test_interleaved) {
           next_num_slots = InterleavedSoln::RoundUpNumSlots(next_num_slots);
           // assert idempotent
@@ -491,11 +494,6 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
       }
       assert(num_slots < Index{0} - 1);
 
-      if (FLAGS_verbose) {
-        fprintf(stderr, "Adding(%s) %u / %u\n", test_interleaved ? "i" : "s",
-                (unsigned)num_to_add, (unsigned)num_slots);
-      }
-
       total_added += num_to_add;
 
       std::string prefix;
@@ -511,16 +509,26 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
       KeyGen two_more(prefix + "more", 2);
 
       // Batch that may or may not be added
-      const Index kBatchSize =
-          sizeof(CoeffRow) == 16 ? 300 : TypeParam::kUseSmash ? 20 : 10;
+      uint32_t batch_size =
+          static_cast<uint32_t>(2.0 * std::sqrt(num_slots - num_to_add));
+      if (batch_size < 10U) {
+        batch_size = 0;
+      }
       std::string batch_str = prefix + "batch";
       KeyGen batch_begin(batch_str, 0);
-      KeyGen batch_end(batch_str, kBatchSize);
+      KeyGen batch_end(batch_str, batch_size);
 
       // Batch never (successfully) added, but used for querying FP rate
       std::string not_str = prefix + "not";
       KeyGen other_keys_begin(not_str, 0);
       KeyGen other_keys_end(not_str, FLAGS_max_check);
+
+      double overhead_ratio = 1.0 * num_slots / num_to_add;
+      if (FLAGS_verbose) {
+        fprintf(stderr, "Adding(%s) %u / %u   Overhead: %g   Batch size: %u\n",
+                test_interleaved ? "i" : "s", (unsigned)num_to_add,
+                (unsigned)num_slots, overhead_ratio, (unsigned)batch_size);
+      }
 
       // Vary bytes for InterleavedSoln to use number of solution columns
       // from 0 to max allowed by ResultRow type (and used by SimpleSoln).
@@ -554,8 +562,10 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
         Index occupied_count = banding.GetOccupiedCount();
         Index more_added = 0;
 
-        if (TypeParam::kLiteFilter) {
-          // Not compatible with backtracking because add doesn't fail.
+        if (TypeParam::kHomogeneous || overhead_ratio < 1.01 ||
+            batch_size == 0) {
+          // Homogeneous not compatible with backtracking because add
+          // doesn't fail. Small overhead ratio too packed to expect more
           first_single = false;
           second_single = false;
           batch_success = false;
@@ -566,7 +576,7 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
           // result side of banding) of these entries.
           KeyGen other_keys_too_big_end = other_keys_begin;
           other_keys_too_big_end += num_to_add;
-          banding.EnsureBacktrackSize(FLAGS_max_check);
+          banding.EnsureBacktrackSize(std::max(FLAGS_max_check, batch_size));
           EXPECT_FALSE(banding.AddRangeOrRollBack(other_keys_begin,
                                                   other_keys_too_big_end));
           EXPECT_EQ(occupied_count, banding.GetOccupiedCount());
@@ -576,12 +586,14 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
           first_single = banding.Add(*one_more);
           second_single = banding.Add(*two_more);
           more_added += (first_single ? 1 : 0) + (second_single ? 1 : 0);
+          total_singles += 2U;
           total_single_failures += 2U - more_added;
 
           // Or as a batch
           batch_success = banding.AddRangeOrRollBack(batch_begin, batch_end);
+          ++total_batch;
           if (batch_success) {
-            more_added += kBatchSize;
+            more_added += batch_size;
             ++total_batch_successes;
           }
           EXPECT_LE(banding.GetOccupiedCount(), occupied_count + more_added);
@@ -659,8 +671,13 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
         // in Hash value. (Negligible for 64-bit, can matter for 32-bit.)
         double correction =
             FLAGS_max_check * ExpectedCollisionFpRate(hasher, num_to_add);
-        EXPECT_LE(fp_count,
-                  FrequentPoissonUpperBound(expected_fp_count + correction));
+        if (TypeParam::kHomogeneous && num_slots < 800) {
+          // Known chance of significant FP degredation in small filters.
+          // TODO: more configured overhead?
+        } else {
+          EXPECT_LE(fp_count,
+                    FrequentPoissonUpperBound(expected_fp_count + correction));
+        }
         EXPECT_GE(fp_count,
                   FrequentPoissonLowerBound(expected_fp_count + correction));
       }
@@ -685,12 +702,17 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
           // 32-bit.)
           double correction =
               FLAGS_max_check * ExpectedCollisionFpRate(hasher, num_to_add);
-          EXPECT_LE(ifp_count,
-                    FrequentPoissonUpperBound(expected_fp_count + correction));
+          if (TypeParam::kHomogeneous && num_slots < 800) {
+            // Known chance of significant FP degredation in small filters.
+            // TODO: more configured overhead?
+          } else {
+            EXPECT_LE(ifp_count, FrequentPoissonUpperBound(expected_fp_count +
+                                                           correction));
+          }
           // FIXME: why sometimes can we slightly "beat the odds"?
           // (0.95 factor should not be needed)
-          EXPECT_GE(ifp_count,
-                    FrequentPoissonLowerBound(0.95 * expected_fp_count + correction));
+          EXPECT_GE(ifp_count, FrequentPoissonLowerBound(
+                                   0.95 * expected_fp_count + correction));
         }
         // Since the bits used in isoln are a subset of the bits used in soln,
         // it cannot have fewer FPs
@@ -732,7 +754,7 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
             "Bloom       outside query, hot, incl hashing, ns/key: %g\n",
             1.0 * bloom_query_nanos / soln_query_count);
 
-    if (TypeParam::kLiteFilter) {
+    if (TypeParam::kHomogeneous) {
       EXPECT_EQ(total_reseeds, 0U);
     } else {
       double average_reseeds = 1.0 * total_reseeds / FLAGS_thoroughness;
@@ -753,28 +775,28 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
                                             FLAGS_thoroughness));
     }
 
-    if (!TypeParam::kLiteFilter && false) {  // FIXME
-      uint64_t total_singles = 2 * FLAGS_thoroughness;
+    if (total_singles > 0) {
       double single_failure_rate = 1.0 * total_single_failures / total_singles;
       fprintf(stderr, "Add'l single, failure rate: %g\n", single_failure_rate);
       // A rough bound (one sided) based on nothing in particular
-      double expected_single_failures =
-          1.0 * total_singles /
-          (sizeof(CoeffRow) == 16 ? 128 : TypeParam::kUseSmash ? 64 : 32);
+      double expected_single_failures = 1.0 * total_singles /
+                                        (sizeof(CoeffRow) == 16 ? 128
+                                         : TypeParam::kUseSmash ? 64
+                                                                : 32);
       EXPECT_LE(total_single_failures,
                 InfrequentPoissonUpperBound(expected_single_failures));
     }
 
-    if (!TypeParam::kLiteFilter && false) {  // FIXME
+    if (total_batch > 0) {
       // Counting successes here for Poisson to approximate the Binomial
       // distribution.
       // A rough bound (one sided) based on nothing in particular.
-      double expected_batch_successes = 1.0 * FLAGS_thoroughness / 2;
+      double expected_batch_successes = 1.0 * total_batch / 2;
       uint64_t lower_bound =
           InfrequentPoissonLowerBound(expected_batch_successes);
       fprintf(stderr, "Add'l batch, success rate: %g (>= %g)\n",
-              1.0 * total_batch_successes / FLAGS_thoroughness,
-              1.0 * lower_bound / FLAGS_thoroughness);
+              1.0 * total_batch_successes / total_batch,
+              1.0 * lower_bound / total_batch);
       EXPECT_GE(total_batch_successes, lower_bound);
     }
 
@@ -842,9 +864,9 @@ TYPED_TEST(RibbonTypeParamTest, Extremes) {
     bool soln_query_result = soln.FilterQuery(*cur, hasher);
     // Solutions are equivalent
     ASSERT_EQ(isoln_query_result, soln_query_result);
-    if (!TypeParam::kLiteFilter) {
+    if (!TypeParam::kHomogeneous) {
       // And in fact we only expect an FP when ResultRow is 0
-      // (except Ribbon lite)
+      // (except Homogeneous)
       ASSERT_EQ(soln_query_result, hasher.GetResultRowFromHash(
                                        hasher.GetHash(*cur)) == ResultRow{0});
     }
@@ -855,9 +877,9 @@ TYPED_TEST(RibbonTypeParamTest, Extremes) {
     ASSERT_EQ(isoln.ExpectedFpRate(), soln.ExpectedFpRate());
     double expected_fp_count = isoln.ExpectedFpRate() * FLAGS_max_check;
     EXPECT_LE(fp_count, InfrequentPoissonUpperBound(expected_fp_count));
-    if (TypeParam::kLiteFilter) {
-      // Pseudorandom garbage in Ribbon lite can "beat the odds" if nothing
-      // added
+    if (TypeParam::kHomogeneous) {
+      // Pseudorandom garbage in Homogeneous filter can "beat the odds" if
+      // nothing added
     } else {
       EXPECT_GE(fp_count, InfrequentPoissonLowerBound(expected_fp_count));
     }
@@ -1039,7 +1061,7 @@ TEST(RibbonTest, PhsfBasic) {
   }
 }
 
-// Not a real test, but a tool used to build GetNumSlotsFor95PctSuccess
+// Not a real test, but a tool used to build APIs in ribbon_config.h
 TYPED_TEST(RibbonTypeParamTest, FindOccupancyForSuccessRate) {
   IMPORT_RIBBON_TYPES_AND_SETTINGS(TypeParam);
   IMPORT_RIBBON_IMPL_TYPES(TypeParam);
@@ -1050,7 +1072,9 @@ TYPED_TEST(RibbonTypeParamTest, FindOccupancyForSuccessRate) {
     return;
   }
 
-  KeyGen cur(ROCKSDB_NAMESPACE::ToString(testing::UnitTest::GetInstance()->random_seed()), 0);
+  KeyGen cur(ROCKSDB_NAMESPACE::ToString(
+                 testing::UnitTest::GetInstance()->random_seed()),
+             0);
 
   Banding banding;
   Index num_slots = InterleavedSoln::RoundUpNumSlots(FLAGS_find_min_slots);
@@ -1079,17 +1103,16 @@ TYPED_TEST(RibbonTypeParamTest, FindOccupancyForSuccessRate) {
         }
       }
       total_added += j;
-      for (auto &slot : slot_histogram) {
+      for (auto& slot : slot_histogram) {
         slot.second += banding.IsOccupied(slot.first);
       }
 
-      int32_t bucket = static_cast<int32_t>(num_slots) - static_cast<int32_t>(j);
+      int32_t bucket =
+          static_cast<int32_t>(num_slots) - static_cast<int32_t>(j);
       rem_histogram[bucket]++;
       if (FLAGS_verbose) {
-        fprintf(stderr,
-                "num_slots: %u i: %u / %u avg_overhead: %g\r",
-                static_cast<unsigned>(num_slots),
-                static_cast<unsigned>(i),
+        fprintf(stderr, "num_slots: %u i: %u / %u avg_overhead: %g\r",
+                static_cast<unsigned>(num_slots), static_cast<unsigned>(i),
                 static_cast<unsigned>(FLAGS_find_iters),
                 1.0 * (i + 1) * num_slots / total_added);
       }
@@ -1109,9 +1132,7 @@ TYPED_TEST(RibbonTypeParamTest, FindOccupancyForSuccessRate) {
       double not_after = 1.0 * (cumulative + h.second) / FLAGS_find_iters;
       if (FLAGS_verbose) {
         fprintf(stderr, "overhead: %g before: %g not_after: %g\n",
-                1.0 * num_slots / (num_slots - h.first),
-                before,
-                not_after);
+                1.0 * num_slots / (num_slots - h.first), before, not_after);
       }
       cumulative += h.second;
       if (before < 0.5 && 0.5 <= not_after) {
@@ -1129,21 +1150,23 @@ TYPED_TEST(RibbonTypeParamTest, FindOccupancyForSuccessRate) {
       }
     }
     for (auto& slot : slot_histogram) {
-      fprintf(stderr, "slot[%u] occupied: %g\n",
-              (unsigned)slot.first,
+      fprintf(stderr, "slot[%u] occupied: %g\n", (unsigned)slot.first,
               1.0 * slot.second / FLAGS_find_iters);
     }
 
-    double mean_rem = (1.0 * FLAGS_find_iters * num_slots - total_added) / FLAGS_find_iters;
-    fprintf(stderr,
-            "num_slots: %u iters: %u mean_ovr: %g p50_ovr: %g p95_ovr: %g p99.9_ovr: %g mean_rem: %g p50_rem: %g p95_rem: %g p99.9_rem: %g\n",
-            static_cast<unsigned>(num_slots),
-            static_cast<unsigned>(FLAGS_find_iters),
-            1.0 * num_slots / (num_slots - mean_rem),
-            1.0 * num_slots / (num_slots - p50_rem),
-            1.0 * num_slots / (num_slots - p95_rem),
-            1.0 * num_slots / (num_slots - p99_9_rem),
-            mean_rem, p50_rem, p95_rem, p99_9_rem);
+    double mean_rem =
+        (1.0 * FLAGS_find_iters * num_slots - total_added) / FLAGS_find_iters;
+    fprintf(
+        stderr,
+        "num_slots: %u iters: %u mean_ovr: %g p50_ovr: %g p95_ovr: %g "
+        "p99.9_ovr: %g mean_rem: %g p50_rem: %g p95_rem: %g p99.9_rem: %g\n",
+        static_cast<unsigned>(num_slots),
+        static_cast<unsigned>(FLAGS_find_iters),
+        1.0 * num_slots / (num_slots - mean_rem),
+        1.0 * num_slots / (num_slots - p50_rem),
+        1.0 * num_slots / (num_slots - p95_rem),
+        1.0 * num_slots / (num_slots - p99_9_rem), mean_rem, p50_rem, p95_rem,
+        p99_9_rem);
 
     num_slots = std::max(
         num_slots + 1, static_cast<Index>(num_slots * FLAGS_find_next_factor));

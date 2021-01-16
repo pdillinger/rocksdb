@@ -50,12 +50,12 @@ namespace ribbon {
 //   // construction.
 //   static constexpr bool kIsFilter;
 //
-//   // When true, enables a special "lite" filter implementation which is
-//   // slightly faster to construct, and never fails to construct though
-//   // FP rate can quickly explode in cases where corresponding non-lite
-//   // filter would fail to construct. Thus, we recommend
+//   // When true, enables a special "homogeneous" filter implementation which
+//   // is slightly faster to construct, and never fails to construct though
+//   // FP rate can quickly explode in cases where corresponding
+//   // non-homogeneous filter would fail to construct. Thus, we recommend
 //   // ConstructionFailureChance smaller than desired FP rate.
-//   static constexpr bool kLiteFilter;
+//   static constexpr bool kHomogeneous;
 //
 //   // When true, adds a tiny bit more hashing logic on queries and
 //   // construction to improve utilization at the beginning and end of
@@ -262,8 +262,7 @@ class StandardHasher {
     } else {
       b = a;
     }
-    static_assert(sizeof(CoeffRow) <= sizeof(Unsigned128),
-                  "Supported sizes");
+    static_assert(sizeof(CoeffRow) <= sizeof(Unsigned128), "Supported sizes");
     Unsigned128 c;
     if (sizeof(uint64_t) < sizeof(CoeffRow)) {
       // Almost-trivial hash expansion (OK - see above), favoring roughly
@@ -293,7 +292,7 @@ class StandardHasher {
     return static_cast<ResultRow>(~ResultRow{0});
   }
   inline ResultRow GetResultRowFromHash(Hash h) const {
-    if (TypesAndSettings::kIsFilter && !TypesAndSettings::kLiteFilter) {
+    if (TypesAndSettings::kIsFilter && !TypesAndSettings::kHomogeneous) {
       // This is not so much "critical path" code because it can be done in
       // parallel (instruction level) with memory lookup.
       //
@@ -465,18 +464,6 @@ double ExpectedCollisionFpRate(const Hasher& /*hasher*/, double added) {
   return added / std::pow(256.0, sizeof(typename Hasher::Hash));
 }
 
-// Represents a chosen chance of successful Ribbon construction for a single
-// seed. Allowing higher chance of failed construction can reduce space
-// overhead but takes extra time in construction.
-enum ConstructionFailureChance {
-  kOneIn2,
-  kOneIn20,
-  // When using kLiteFilter==true, construction failure chance should
-  // not generally exceed target FP rate, so this is often (but not always)
-  // the best choice with Ribbon Lite.
-  kOneIn1000,
-};
-
 // StandardBanding: a canonical implementation of BandingStorage and
 // BacktrackStorage, with convenience API for banding (solving with on-the-fly
 // Gaussian elimination) with and without backtracking.
@@ -498,7 +485,7 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
       assert(num_slots >= kCoeffBits);
       if (num_slots > num_slots_allocated_) {
         coeff_rows_.reset(new CoeffRow[num_slots]());
-        if (!TypesAndSettings::kLiteFilter) {
+        if (!TypesAndSettings::kHomogeneous) {
           // Note: don't strictly have to zero-init result_rows,
           // except possible information leakage, etc ;)
           result_rows_.reset(new ResultRow[num_slots]());
@@ -507,7 +494,7 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
       } else {
         for (Index i = 0; i < num_slots; ++i) {
           coeff_rows_[i] = 0;
-          if (!TypesAndSettings::kLiteFilter) {
+          if (!TypesAndSettings::kHomogeneous) {
             // Note: don't strictly have to zero-init result_rows,
             // except possible information leakage, etc ;)
             result_rows_[i] = 0;
@@ -536,14 +523,14 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   }
   inline void Prefetch(Index i) const {
     PREFETCH(&coeff_rows_[i], 1 /* rw */, 1 /* locality */);
-    if (!TypesAndSettings::kLiteFilter) {
+    if (!TypesAndSettings::kHomogeneous) {
       PREFETCH(&result_rows_[i], 1 /* rw */, 1 /* locality */);
     }
   }
   inline void LoadRow(Index i, CoeffRow* cr, ResultRow* rr,
                       bool for_back_subst) const {
     *cr = coeff_rows_[i];
-    if (TypesAndSettings::kLiteFilter) {
+    if (TypesAndSettings::kHomogeneous) {
       if (for_back_subst && *cr == 0) {
         // Cheap pseudorandom data to fill unconstrained solution rows
         *rr = static_cast<ResultRow>(i * 0x9E3779B185EBCA87ULL);
@@ -556,7 +543,7 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   }
   inline void StoreRow(Index i, CoeffRow cr, ResultRow rr) {
     coeff_rows_[i] = cr;
-    if (TypesAndSettings::kLiteFilter) {
+    if (TypesAndSettings::kHomogeneous) {
       assert(rr == 0);
     } else {
       result_rows_[i] = rr;
@@ -634,9 +621,7 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
 
   // Returns whether a row is "occupied" in the banding (non-zero
   // coefficients stored). (Only recommended for debug/test)
-  bool IsOccupied(Index i) {
-    return coeff_rows_[i] != 0;
-  }
+  bool IsOccupied(Index i) { return coeff_rows_[i] != 0; }
 
   // ********************************************************************
   // High-level API
@@ -690,77 +675,6 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
     } while (cur_ordinal_seed != starting_ordinal_seed);
     // Reached limit by circling around
     return false;
-  }
-
-  // ********************************************************************
-  // Static high-level API
-
-  static constexpr ConstructionFailureChance kDefaultFailureChance =
-      TypesAndSettings::kLiteFilter ? kOneIn1000 : kOneIn20;
-
-  // Based on data from FindOccupancyForSuccessRate in ribbon_test,
-  // returns a number of slots for a given number of entries to add
-  // that should have roughly the specified chance of successful
-  // construction per seed, or better. Does NOT do rounding for
-  // InterleavedSoln; call RoundUpNumSlots for that.
-  //
-  // num_to_add should not exceed roughly 2/3rds of the maximum value
-  // of the Index type to avoid overflow.
-  static Index GetNumSlots(Index num_to_add,
-                           ConstructionFailureChance max_failure = kDefaultFailureChance) {
-    assert(!TypesAndSettings::kLiteFilter || max_failure == kOneIn1000);
-    if (num_to_add == 0) {
-      return 0;
-    }
-    double factor = GetOverheadFactor(num_to_add, max_failure);
-    Index num_slots = static_cast<Index>(num_to_add * factor + 0.999);
-    assert(num_slots >= num_to_add);
-    return num_slots;
-  }
-
-  // Based on data from FindOccupancyForSuccessRate in ribbon_test,
-  // given a number of entries to add, returns a space overhead factor
-  // (slots divided by num_to_add) that should have roughly the specified
-  // chance of successful construction per seed, or better. Does NOT do
-  // rounding for InterleavedSoln; call RoundUpNumSlots for that.
-  //
-  // The reason that num_to_add is needed is that Ribbon filters of a
-  // particular CoeffRow size do not scale infinitely.
-  static double GetOverheadFactor(
-      Index num_to_add, ConstructionFailureChance max_failure = kDefaultFailureChance) {
-    // Supported sizes for now
-    assert(kCoeffBits == 64 || kCoeffBits == 128);
-    constexpr bool c64 = kCoeffBits == 64;
-    constexpr bool smash = TypesAndSettings::kUseSmash;
-    double log2_num_to_add = std::log(num_to_add) * 1.442695;
-    double base;
-    double pivot;
-    double slope;
-    switch (max_failure) {
-      case kOneIn2:
-        base = c64 ? (smash ? 1.003 : 1.021) : (smash ? 1.0005 : 1.010);
-        pivot = c64 ? (smash ? 10.0 : 12.0) : (smash ? 12.0 : 14.0);
-        slope = c64 ? 0.009 : 0.0041;
-        break;
-      case kOneIn20:
-        base = c64 ? (smash ? 1.02 : 1.05) : (smash ? 1.01 : 1.02);
-        pivot = c64 ? (smash ? 8.5 : 11.0) : (smash ? 10.0 : 12.0);
-        slope = c64 ? 0.009 : 0.0042;
-        break;
-      default:
-        assert(false);
-        FALLTHROUGH_INTENDED;
-      case kOneIn1000:
-        // smash apparently irrelevant in c128 case here
-        // FIXME: FindOccupancyForSuccessRate suggested 1.052 would be fine
-        // for c128 here but 1.055 seems to be requried to (largely) avoid
-        // the FP rate penalty in Ribbon lite
-        base = c64 ? (smash ? 1.055 : 1.09) : 1.055;
-        pivot = c64 ? (smash ? 9.5 : 11.0) : 17.0;
-        slope = c64 ? 0.009 : 0.004;
-        break;
-    }
-    return base + std::max(log2_num_to_add - pivot, 0.0) * slope;
   }
 
  protected:
