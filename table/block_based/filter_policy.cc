@@ -412,6 +412,7 @@ struct Standard128RibbonRehasherTypesAndSettings {
   using ResultRow = uint32_t;
   // Save a conditional in Ribbon queries
   static constexpr bool kAllowZeroStarts = false;
+  static constexpr Index kFixedNumColumns = /*disabled*/ 0;
 };
 
 using Standard128RibbonTypesAndSettings =

@@ -202,6 +202,7 @@ struct DefaultTypesAndSettings {
   static constexpr bool kFirstCoeffAlwaysOne = true;
   static constexpr bool kUseSmash = false;
   static constexpr bool kAllowZeroStarts = false;
+  static constexpr Index kFixedNumColumns = /*disabled*/ 0;
   static Hash HashFn(const Key& key, uint64_t raw_seed) {
     // This version 0.7.2 preview of XXH3 (a.k.a. XXH3p) function does
     // not pass SmallKeyGen tests below without some seed premixing from
@@ -227,6 +228,9 @@ struct TypesAndSettings_Coeff64Smash : public TypesAndSettings_Coeff64 {
 };
 struct TypesAndSettings_Coeff64Smash0 : public TypesAndSettings_Coeff64Smash {
   static constexpr bool kFirstCoeffAlwaysOne = false;
+};
+struct TypesAndSettings_Coeff64Fixed7 : public TypesAndSettings_Coeff64 {
+  static constexpr uint32_t kFixedNumColumns = 7;
 };
 
 // Homogeneous Ribbon configurations
@@ -350,6 +354,7 @@ struct TypesAndSettings_Coeff16Smash : public TypesAndSettings_Coeff16 {
 using TestTypesAndSettings = ::testing::Types<
     TypesAndSettings_Coeff128, TypesAndSettings_Coeff128Smash,
     TypesAndSettings_Coeff64, TypesAndSettings_Coeff64Smash,
+    TypesAndSettings_Coeff64Fixed7/*,
     TypesAndSettings_Coeff64Smash0, TypesAndSettings_Coeff128_Homog,
     TypesAndSettings_Coeff128Smash_Homog, TypesAndSettings_Coeff64_Homog,
     TypesAndSettings_Coeff64Smash_Homog, TypesAndSettings_Result16,
@@ -363,7 +368,7 @@ using TestTypesAndSettings = ::testing::Types<
     TypesAndSettings_Rehasher32_Coeff64, TypesAndSettings_SmallKeyGen,
     TypesAndSettings_Hash32_SmallKeyGen, TypesAndSettings_Coeff32,
     TypesAndSettings_Coeff32Smash, TypesAndSettings_Coeff16,
-    TypesAndSettings_Coeff16Smash>;
+    TypesAndSettings_Coeff16Smash*/>;
 TYPED_TEST_CASE(RibbonTypeParamTest, TestTypesAndSettings);
 
 namespace {
@@ -558,7 +563,9 @@ TYPED_TEST(RibbonTypeParamTest, CompactnessAndBacktrackAndFpRate) {
       uint32_t max_ibytes =
           static_cast<uint32_t>(sizeof(ResultRow) * num_slots);
       size_t ibytes;
-      if (i == 0) {
+      if (TypeParam::kFixedNumColumns > 0) {
+        ibytes = TypeParam::kFixedNumColumns * num_slots / 8;
+      } else if (i == 0) {
         ibytes = 0;
       } else if (i == 1) {
         ibytes = max_ibytes;
@@ -904,7 +911,11 @@ TYPED_TEST(RibbonTypeParamTest, Extremes) {
 
   // Because there's plenty of memory, we expect the interleaved solution to
   // use maximum supported columns (same as simple solution)
-  ASSERT_EQ(isoln.GetUpperNumColumns(), 8U * sizeof(ResultRow));
+  if (TypeParam::kFixedNumColumns == 0) {
+    ASSERT_EQ(isoln.GetUpperNumColumns(), 8U * sizeof(ResultRow));
+  } else {
+    ASSERT_EQ(isoln.GetUpperNumColumns(), TypeParam::kFixedNumColumns);
+  }
   ASSERT_EQ(isoln.GetUpperStartBlock(), 0U);
 
   // Somewhat oddly, we expect same FP rate as if we had essentially filled
@@ -917,19 +928,26 @@ TYPED_TEST(RibbonTypeParamTest, Extremes) {
   while (cur != other_keys_end) {
     bool isoln_query_result = isoln.FilterQuery(*cur, hasher);
     bool soln_query_result = soln.FilterQuery(*cur, hasher);
-    // Solutions are equivalent
-    ASSERT_EQ(isoln_query_result, soln_query_result);
+    // Solutions are equivalent (except fixed column setting)
+    if (TypeParam::kFixedNumColumns == 0) {
+      ASSERT_EQ(isoln_query_result, soln_query_result);
+    } else {
+      ASSERT_TRUE(!soln_query_result || isoln_query_result);
+    }
     if (!TypeParam::kHomogeneous) {
       // And in fact we only expect an FP when ResultRow is 0
       // (except Homogeneous)
       ASSERT_EQ(soln_query_result, hasher.GetResultRowFromHash(
                                        hasher.GetHash(*cur)) == ResultRow{0});
     }
-    fp_count += soln_query_result ? 1 : 0;
+    fp_count += isoln_query_result ? 1 : 0;
     ++cur;
   }
   {
-    ASSERT_EQ(isoln.ExpectedFpRate(), soln.ExpectedFpRate());
+    if (TypeParam::kFixedNumColumns == 0) {
+      // Solutions are equivalent (except fixed column setting)
+      ASSERT_EQ(isoln.ExpectedFpRate(), soln.ExpectedFpRate());
+    }
     double expected_fp_count = isoln.ExpectedFpRate() * FLAGS_max_check;
     EXPECT_LE(fp_count, InfrequentPoissonUpperBound(expected_fp_count));
     if (TypeParam::kHomogeneous) {
@@ -942,24 +960,26 @@ TYPED_TEST(RibbonTypeParamTest, Extremes) {
 
   // ######################################################
   // Use zero bytes for interleaved solution (key(s) added)
+  // Not supported for fixed number of columns
+  if (TypeParam::kFixedNumColumns == 0) {
+    // Add one key
+    KeyGen key_begin("added", 0);
+    KeyGen key_end("added", 1);
+    ASSERT_TRUE(banding.ResetAndFindSeedToSolve(
+        /*slots*/ kCoeffBits, key_begin, key_end, /*first seed*/ 0,
+        /* seed mask*/ 0));
 
-  // Add one key
-  KeyGen key_begin("added", 0);
-  KeyGen key_end("added", 1);
-  ASSERT_TRUE(banding.ResetAndFindSeedToSolve(
-      /*slots*/ kCoeffBits, key_begin, key_end, /*first seed*/ 0,
-      /* seed mask*/ 0));
+    InterleavedSoln isoln2(nullptr, /*bytes*/ 0);
 
-  InterleavedSoln isoln2(nullptr, /*bytes*/ 0);
+    isoln2.BackSubstFrom(banding);
 
-  isoln2.BackSubstFrom(banding);
+    ASSERT_EQ(isoln2.GetUpperNumColumns(), 0U);
+    ASSERT_EQ(isoln2.GetUpperStartBlock(), 0U);
 
-  ASSERT_EQ(isoln2.GetUpperNumColumns(), 0U);
-  ASSERT_EQ(isoln2.GetUpperStartBlock(), 0U);
-
-  // All queries return true
-  ASSERT_TRUE(isoln2.FilterQuery(*other_keys_begin, hasher));
-  ASSERT_EQ(isoln2.ExpectedFpRate(), 1.0);
+    // All queries return true
+    ASSERT_TRUE(isoln2.FilterQuery(*other_keys_begin, hasher));
+    ASSERT_EQ(isoln2.ExpectedFpRate(), 1.0);
+  }
 }
 
 TEST(RibbonTest, AllowZeroStarts) {
@@ -1040,6 +1060,72 @@ TEST(RibbonTest, RawAndOrdinalSeeds) {
       seen[v] = true;
     }
   }
+}
+
+TEST(RibbonTest, Balanced) {
+  using TS = TypesAndSettings_Coeff128;
+  IMPORT_RIBBON_TYPES_AND_SETTINGS(TS);
+  IMPORT_RIBBON_IMPL_TYPES(TS);
+
+  constexpr uint32_t kBitsPerVshard = 8;
+  using BalancedBanding =
+      ROCKSDB_NAMESPACE::ribbon::BalancedBanding<TS, kBitsPerVshard>;
+  using BalancedHasher =
+      ROCKSDB_NAMESPACE::ribbon::BalancedHasher<TS, kBitsPerVshard>;
+  using KeyGen = StandardKeyGen;
+
+  uint32_t log2_vshards = 12;
+
+  int successes = 0;
+  uint32_t num_to_add = 1000 << log2_vshards;
+  // 32-bit works with 5% overhead @ 1000 entries per vshard
+  //                or 3% overhead @ 500 entries per vshard
+  // 64-bit works with 0.5% overhead @ 1000 entries per vshard
+  // 128-bit works with 0.1% overhead @ 1000 entries per vshard
+  //                 or 0.2% overhead @ 2000 entries per vshard
+  uint32_t num_slots = 1001 << log2_vshards;
+
+  for (uint64_t i = 0; i < FLAGS_thoroughness; ++i) {
+    fprintf(stderr, "Balanced run %u\n", (unsigned)i);
+    BalancedBanding b(log2_vshards);
+    KeyGen begin("foo", i << 32);
+    KeyGen end = begin;
+    end += num_to_add;
+
+    b.BalancerAddRange(begin, end);
+    bool success = b.Balance(num_slots);
+    successes += success;
+
+    std::unique_ptr<char[]> idata(new char[num_slots]);
+    InterleavedSoln isoln(idata.get(), num_slots);
+    isoln.BackSubstFrom(b);
+
+    std::unique_ptr<char[]> metadata(new char[b.GetMetadataLength()]);
+    memcpy(metadata.get(), b.GetMetadata(), b.GetMetadataLength());
+    BalancedHasher hasher(log2_vshards, metadata.get());
+
+    // clear
+    b.BalancerReset(1);
+
+    for (KeyGen cur = begin; cur != end; ++cur) {
+      ASSERT_TRUE(isoln.FilterQuery(*cur, hasher));
+    }
+
+    size_t query_count_for_fp = 100000;
+    KeyGen outside_begin("bar", 0);
+    KeyGen outside_end("bar", query_count_for_fp);
+    size_t fp_count = 0;
+    for (KeyGen cur = outside_begin; cur != outside_end; ++cur) {
+      fp_count += isoln.FilterQuery(*cur, hasher) ? 1 : 0;
+    }
+    fprintf(stderr, "FP rate: %g (expected: 0.00390625)\n",
+            1.0 * fp_count / query_count_for_fp);
+  }
+  fprintf(stderr, "Space efficiency: %g lg(1/f) + %g bits / key\n",
+          1.0 * num_slots / num_to_add,
+          1.0 * (kBitsPerVshard << log2_vshards) / num_to_add);
+
+  ASSERT_EQ(successes, FLAGS_thoroughness);
 }
 
 namespace {

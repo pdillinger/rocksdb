@@ -5,7 +5,11 @@
 
 #pragma once
 
+// FIXME
+#include <stdio.h>
+
 #include <cmath>
+#include <deque>
 
 #include "port/port.h"  // for PREFETCH
 #include "util/fastrange.h"
@@ -78,6 +82,11 @@ namespace ribbon {
 //   // queries.
 //   static constexpr bool kAllowZeroStarts;
 //
+//   // An optional fixed number of solution columns (for speed).
+//   // 0 -> disabled (column configuration determined by memory for slots
+//   // Currently only supported by SerializableInterleavedSolution.
+//   static constexpr Index kFixedNumColumns;
+//
 //   // A seedable stock hash function on Keys. All bits of Hash must
 //   // be reasonably high quality. XXH functions recommended, but
 //   // Murmur, City, Farm, etc. also work.
@@ -99,30 +108,32 @@ struct AddInputSelector<Key, ResultRow, true /*IsFilter*/> {
 };
 
 // To avoid writing 'typename' everywhere that we use types like 'Index'
-#define IMPORT_RIBBON_TYPES_AND_SETTINGS(TypesAndSettings)                   \
-  using CoeffRow = typename TypesAndSettings::CoeffRow;                      \
-  using ResultRow = typename TypesAndSettings::ResultRow;                    \
-  using Index = typename TypesAndSettings::Index;                            \
-  using Hash = typename TypesAndSettings::Hash;                              \
-  using Key = typename TypesAndSettings::Key;                                \
-  using Seed = typename TypesAndSettings::Seed;                              \
-                                                                             \
-  /* Some more additions */                                                  \
-  using QueryInput = Key;                                                    \
-  using AddInput = typename ROCKSDB_NAMESPACE::ribbon::AddInputSelector<     \
-      Key, ResultRow, TypesAndSettings::kIsFilter>::T;                       \
-  static constexpr auto kCoeffBits =                                         \
-      static_cast<Index>(sizeof(CoeffRow) * 8U);                             \
-                                                                             \
-  /* Export to algorithm */                                                  \
-  static constexpr bool kFirstCoeffAlwaysOne =                               \
-      TypesAndSettings::kFirstCoeffAlwaysOne;                                \
-                                                                             \
-  static_assert(sizeof(CoeffRow) + sizeof(ResultRow) + sizeof(Index) +       \
-                        sizeof(Hash) + sizeof(Key) + sizeof(Seed) +          \
-                        sizeof(QueryInput) + sizeof(AddInput) + kCoeffBits + \
-                        kFirstCoeffAlwaysOne >                               \
-                    0,                                                       \
+#define IMPORT_RIBBON_TYPES_AND_SETTINGS(TypesAndSettings)                    \
+  using TS = TypesAndSettings;                                                \
+  /* For concept */                                                           \
+  using CoeffRow = typename TS::CoeffRow;                                     \
+  using ResultRow = typename TS::ResultRow;                                   \
+  using Index = typename TS::Index;                                           \
+  using Hash = typename TS::Hash;                                             \
+  using Key = typename TS::Key;                                               \
+  using Seed = typename TS::Seed;                                             \
+                                                                              \
+  /* Some more additions */                                                   \
+  using QueryInput = Key;                                                     \
+  using AddInput =                                                            \
+      typename ROCKSDB_NAMESPACE::ribbon::AddInputSelector<Key, ResultRow,    \
+                                                           TS::kIsFilter>::T; \
+  static constexpr auto kCoeffBits =                                          \
+      static_cast<Index>(sizeof(CoeffRow) * 8U);                              \
+                                                                              \
+  /* Export to algorithm */                                                   \
+  static constexpr bool kFirstCoeffAlwaysOne = TS::kFirstCoeffAlwaysOne;      \
+                                                                              \
+  static_assert(sizeof(CoeffRow) + sizeof(ResultRow) + sizeof(Index) +        \
+                        sizeof(Hash) + sizeof(Key) + sizeof(Seed) +           \
+                        sizeof(QueryInput) + sizeof(AddInput) + kCoeffBits +  \
+                        kFirstCoeffAlwaysOne >                                \
+                    0,                                                        \
                 "avoid unused warnings, semicolon expected after macro call")
 
 #ifdef _MSC_VER
@@ -167,7 +178,7 @@ class StandardHasher {
   IMPORT_RIBBON_TYPES_AND_SETTINGS(TypesAndSettings);
 
   inline Hash GetHash(const Key& key) const {
-    return TypesAndSettings::HashFn(key, raw_seed_);
+    return TS::HashFn(key, raw_seed_);
   };
   // For when AddInput == pair<Key, ResultRow> (kIsFilter == false)
   inline Hash GetHash(const std::pair<Key, ResultRow>& bi) const {
@@ -181,7 +192,7 @@ class StandardHasher {
     // appropriate range. This depends most, sometimes exclusively, on
     // upper bits of h.
     //
-    if (TypesAndSettings::kUseSmash) {
+    if (TS::kUseSmash) {
       // Extra logic to "smash" entries at beginning and end, for
       // better utilization. For example, without smash and with
       // kFirstCoeffAlwaysOne, there's about a 30% chance that the
@@ -218,7 +229,7 @@ class StandardHasher {
     //
     // When we might have many entries squeezed into a single start,
     // we need reasonably good remixing for CoeffRow.
-    if (TypesAndSettings::kUseSmash) {
+    if (TS::kUseSmash) {
       // Reasonably good, reasonably fast, reasonably general.
       // Probably not 1:1 but probably close enough.
       Unsigned128 a = Multiply64to128(h, kAltCoeffFactor1);
@@ -298,7 +309,7 @@ class StandardHasher {
     return static_cast<ResultRow>(~ResultRow{0});
   }
   inline ResultRow GetResultRowFromHash(Hash h) const {
-    if (TypesAndSettings::kIsFilter && !TypesAndSettings::kHomogeneous) {
+    if (TS::kIsFilter && !TS::kHomogeneous) {
       // This is not so much "critical path" code because it can be done in
       // parallel (instruction level) with memory lookup.
       //
@@ -440,6 +451,16 @@ template <class RehasherTypesAndSettings>
 using StandardRehasher =
     StandardHasher<StandardRehasherAdapter<RehasherTypesAndSettings>>;
 
+template <class RehasherTypesAndSettings>
+class StandardPrehasherAdapter : public RehasherTypesAndSettings {
+ public:
+  using Hash = typename RehasherTypesAndSettings::Hash;
+  using Key = Hash;
+  using Seed = typename RehasherTypesAndSettings::Seed;
+
+  static Hash HashFn(const Hash& input, Seed /*raw_seed*/) { return input; }
+};
+
 #ifdef _MSC_VER
 #pragma warning(pop)
 #endif
@@ -478,14 +499,14 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
 
   void Reset(Index num_slots, Index backtrack_size = 0) {
     if (num_slots == 0) {
-      // Unusual (TypesAndSettings::kAllowZeroStarts) or "uninitialized"
+      // Unusual (TS::kAllowZeroStarts) or "uninitialized"
       num_starts_ = 0;
     } else {
       // Normal
       assert(num_slots >= kCoeffBits);
       if (num_slots > num_slots_allocated_) {
         coeff_rows_.reset(new CoeffRow[num_slots]());
-        if (!TypesAndSettings::kHomogeneous) {
+        if (!TS::kHomogeneous) {
           // Note: don't strictly have to zero-init result_rows,
           // except possible information leakage, etc ;)
           result_rows_.reset(new ResultRow[num_slots]());
@@ -494,7 +515,7 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
       } else {
         for (Index i = 0; i < num_slots; ++i) {
           coeff_rows_[i] = 0;
-          if (!TypesAndSettings::kHomogeneous) {
+          if (!TS::kHomogeneous) {
             // Note: don't strictly have to zero-init result_rows,
             // except possible information leakage, etc ;)
             result_rows_[i] = 0;
@@ -523,14 +544,14 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   }
   inline void Prefetch(Index i) const {
     PREFETCH(&coeff_rows_[i], 1 /* rw */, 1 /* locality */);
-    if (!TypesAndSettings::kHomogeneous) {
+    if (!TS::kHomogeneous) {
       PREFETCH(&result_rows_[i], 1 /* rw */, 1 /* locality */);
     }
   }
   inline void LoadRow(Index i, CoeffRow* cr, ResultRow* rr,
                       bool for_back_subst) const {
     *cr = coeff_rows_[i];
-    if (TypesAndSettings::kHomogeneous) {
+    if (TS::kHomogeneous) {
       if (for_back_subst && *cr == 0) {
         // Cheap pseudorandom data to fill unconstrained solution rows
         *rr = static_cast<ResultRow>(i * 0x9E3779B185EBCA87ULL);
@@ -543,7 +564,7 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   }
   inline void StoreRow(Index i, CoeffRow cr, ResultRow rr) {
     coeff_rows_[i] = cr;
-    if (TypesAndSettings::kHomogeneous) {
+    if (TS::kHomogeneous) {
       assert(rr == 0);
     } else {
       result_rows_[i] = rr;
@@ -568,8 +589,8 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   //
   template <typename InputIterator>
   bool AddRange(InputIterator begin, InputIterator end) {
-    assert(num_starts_ > 0 || TypesAndSettings::kAllowZeroStarts);
-    if (TypesAndSettings::kAllowZeroStarts && num_starts_ == 0) {
+    assert(num_starts_ > 0 || TS::kAllowZeroStarts);
+    if (TS::kAllowZeroStarts && num_starts_ == 0) {
       // Unusual. Can't add any in this case.
       return begin == end;
     }
@@ -586,8 +607,8 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
   //
   template <typename InputIterator>
   bool AddRangeOrRollBack(InputIterator begin, InputIterator end) {
-    assert(num_starts_ > 0 || TypesAndSettings::kAllowZeroStarts);
-    if (TypesAndSettings::kAllowZeroStarts && num_starts_ == 0) {
+    assert(num_starts_ > 0 || TS::kAllowZeroStarts);
+    if (TS::kAllowZeroStarts && num_starts_ == 0) {
       // Unusual. Can't add any in this case.
       return begin == end;
     }
@@ -665,7 +686,7 @@ class StandardBanding : public StandardHasher<TypesAndSettings> {
 
     Seed cur_ordinal_seed = starting_ordinal_seed;
     do {
-      StandardHasher<TypesAndSettings>::SetOrdinalSeed(cur_ordinal_seed);
+      StandardHasher<TS>::SetOrdinalSeed(cur_ordinal_seed);
       Reset(num_slots);
       bool success = AddRange(begin, end);
       if (success) {
@@ -698,7 +719,7 @@ class InMemSimpleSolution {
   IMPORT_RIBBON_TYPES_AND_SETTINGS(TypesAndSettings);
 
   void PrepareForNumStarts(Index num_starts) {
-    if (TypesAndSettings::kAllowZeroStarts && num_starts == 0) {
+    if (TS::kAllowZeroStarts && num_starts == 0) {
       // Unusual
       num_starts_ = 0;
     } else {
@@ -727,7 +748,7 @@ class InMemSimpleSolution {
 
   template <typename BandingStorage>
   void BackSubstFrom(const BandingStorage& bs) {
-    if (TypesAndSettings::kAllowZeroStarts && bs.GetNumStarts() == 0) {
+    if (TS::kAllowZeroStarts && bs.GetNumStarts() == 0) {
       // Unusual
       PrepareForNumStarts(0);
     } else {
@@ -738,8 +759,8 @@ class InMemSimpleSolution {
 
   template <typename PhsfQueryHasher>
   ResultRow PhsfQuery(const Key& input, const PhsfQueryHasher& hasher) const {
-    // assert(!TypesAndSettings::kIsFilter);  Can be useful in testing
-    if (TypesAndSettings::kAllowZeroStarts && num_starts_ == 0) {
+    // assert(!TS::kIsFilter);  Can be useful in testing
+    if (TS::kAllowZeroStarts && num_starts_ == 0) {
       // Unusual
       return 0;
     } else {
@@ -750,8 +771,8 @@ class InMemSimpleSolution {
 
   template <typename FilterQueryHasher>
   bool FilterQuery(const Key& input, const FilterQueryHasher& hasher) const {
-    assert(TypesAndSettings::kIsFilter);
-    if (TypesAndSettings::kAllowZeroStarts && num_starts_ == 0) {
+    assert(TS::kIsFilter);
+    if (TS::kAllowZeroStarts && num_starts_ == 0) {
       // Unusual. Zero starts presumes no keys added -> always false
       return false;
     } else {
@@ -762,8 +783,8 @@ class InMemSimpleSolution {
   }
 
   double ExpectedFpRate() const {
-    assert(TypesAndSettings::kIsFilter);
-    if (TypesAndSettings::kAllowZeroStarts && num_starts_ == 0) {
+    assert(TS::kIsFilter);
+    if (TS::kAllowZeroStarts && num_starts_ == 0) {
       // Unusual, but we don't have FPs if we always return false.
       return 0.0;
     }
@@ -783,7 +804,7 @@ class InMemSimpleSolution {
     // Must be at least kCoeffBits for at least one start
     // Or if not smash, even more because hashing not equipped
     // for stacking up so many entries on a single start location
-    auto min_slots = kCoeffBits * (TypesAndSettings::kUseSmash ? 1 : 2);
+    auto min_slots = kCoeffBits * (TS::kUseSmash ? 1 : 2);
     return std::max(num_slots, static_cast<Index>(min_slots));
   }
 
@@ -804,7 +825,6 @@ class InMemSimpleSolution {
 // The structure is passed an externally allocated/de-allocated byte buffer
 // that is optionally pre-populated (from storage) for answering queries,
 // or can be populated by BackSubstFrom.
-//
 template <class TypesAndSettings>
 class SerializableInterleavedSolution {
  public:
@@ -829,9 +849,21 @@ class SerializableInterleavedSolution {
     return num_slots / kCoeffBits;
   }
 
-  Index GetUpperNumColumns() const { return upper_num_columns_; }
+  Index GetUpperNumColumns() const {
+    if (TS::kFixedNumColumns > 0) {
+      return TS::kFixedNumColumns;
+    } else {
+      return upper_num_columns_;
+    }
+  }
 
-  Index GetUpperStartBlock() const { return upper_start_block_; }
+  Index GetUpperStartBlock() const {
+    if (TS::kFixedNumColumns > 0) {
+      return 0;
+    } else {
+      return upper_start_block_;
+    }
+  }
 
   Index GetNumSegments() const {
     return static_cast<Index>(data_len_ / sizeof(CoeffRow));
@@ -878,7 +910,7 @@ class SerializableInterleavedSolution {
 
   template <typename BandingStorage>
   void BackSubstFrom(const BandingStorage& bs) {
-    if (TypesAndSettings::kAllowZeroStarts && bs.GetNumStarts() == 0) {
+    if (TS::kAllowZeroStarts && bs.GetNumStarts() == 0) {
       // Unusual
       PrepareForNumStarts(0);
     } else {
@@ -889,8 +921,8 @@ class SerializableInterleavedSolution {
 
   template <typename PhsfQueryHasher>
   ResultRow PhsfQuery(const Key& input, const PhsfQueryHasher& hasher) const {
-    // assert(!TypesAndSettings::kIsFilter);  Can be useful in testing
-    if (TypesAndSettings::kAllowZeroStarts && num_starts_ == 0) {
+    // assert(!TS::kIsFilter);  Can be useful in testing
+    if (TS::kAllowZeroStarts && num_starts_ == 0) {
       // Unusual
       return 0;
     } else {
@@ -909,8 +941,8 @@ class SerializableInterleavedSolution {
 
   template <typename FilterQueryHasher>
   bool FilterQuery(const Key& input, const FilterQueryHasher& hasher) const {
-    assert(TypesAndSettings::kIsFilter);
-    if (TypesAndSettings::kAllowZeroStarts && num_starts_ == 0) {
+    assert(TS::kIsFilter);
+    if (TS::kAllowZeroStarts && num_starts_ == 0) {
       // Unusual. Zero starts presumes no keys added -> always false
       return false;
     } else {
@@ -929,21 +961,25 @@ class SerializableInterleavedSolution {
   }
 
   double ExpectedFpRate() const {
-    assert(TypesAndSettings::kIsFilter);
-    if (TypesAndSettings::kAllowZeroStarts && num_starts_ == 0) {
+    assert(TS::kIsFilter);
+    if (TS::kAllowZeroStarts && num_starts_ == 0) {
       // Unusual. Zero starts presumes no keys added -> always false
       return 0.0;
+    } else if (TS::kFixedNumColumns > 0) {
+      // Fixed number of columns.
+      // Each result (solution) bit (column) cuts FP rate in half.
+      return std::pow(0.5, TS::kFixedNumColumns);
+    } else {
+      // Normal: flexible number of columns
+      // Note: Ignoring smash setting; still close enough in that case
+      double lower_portion =
+          (upper_start_block_ * 1.0 * kCoeffBits) / num_starts_;
+
+      // Each result (solution) bit (column) cuts FP rate in half. Weight that
+      // for upper and lower number of bits (columns).
+      return lower_portion * std::pow(0.5, upper_num_columns_ - 1) +
+             (1.0 - lower_portion) * std::pow(0.5, upper_num_columns_);
     }
-    // else Normal
-
-    // Note: Ignoring smash setting; still close enough in that case
-    double lower_portion =
-        (upper_start_block_ * 1.0 * kCoeffBits) / num_starts_;
-
-    // Each result (solution) bit (column) cuts FP rate in half. Weight that
-    // for upper and lower number of bits (columns).
-    return lower_portion * std::pow(0.5, upper_num_columns_ - 1) +
-           (1.0 - lower_portion) * std::pow(0.5, upper_num_columns_);
   }
 
   // ********************************************************************
@@ -959,7 +995,7 @@ class SerializableInterleavedSolution {
     // Do not use num_starts==1 unless kUseSmash, because the hashing
     // might not be equipped for stacking up so many entries on a
     // single start location.
-    if (!TypesAndSettings::kUseSmash && corrected == kCoeffBits) {
+    if (!TS::kUseSmash && corrected == kCoeffBits) {
       corrected += kCoeffBits;
     }
     return corrected;
@@ -975,7 +1011,7 @@ class SerializableInterleavedSolution {
     // Do not use num_starts==1 unless kUseSmash, because the hashing
     // might not be equipped for stacking up so many entries on a
     // single start location.
-    if (!TypesAndSettings::kUseSmash && corrected == kCoeffBits) {
+    if (!TS::kUseSmash && corrected == kCoeffBits) {
       corrected = 0;
     }
     return corrected;
@@ -1007,8 +1043,8 @@ class SerializableInterleavedSolution {
                                           double desired_fp_rate,
                                           double desired_one_in_fp_rate,
                                           uint32_t rounding_bias32) {
-    assert(TypesAndSettings::kIsFilter);
-    if (TypesAndSettings::kAllowZeroStarts) {
+    assert(TS::kIsFilter);
+    if (TS::kAllowZeroStarts) {
       if (num_slots == 0) {
         // Unusual. Zero starts presumes no keys added -> always false (no FPs)
         return 0U;
@@ -1062,7 +1098,7 @@ class SerializableInterleavedSolution {
       }
     } else {
       // Effectively asking for 100% FP rate, or NaN etc.
-      if (TypesAndSettings::kAllowZeroStarts) {
+      if (TS::kAllowZeroStarts) {
         // Zero segments
         return 0U;
       } else {
@@ -1076,7 +1112,10 @@ class SerializableInterleavedSolution {
     const Index num_blocks = GetNumBlocks();
     Index num_segments = GetNumSegments();
 
-    if (num_blocks == 0) {
+    if (TS::kFixedNumColumns > 0) {
+      assert(num_blocks * TS::kFixedNumColumns <= num_segments);
+      num_segments = num_blocks * TS::kFixedNumColumns;
+    } else if (num_blocks == 0) {
       // Exceptional
       upper_num_columns_ = 0;
       upper_start_block_ = 0;
@@ -1105,6 +1144,232 @@ class SerializableInterleavedSolution {
   Index num_starts_ = 0;
   Index upper_num_columns_ = 0;
   Index upper_start_block_ = 0;
+};
+
+template <class TypesAndSettings, size_t kBitsPerVshard>
+class BalancedHasher : public StandardHasher<TypesAndSettings> {
+ public:
+  IMPORT_RIBBON_TYPES_AND_SETTINGS(TypesAndSettings);
+
+  BalancedHasher(Index log2_vshards, const char* metadata)
+      : log2_vshards_(log2_vshards), metadata_(metadata) {
+    assert(log2_vshards > 0);
+  }
+
+  inline void PreprocessHash(Hash* h, size_t* bucket, size_t* vshard) const {
+    static_assert(sizeof(Hash) == 8, "Requires 64-bit hash");
+    static_assert(kBitsPerVshard % 2 == 0, "Requires even kBitsPerVshard");
+
+    Hash orig_h = *h;
+
+    // Relocate 1/8th of upper half to lower half (determined by lowest bits)
+    Hash new_h = orig_h & ~(uint64_t{(orig_h & 7U) == 7U} << 63);
+    *h = new_h;
+
+    // Bucket odd/even determined by next lowest bits
+    // 3/8ths of keys assigned to odd buckets
+    bool odd = (orig_h & (7U * 8U)) < (3U * 8U);
+
+    // Bucket finally determined by next lowest bits
+    // size_t tzcount = static_cast<size_t>(CountTrailingZeroBits((orig_h >> 6)
+    // | (Hash{1} << (kBitsPerVshard / 2 - 1))));
+    size_t tzcount = static_cast<size_t>(CountTrailingZeroBits(orig_h >> 6) %
+                                         (kBitsPerVshard / 2));
+    *bucket = tzcount * 2 + odd;
+    assert(*bucket < kBitsPerVshard);
+
+    // Vshard determined by highest bits (to match GetStart ordering)
+    *vshard = static_cast<size_t>(new_h >> (64 - log2_vshards_));
+  }
+
+  inline Hash GetBaseHash(const Key& key) const {
+    return StandardHasher<TS>::GetHash(key);
+  }
+
+  inline Hash BumpHash(Hash h) const {
+    static_assert(sizeof(Hash) == 8, "Requires 64-bit hash");
+    // Increase number of leading ones by one, and remix what's below that
+    // FIXME: clz API
+    int lz = __builtin_clzl(~h);
+    Hash hh = h * 0x9e3779b97f4a7c13 * 0x9e3779b97f4a7c13 |
+              (uint64_t{lz < log2_vshards_} << 63);
+    Hash rv = ~(hh >> std::min(lz + 1, log2_vshards_));
+    // fprintf(stderr, "Bumping %016llx to %016llx\n", (long long)h, (long
+    // long)rv);
+    return rv;
+  }
+
+  inline Hash GetHash(const Key& key) const {
+    Hash h = GetBaseHash(key);
+    size_t bucket;
+    size_t vshard;
+    PreprocessHash(&h, &bucket, &vshard);
+    // Lookup metadata
+    size_t bit_index = vshard * kBitsPerVshard + bucket;
+    bool bumped = (metadata_[bit_index / 8] & (int{1} << (bit_index % 8))) != 0;
+    // Maybe bump, and always bitwise NOT
+    Hash bumped_hash = BumpHash(h);
+    return bumped ? bumped_hash : h;
+  }
+
+  // For when AddInput == pair<Key, ResultRow> (kIsFilter == false)
+  inline Hash GetBaseHash(const std::pair<Key, ResultRow>& bi) const {
+    return GetBaseHash(bi.first);
+  };
+  inline Hash GetHash(const std::pair<Key, ResultRow>& bi) const {
+    return GetHash(bi.first);
+  };
+
+  inline Index GetLog2Vshards() const { return log2_vshards_; }
+  inline const char* GetMetadata() const { return metadata_; }
+  inline Index GetMetadataLength() const {
+    return static_cast<Index>(((kBitsPerVshard << log2_vshards_) + 7U) / 8U);
+  }
+
+ protected:
+  BalancedHasher() {}
+  int log2_vshards_ = 0;
+  const char* metadata_ = nullptr;
+};
+
+template <class TypesAndSettings, size_t kBitsPerVshard>
+class BalancedBanding
+    : public BalancedHasher<TypesAndSettings, kBitsPerVshard> {
+ public:
+  IMPORT_RIBBON_TYPES_AND_SETTINGS(TypesAndSettings);
+  BalancedBanding(int log2_vshards) { BalancerReset(log2_vshards); }
+
+  void BalancerReset(int log2_vshards) {
+    vshard_buckets_.reset(
+        new std::array<std::deque<Hash>, kBitsPerVshard>[size_t{1}
+                                                         << log2_vshards]);
+    count_ = 0;
+    // Hasher
+    this->log2_vshards_ = log2_vshards;
+    mutable_metadata_.reset(new char[this->GetMetadataLength()]{});
+    this->metadata_ = mutable_metadata_.get();
+  }
+
+  // FIXME: PHSF support
+  void BalancerAdd(const AddInput& input) {
+    // Skip metadata check for bumped
+    Hash h = this->GetBaseHash(input);
+
+    size_t bucket;
+    size_t vshard;
+    this->PreprocessHash(&h, &bucket, &vshard);
+
+    // Save preprocessed hash
+    vshard_buckets_[vshard][bucket].push_back(h);
+    ++count_;
+  }
+
+  template <typename InputIterator>
+  void BalancerAddRange(InputIterator begin, InputIterator end) {
+    for (auto cur = begin; cur != end; ++cur) {
+      BalancerAdd(*cur);
+    }
+  }
+
+  size_t GetBalancerCount() { return count_; }
+
+  bool Balance(Index num_slots) {
+    if (count_ > num_slots) {
+      return false;
+    }
+    const int log2_vshards = this->log2_vshards_;
+    const Index max_to_vshard = (num_slots >> log2_vshards) + kCoeffBits;
+    banding_.Reset(num_slots, /*backtrack size*/ max_to_vshard);
+
+    const Index vshards = Index{1} << log2_vshards;
+    const Index vshards_mask = vshards - 1;
+    std::unique_ptr<Index[]> added_to_vshards(new Index[vshards]{});
+
+    // Index rem_entries_overall = static_cast<Index>(count_);
+    for (int level = 0; level <= log2_vshards; ++level) {
+      Index level_vshard_begin = (~vshards_mask >> level) & vshards_mask;
+      Index level_vshard_end =
+          level_vshard_begin +
+          (Index{1} << std::max(0, log2_vshards - 1 - level));
+
+      // Index rem_slots_overall = static_cast<Index>((uint64_t{vshards -
+      // vshard} * num_slots) >> this->log2_vshards_); if (rem_entries_overall >
+      // rem_slots_overall) {
+      //  return false;
+      //}
+      // fprintf(stderr, "Level %u [%u,%u)\n", (unsigned)level,
+      // (unsigned)level_vshard_begin, (unsigned)level_vshard_end);
+
+      for (Index bucket = 0; bucket < kBitsPerVshard; ++bucket) {
+        for (Index vshard = level_vshard_begin; vshard < level_vshard_end;
+             ++vshard) {
+          Index& vshard_added = added_to_vshards[vshard];
+          // fprintf(stderr, "Vshard %u starting rem %u\n", (unsigned)vshard,
+          //        (unsigned)rem_vshard);
+          const std::deque<Hash>& entries = vshard_buckets_[vshard][bucket];
+          if (vshard_added + entries.size() <= max_to_vshard &&
+              banding_.AddRangeOrRollBack(entries.begin(), entries.end())) {
+            vshard_added += entries.size();
+            /*
+            fprintf(stderr, "Added %zu from vshard %u bucket %u\n",
+            entries.size(), (unsigned)vshard, (unsigned)bucket);
+                    */
+          } else {
+            // bump, recording that fact
+            size_t bit_index = vshard * kBitsPerVshard + bucket;
+            mutable_metadata_[bit_index / 8] |=
+                static_cast<char>(1 << (bit_index % 8));
+            for (Hash h : entries) {
+              Hash bh = this->BumpHash(h);
+              if (!banding_.Add(bh)) {
+                fprintf(stderr, "Failed on vshard %u bucket %u\n",
+                        (unsigned)vshard, (unsigned)bucket);
+                return false;
+              }
+              added_to_vshards[static_cast<size_t>(bh >>
+                                                   (64 - log2_vshards))]++;
+            }
+            /*
+            fprintf(stderr, "Bumped %zu from bucket %u\n", entries.size(),
+                    (unsigned)bucket);
+            */
+          }
+          /*
+        if (bucket == kBitsPerVshard - 1) {
+          fprintf(stderr, "Vshard %u added %u / %g\n", (unsigned)vshard,
+                  (unsigned)vshard_added,
+                  (double)num_slots / vshards);
+        }
+                  */
+        }
+      }
+    }
+    Index total_added = 0;
+    for (Index vshard = 0; vshard < vshards; ++vshard) {
+      total_added += added_to_vshards[vshard];
+    }
+    fprintf(stderr, "Total added: %u\n", (unsigned)total_added);
+    return true;
+  }
+
+  // Pass-thu concept BandingStorage
+  inline bool UsePrefetch() const { return banding_.UsePrefetch(); }
+  inline void Prefetch(Index i) const { banding_.Prefetch(i); }
+  inline void LoadRow(Index i, CoeffRow* cr, ResultRow* rr,
+                      bool for_back_subst) const {
+    banding_.LoadRow(i, cr, rr, for_back_subst);
+  }
+  inline void StoreRow(Index i, CoeffRow cr, ResultRow rr) {
+    banding_.StoreRow(i, cr, rr);
+  }
+  inline Index GetNumStarts() const { return banding_.GetNumStarts(); }
+
+ protected:
+  StandardBanding<StandardPrehasherAdapter<TS>> banding_;
+  std::unique_ptr<char[]> mutable_metadata_;
+  std::unique_ptr<std::array<std::deque<Hash>, kBitsPerVshard>[]>
+      vshard_buckets_;
+  size_t count_;
 };
 
 }  // namespace ribbon

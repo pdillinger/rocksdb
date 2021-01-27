@@ -1189,27 +1189,25 @@ inline bool InterleavedFilterQuery(
   const CoeffRow cr = hasher.GetCoeffRow(hash);
   const ResultRow expected = hasher.GetResultRowFromHash(hash);
 
-  // TODO: consider optimizations such as
-  // * get rid of start_bit == 0 condition with careful fetching & shifting
-  if (start_bit == 0) {
-    for (Index i = 0; i < num_columns; ++i) {
-      if (BitParity(iss.LoadSegment(segment_num + i) & cr) !=
-          (static_cast<int>(expected >> i) & 1)) {
-        return false;
-      }
-    }
-  } else {
-    const CoeffRow cr_left = cr << static_cast<unsigned>(start_bit);
-    const CoeffRow cr_right =
-        cr >> static_cast<unsigned>(kCoeffBits - start_bit);
+  // A direct implementation would have 'if (start_bit == 0)' but
+  // we want to avoid conditional branches for fast queries. So we
+  // always use two memory loads but they might be to the same
+  // address.
+  const CoeffRow cr_left = cr << static_cast<unsigned>(start_bit);
+  // We have to do something to accommodate the start_bit == 0 case
+  // because shifting by kCoeffBits is undefined
+  const CoeffRow cr_right =
+      cr >> static_cast<unsigned>((kCoeffBits - start_bit) % kCoeffBits);
+  // This determines whether our two memory loads are to different
+  // addresses (common) or the same address (1/kCoeffBits chance)
+  const Index maybe_num_columns = (start_bit != 0) * num_columns;
 
-    for (Index i = 0; i < num_columns; ++i) {
-      CoeffRow soln_data =
-          (iss.LoadSegment(segment_num + i) & cr_left) ^
-          (iss.LoadSegment(segment_num + num_columns + i) & cr_right);
-      if (BitParity(soln_data) != (static_cast<int>(expected >> i) & 1)) {
-        return false;
-      }
+  for (Index i = 0; i < num_columns; ++i) {
+    CoeffRow soln_data =
+        (iss.LoadSegment(segment_num + i) & cr_left) |
+        (iss.LoadSegment(segment_num + maybe_num_columns + i) & cr_right);
+    if (BitParity(soln_data) != (static_cast<int>(expected >> i) & 1)) {
+      return false;
     }
   }
   // otherwise, all match
