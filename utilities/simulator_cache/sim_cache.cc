@@ -249,9 +249,16 @@ class SimCacheImpl : public SimCache {
     key_only_cache_->DisownData();
   }
 
-  void ApplyToAllCacheEntries(void (*callback)(void*, size_t),
+  void ApplyToAllCacheEntries(void (*callback)(void* value, size_t charge),
                               bool thread_safe) override {
     // only apply to _cache since key_only_cache doesn't hold value
+    cache_->ApplyToAllCacheEntries(callback, thread_safe);
+  }
+
+  void ApplyToAllCacheEntries(void (*callback)(const Slice& key, void* value,
+                                               size_t charge,
+                                               DeleterFn deleter),
+                              bool thread_safe) override {
     cache_->ApplyToAllCacheEntries(callback, thread_safe);
   }
 

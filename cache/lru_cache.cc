@@ -137,11 +137,31 @@ void LRUCacheShard::EraseUnRefEntries() {
   }
 }
 
-void LRUCacheShard::ApplyToAllCacheEntries(void (*callback)(void*, size_t),
+void LRUCacheShard::ApplyToAllCacheEntries(void (*callback)(void* value,
+                                                            size_t charge),
                                            bool thread_safe) {
   const auto applyCallback = [&]() {
     table_.ApplyToAllCacheEntries(
         [callback](LRUHandle* h) { callback(h->value, h->charge); });
+  };
+
+  if (thread_safe) {
+    MutexLock l(&mutex_);
+    applyCallback();
+  } else {
+    applyCallback();
+  }
+}
+
+void LRUCacheShard::ApplyToAllCacheEntries(void (*callback)(const Slice& key,
+                                                            void* value,
+                                                            size_t charge,
+                                                            DeleterFn deleter),
+                                           bool thread_safe) {
+  const auto applyCallback = [&]() {
+    table_.ApplyToAllCacheEntries([callback](LRUHandle* h) {
+      callback(h->key(), h->value, h->charge, h->deleter);
+    });
   };
 
   if (thread_safe) {

@@ -49,7 +49,7 @@ namespace ROCKSDB_NAMESPACE {
 
 struct LRUHandle {
   void* value;
-  void (*deleter)(const Slice&, void* value);
+  Cache::DeleterFn deleter;
   LRUHandle* next_hash;
   LRUHandle* next;
   LRUHandle* prev;
@@ -209,8 +209,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
 
   // Like Cache methods, but with an extra "hash" parameter.
   virtual Status Insert(const Slice& key, uint32_t hash, void* value,
-                        size_t charge,
-                        void (*deleter)(const Slice& key, void* value),
+                        size_t charge, Cache::DeleterFn deleter,
                         Cache::Handle** handle,
                         Cache::Priority priority) override;
   virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash) override;
@@ -226,7 +225,13 @@ class ALIGN_AS(CACHE_LINE_SIZE) LRUCacheShard final : public CacheShard {
   virtual size_t GetUsage() const override;
   virtual size_t GetPinnedUsage() const override;
 
-  virtual void ApplyToAllCacheEntries(void (*callback)(void*, size_t),
+  virtual void ApplyToAllCacheEntries(void (*callback)(void* value,
+                                                       size_t charge),
+                                      bool thread_safe) override;
+  virtual void ApplyToAllCacheEntries(void (*callback)(const Slice& key,
+                                                       void* value,
+                                                       size_t charge,
+                                                       DeleterFn deleter),
                                       bool thread_safe) override;
 
   virtual void EraseUnRefEntries() override;

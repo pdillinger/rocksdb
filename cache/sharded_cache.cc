@@ -44,8 +44,8 @@ void ShardedCache::SetStrictCapacityLimit(bool strict_capacity_limit) {
 }
 
 Status ShardedCache::Insert(const Slice& key, void* value, size_t charge,
-                            void (*deleter)(const Slice& key, void* value),
-                            Handle** handle, Priority priority) {
+                            DeleterFn deleter, Handle** handle,
+                            Priority priority) {
   uint32_t hash = HashSlice(key);
   return GetShard(Shard(hash))
       ->Insert(key, hash, value, charge, deleter, handle, priority);
@@ -109,7 +109,19 @@ size_t ShardedCache::GetPinnedUsage() const {
   return usage;
 }
 
-void ShardedCache::ApplyToAllCacheEntries(void (*callback)(void*, size_t),
+void ShardedCache::ApplyToAllCacheEntries(void (*callback)(void* value,
+                                                           size_t charge),
+                                          bool thread_safe) {
+  int num_shards = 1 << num_shard_bits_;
+  for (int s = 0; s < num_shards; s++) {
+    GetShard(s)->ApplyToAllCacheEntries(callback, thread_safe);
+  }
+}
+
+void ShardedCache::ApplyToAllCacheEntries(void (*callback)(const Slice& key,
+                                                           void* value,
+                                                           size_t charge,
+                                                           DeleterFn deleter),
                                           bool thread_safe) {
   int num_shards = 1 << num_shard_bits_;
   for (int s = 0; s < num_shards; s++) {

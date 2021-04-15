@@ -284,7 +284,11 @@ class ClockCacheShard final : public CacheShard {
   size_t GetUsage() const override;
   size_t GetPinnedUsage() const override;
   void EraseUnRefEntries() override;
-  void ApplyToAllCacheEntries(void (*callback)(void*, size_t),
+  void ApplyToAllCacheEntries(void (*callback)(void* value, size_t charge),
+                              bool thread_safe) override;
+  void ApplyToAllCacheEntries(void (*callback)(const Slice& key, void* value,
+                                               size_t charge,
+                                               DeleterFn deleter),
                               bool thread_safe) override;
 
  private:
@@ -404,7 +408,8 @@ size_t ClockCacheShard::GetPinnedUsage() const {
   return pinned_usage_.load(std::memory_order_relaxed);
 }
 
-void ClockCacheShard::ApplyToAllCacheEntries(void (*callback)(void*, size_t),
+void ClockCacheShard::ApplyToAllCacheEntries(void (*callback)(void* value,
+                                                              size_t charge),
                                              bool thread_safe) {
   if (thread_safe) {
     mutex_.Lock();
@@ -415,6 +420,26 @@ void ClockCacheShard::ApplyToAllCacheEntries(void (*callback)(void*, size_t),
     uint32_t flags = handle.flags.load(std::memory_order_relaxed);
     if (InCache(flags)) {
       callback(handle.value, handle.charge);
+    }
+  }
+  if (thread_safe) {
+    mutex_.Unlock();
+  }
+}
+
+void ClockCacheShard::ApplyToAllCacheEntries(
+    void (*callback)(const Slice& key, void* value, size_t charge,
+                     DeleterFn deleter),
+    bool thread_safe) {
+  if (thread_safe) {
+    mutex_.Lock();
+  }
+  for (auto& handle : list_) {
+    // Use relaxed semantics instead of acquire semantics since we are either
+    // holding mutex, or don't have thread safe requirement.
+    uint32_t flags = handle.flags.load(std::memory_order_relaxed);
+    if (InCache(flags)) {
+      callback(handle.key, handle.value, handle.charge, handle.deleter);
     }
   }
   if (thread_safe) {

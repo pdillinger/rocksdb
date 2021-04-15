@@ -24,9 +24,9 @@ class CacheShard {
   CacheShard() = default;
   virtual ~CacheShard() = default;
 
+  using DeleterFn = Cache::DeleterFn;
   virtual Status Insert(const Slice& key, uint32_t hash, void* value,
-                        size_t charge,
-                        void (*deleter)(const Slice& key, void* value),
+                        size_t charge, DeleterFn deleter,
                         Cache::Handle** handle, Cache::Priority priority) = 0;
   virtual Cache::Handle* Lookup(const Slice& key, uint32_t hash) = 0;
   virtual bool Ref(Cache::Handle* handle) = 0;
@@ -36,7 +36,13 @@ class CacheShard {
   virtual void SetStrictCapacityLimit(bool strict_capacity_limit) = 0;
   virtual size_t GetUsage() const = 0;
   virtual size_t GetPinnedUsage() const = 0;
-  virtual void ApplyToAllCacheEntries(void (*callback)(void*, size_t),
+  virtual void ApplyToAllCacheEntries(void (*callback)(void* value,
+                                                       size_t charge),
+                                      bool thread_safe) = 0;
+  virtual void ApplyToAllCacheEntries(void (*callback)(const Slice& key,
+                                                       void* value,
+                                                       size_t charge,
+                                                       DeleterFn deleter),
                                       bool thread_safe) = 0;
   virtual void EraseUnRefEntries() = 0;
   virtual std::string GetPrintableOptions() const { return ""; }
@@ -70,8 +76,8 @@ class ShardedCache : public Cache {
   virtual void SetStrictCapacityLimit(bool strict_capacity_limit) override;
 
   virtual Status Insert(const Slice& key, void* value, size_t charge,
-                        void (*deleter)(const Slice& key, void* value),
-                        Handle** handle, Priority priority) override;
+                        DeleterFn deleter, Handle** handle,
+                        Priority priority) override;
   virtual Handle* Lookup(const Slice& key, Statistics* stats) override;
   virtual bool Ref(Handle* handle) override;
   virtual bool Release(Handle* handle, bool force_erase = false) override;
@@ -82,7 +88,13 @@ class ShardedCache : public Cache {
   virtual size_t GetUsage() const override;
   virtual size_t GetUsage(Handle* handle) const override;
   virtual size_t GetPinnedUsage() const override;
-  virtual void ApplyToAllCacheEntries(void (*callback)(void*, size_t),
+  virtual void ApplyToAllCacheEntries(void (*callback)(void* value,
+                                                       size_t charge),
+                                      bool thread_safe) override;
+  virtual void ApplyToAllCacheEntries(void (*callback)(const Slice& key,
+                                                       void* value,
+                                                       size_t charge,
+                                                       DeleterFn deleter),
                                       bool thread_safe) override;
   virtual void EraseUnRefEntries() override;
   virtual std::string GetPrintableOptions() const override;
