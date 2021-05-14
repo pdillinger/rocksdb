@@ -19,8 +19,10 @@
 #include <nmmintrin.h>
 #include <wmmintrin.h>
 #endif
+
 #include "port/lang.h"
 #include "util/coding.h"
+#include "util/math.h"
 
 #include "util/crc32c_arm64.h"
 
@@ -1283,7 +1285,31 @@ uint32_t Extend(uint32_t crc, const char* buf, size_t size) {
 }
 
 
-// The code for crc32c combine
+// The code for crc32c combine, copied with permission from folly
+
+// Standard galois-field multiply.  The only modification is that a,
+// b, m, and p are all bit-reflected.
+//
+// https://en.wikipedia.org/wiki/Finite_field_arithmetic
+static constexpr uint32_t gf_multiply_sw_1(
+    size_t i, uint32_t p, uint32_t a, uint32_t b, uint32_t m) {
+  // clang-format off
+  return i == 32 ? p : gf_multiply_sw_1(
+      /* i = */ i + 1,
+      /* p = */ p ^ (-((b >> 31) & 1) & a),
+      /* a = */ (a >> 1) ^ (-(a & 1) & m),
+      /* b = */ b << 1,
+      /* m = */ m);
+  // clang-format on
+}
+static constexpr uint32_t gf_multiply_sw(uint32_t a, uint32_t b, uint32_t m) {
+  return gf_multiply_sw_1(/* i = */ 0, /* p = */ 0, a, b, m);
+}
+
+static constexpr uint32_t gf_square_sw(uint32_t a, uint32_t m) {
+  return gf_multiply_sw(a, a, m);
+}
+
 template <size_t i, uint32_t m>
 struct gf_powers_memo {
   static constexpr uint32_t value =
@@ -1314,55 +1340,10 @@ struct gf_powers_make {
   template <size_t... i>
   using index_sequence = integer_sequence<size_t, i...>;
   template <size_t... i>
-  constexpr auto operator()(index_sequence<i...>) const {
+  constexpr std::array<uint32_t, sizeof...(i)> operator()(index_sequence<i...>) const {
     return std::array<uint32_t, sizeof...(i)>{{gf_powers_memo<i, m>::value...}};
   }
 };
-
-struct to_signed {
-  template <typename..., typename T>
-  constexpr auto operator()(T const& t) const noexcept ->
-      typename std::make_signed<T>::type {
-    using S = typename std::make_signed<T>::type;
-    // note: static_cast<S>(t) would be more straightforward, but it would also
-    // be implementation-defined behavior and that is typically to be avoided;
-    // the following code optimized into the same thing, though
-    return static_cast<T>(std::numeric_limits<S>::max()) < t ? -static_cast<S>(~t) + S{-1} : static_cast<S>(t);
-  }
-};
-
-struct to_unsigned {
-  template <typename..., typename T>
-  constexpr auto operator()(T const& t) const noexcept ->
-      typename std::make_unsigned<T>::type {
-    using U = typename std::make_unsigned<T>::type;
-    return static_cast<U>(t);
-  }
-};
-
-template <typename Dst, typename Src>
-constexpr std::make_signed<Dst> bits_to_signed(Src const s) {
-  static_assert(std::is_signed<Dst>::value, "unsigned type");
-  return to_signed(static_cast<std::make_unsigned<Dst>>(to_unsigned(s)));
-}
-
-template <typename T>
-inline constexpr unsigned int findFirstSet(T const v) {
-  using S0 = int;
-  using S1 = long int;
-  using S2 = long long int;
-  static_assert(sizeof(T) <= sizeof(S2), "over-sized type");
-  static_assert(std::is_integral<T>::value, "non-integral type");
-  static_assert(!std::is_same<T, bool>::value, "bool type");
-
-  // clang-format off
-  return static_cast<unsigned int>(
-      sizeof(T) <= sizeof(S0) ? __builtin_ffs(bits_to_signed<S0>(v)) :
-      sizeof(T) <= sizeof(S1) ? __builtin_ffsl(bits_to_signed<S1>(v)) :
-      sizeof(T) <= sizeof(S2) ? __builtin_ffsll(bits_to_signed<S2>(v)) :
-      0);
-  // clang-format on
-}
 
 static constexpr uint32_t crc32c_m = 0x82f63b78;
 
@@ -1396,7 +1377,7 @@ static uint32_t Crc32AppendZeroes(
 
   while (len) {
     // Advance directly to next bit set.
-    auto r = findFirstSet(len) - 1;
+    auto r = CountTrailingZeroBits(len);
     len >>= r;
     powers += r;
 
@@ -1413,10 +1394,14 @@ uint32_t Crc32cCombine(uint32_t crc1, uint32_t crc2, size_t crc2len) {
   // Append up to 32 bits of zeroes in the normal way
   char data[4] = {0, 0, 0, 0};
   auto len = crc2len & 3;
+  uint32_t crc0 = 0;
   if (len) {
     crc1 = crc32c::Extend(crc1, data, len);
+    crc0 = crc32c::Extend(crc0, data, len);
   }
-  return crc2 ^ Crc32AppendZeroes(crc1, crc2len, crc32c_m, crc32c_powers);
+  // Note: bitwise not to translate between "pure" crc form and inverted
+  // form (our preferred)
+  return ~(~crc2 ^ Crc32AppendZeroes(~crc0, crc2len, crc32c_m, crc32c_powers) ^ Crc32AppendZeroes(~crc1, crc2len, crc32c_m, crc32c_powers));
 }
 
 }  // namespace crc32c
