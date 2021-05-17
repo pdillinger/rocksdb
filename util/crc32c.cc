@@ -11,7 +11,6 @@
 // four bytes at a time.
 #include "util/crc32c.h"
 
-#include <bits/stdint-uintn.h>
 #include <stdint.h>
 
 #include <array>
