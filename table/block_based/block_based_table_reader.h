@@ -19,8 +19,8 @@
 #include "table/table_properties_internal.h"
 #include "table/table_reader.h"
 #include "table/two_level_iterator.h"
-
 #include "trace_replay/block_cache_tracer.h"
+#include "util/uuid.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -460,26 +460,29 @@ class BlockBasedTable : public TableReader {
   static void GenerateCachePrefix(TCache* cc, TFile* file, char* buffer,
                                   size_t* size,
                                   const std::string& db_session_id,
-                                  uint64_t cur_file_num) {
+                                  uint64_t file_num) {
+    assert(cc != nullptr);
+
     // generate an id from the file
     *size = file->GetUniqueId(buffer, kMaxCacheKeyPrefixSize);
 
     // If the prefix wasn't generated or was too long,
-    // create one based on the DbSessionId and curent file number if they
+    // create one based on the DbSessionId and file number if they
     // are set. Otherwise, created from NewId()
-    if (cc != nullptr && *size == 0) {
-      if (db_session_id.size() == 20) {
-        // db_session_id is 20 bytes as defined.
-        memcpy(buffer, db_session_id.c_str(), 20);
-        char* end;
-        if (cur_file_num != 0) {
-          end = EncodeVarint64(buffer + 20, cur_file_num);
-        } else {
-          end = EncodeVarint64(buffer + 20, cc->NewId());
-        }
-        // kMaxVarint64Length is 10 therefore, the prefix is at most 30 bytes.
-        *size = static_cast<size_t>(end - buffer);
+    if (*size == 0) {
+      RocksMuid muid;
+      Status s = RocksMuid::Parse(db_session_id, &muid);
+      if (s.ok()) {
+        // Combine the muid for session id with file number. muid.scaled_data
+        // essentially uses the upper-most 103+ bits of Unsigned128, so the
+        // best way to preserve file number is direct addition. (File numbers
+        // up to 25 million preserved without collision possibility with
+        // other muids.)
+        RawUuid combined = muid.scaled_data + file_num;
+        EncodeFixed128(buffer, combined);
+        *size = 16;
       } else {
+        // Fall back on something unique per file open
         char* end = EncodeVarint64(buffer, cc->NewId());
         *size = static_cast<size_t>(end - buffer);
       }

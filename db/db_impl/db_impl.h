@@ -1105,9 +1105,11 @@ class DBImpl : public DB {
 
  protected:
   const std::string dbname_;
+  // TODO(peterd): Change from std::string to RfcUuid
   std::string db_id_;
   // db_session_id_ is an identifier that gets reset
   // every time the DB is opened
+  // TODO(peterd): Change from std::string to RocksMuid
   std::string db_session_id_;
   std::unique_ptr<VersionSet> versions_;
   // Flag to check whether we allocated and own the info log file
