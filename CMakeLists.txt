@@ -711,6 +711,7 @@ set(SOURCES
         env/file_system.cc
         env/file_system_tracer.cc
         env/fs_remap.cc
+        env/generate_uuid.cc
         env/mock_env.cc
         file/delete_scheduler.cc
         file/file_prefetch_buffer.cc
@@ -837,6 +838,7 @@ set(SOURCES
         util/string_util.cc
         util/thread_local.cc
         util/threadpool_imp.cc
+        util/uuid.cc
         util/xxhash.cc
         utilities/backupable/backupable_db.cc
         utilities/blob_db/blob_compaction_filter.cc

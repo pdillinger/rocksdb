@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "env/composite_env_wrapper.h"
+#include "env/generate_uuid.h"
 #include "logging/env_logger.h"
 #include "memory/arena.h"
 #include "options/db_options.h"
@@ -736,6 +737,8 @@ Status Env::GetHostNameString(std::string* result) {
   }
   return s;
 }
+
+std::string Env::GenerateUniqueId() { return GenerateRfcUuid().ToString(); }
 
 SequentialFile::~SequentialFile() {
 }

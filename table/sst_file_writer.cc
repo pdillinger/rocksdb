@@ -8,12 +8,14 @@
 #include <vector>
 
 #include "db/dbformat.h"
+#include "env/generate_uuid.h"
 #include "file/writable_file_writer.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/table.h"
 #include "table/block_based/block_based_table_builder.h"
 #include "table/sst_file_writer_collectors.h"
 #include "test_util/sync_point.h"
+#include "util/uuid.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -244,11 +246,11 @@ Status SstFileWriter::Open(const std::string& file_path) {
   // later. Therefore, no real db_id and db_session_id are associated with it.
   // Here we mimic the way db_session_id behaves by resetting the db_session_id
   // every time SstFileWriter is used, and in this case db_id is set to be "SST
-  // Writer".
-  std::string db_session_id = r->ioptions.env->GenerateUniqueId();
-  if (!db_session_id.empty() && db_session_id.back() == '\n') {
-    db_session_id.pop_back();
-  }
+  // Writer". It is especially important that each file get a unique session ID
+  // because ingestion will assign a different file number. Thus, even if file
+  // number changes for an ingested file, <session_id,file_number> still works
+  // as a unique identifier of the file.
+  std::string db_session_id = GenerateMuid().ToString();
   TableBuilderOptions table_builder_options(
       r->ioptions, r->mutable_cf_options, r->internal_comparator,
       &int_tbl_prop_collector_factories, compression_type, compression_opts,

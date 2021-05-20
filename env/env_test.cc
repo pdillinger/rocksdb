@@ -7,6 +7,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include "util/uuid.h"
 #ifndef OS_WIN
 #include <sys/ioctl.h>
 #endif
@@ -18,10 +19,11 @@
 
 #include <sys/types.h>
 
-#include <iostream>
-#include <unordered_set>
 #include <atomic>
+#include <iostream>
 #include <list>
+#include <mutex>
+#include <unordered_set>
 
 #ifdef OS_LINUX
 #include <fcntl.h>
@@ -37,6 +39,7 @@
 
 #include "env/env_chroot.h"
 #include "env/env_encryption_ctr.h"
+#include "env/generate_uuid.h"
 #include "logging/log_buffer.h"
 #include "port/malloc.h"
 #include "port/port.h"
@@ -2457,6 +2460,211 @@ TEST_F(EncryptionProviderTest, LoadROT13Cipher) {
 }
 
 #endif  // ROCKSDB_LITE
+
+namespace {
+
+constexpr size_t kThreads = 8;
+constexpr size_t kIdsPerThread = 1000;
+
+// This is a mini-stress test to check for duplicates in functions like
+// GenerateUniqueId()
+template <typename IdType>
+struct NoDuplicateMiniStressTest {
+  std::unordered_set<IdType> ids;
+  std::mutex mutex;
+  Env* env;
+
+  NoDuplicateMiniStressTest() { env = Env::Default(); }
+
+  virtual ~NoDuplicateMiniStressTest() {}
+
+  void Run() {
+    std::array<std::thread, kThreads> threads;
+    for (size_t i = 0; i < kThreads; ++i) {
+      threads[i] = std::thread([&]() { ThreadFn(); });
+    }
+    for (auto& thread : threads) {
+      thread.join();
+    }
+    // All must be unique
+    ASSERT_EQ(ids.size(), kThreads * kIdsPerThread);
+  }
+
+  void ThreadFn() {
+    std::array<IdType, kIdsPerThread> my_ids;
+    for (size_t i = 0; i < kIdsPerThread; ++i) {
+      my_ids[i] = Generate();
+    }
+    std::lock_guard<std::mutex> lock(mutex);
+    for (auto& id : my_ids) {
+      ids.insert(id);
+    }
+  }
+
+  virtual IdType Generate() = 0;
+};
+
+void VerifyRfcUuids(const std::unordered_set<RfcUuid>& uuids) {
+  if (uuids.empty()) {
+    return;
+  }
+  // If these came from the same source, then they should all have the
+  // same version and variant.
+  int version = uuids.begin()->GetVersion();
+  int variant = uuids.begin()->GetVariant();
+  for (auto& uuid : uuids) {
+    ASSERT_EQ(version, uuid.GetVersion());
+    ASSERT_EQ(variant, uuid.GetVariant());
+  }
+}
+
+}  // namespace
+
+TEST_F(EnvTest, GenerateUniqueId) {
+  struct MyStressTest : public NoDuplicateMiniStressTest<std::string> {
+    std::string Generate() { return env->GenerateUniqueId(); }
+  };
+
+  MyStressTest t;
+  t.Run();
+
+  // Extra verification that these are (currently) RFC 4122 UUIDs.
+  // This also verifies that we can use RfcUuid with std::set and
+  // std::unordered_set
+  std::unordered_set<RfcUuid> uuids;
+  std::set<std::string> sorted_by_string;
+  std::set<RfcUuid> sorted_by_data;
+  for (std::string id : t.ids) {
+    RfcUuid uuid;
+    ASSERT_OK(RfcUuid::Parse(id, &uuid));
+    ASSERT_EQ(id, uuid.ToString());
+    uuids.insert(uuid);
+    sorted_by_string.insert(id);
+    sorted_by_data.insert(uuid);
+  }
+  ASSERT_EQ(uuids.size(), t.ids.size());
+  VerifyRfcUuids(uuids);
+
+  ASSERT_EQ(sorted_by_string.size(), t.ids.size());
+  ASSERT_EQ(sorted_by_data.size(), t.ids.size());
+
+  // Both should be numerical sort
+  auto cur_str = sorted_by_string.begin();
+  auto cur_data = sorted_by_data.begin();
+  while (cur_str != sorted_by_string.end()) {
+    ASSERT_EQ(*cur_str, cur_data->ToString());
+    ++cur_str;
+    ++cur_data;
+  }
+}
+
+TEST_F(EnvTest, GenerateRfcUuid) {
+  struct MyStressTest : public NoDuplicateMiniStressTest<RfcUuid> {
+    RfcUuid Generate() { return GenerateRfcUuid(); }
+  };
+
+  MyStressTest t;
+  t.Run();
+
+  // Extra verification on versions and variants
+  VerifyRfcUuids(t.ids);
+}
+
+constexpr bool kRequireRfcUuidFromPlatform =
+#if defined(OS_LINUX) || defined(OS_ANDROID) || defined(OS_WIN)
+    true;
+#else
+    false;
+#endif
+
+TEST_F(EnvTest, GenerateRfcUuidFromPlatform) {
+  struct MyStressTest : public NoDuplicateMiniStressTest<RfcUuid> {
+    RfcUuid Generate() {
+      RfcUuid u;
+      Status s = GenerateRfcUuidFromPlatform(&u);
+      if (!s.ok()) {
+        assert(!kRequireRfcUuidFromPlatform);
+        assert(s.IsNotSupported());
+        // fall back
+        u = RfcUuid::FromRawLoseData(GenerateRawUuid());
+      }
+      return u;
+    }
+  };
+
+  MyStressTest t;
+  t.Run();
+
+  // Extra verification on versions and variants
+  VerifyRfcUuids(t.ids);
+}
+
+// Test the atomic, linear generation of GenerateRawUuid
+TEST_F(EnvTest, GenerateRawUuid) {
+  struct MyStressTest : public NoDuplicateMiniStressTest<RawUuid> {
+    RawUuid Generate() { return GenerateRawUuid(); }
+  };
+
+  MyStressTest t;
+  t.Run();
+}
+
+// Test the generation of random starting seed for GenerateRawUuid
+TEST_F(EnvTest, GenerateRandomRawUuidExpensive) {
+  struct MyStressTest : public NoDuplicateMiniStressTest<RawUuid> {
+    RawUuid Generate() { return GenerateRandomRawUuidExpensive(env); }
+  };
+
+  MyStressTest t;
+  t.Run();
+}
+
+// Test that each entropy source ("track") is at least adequate
+TEST_F(EnvTest, GenerateRandomRawUuidExpensiveTrack1Only) {
+  struct MyStressTest : public NoDuplicateMiniStressTest<RawUuid> {
+    RawUuid Generate() {
+      return GenerateRandomRawUuidExpensive(env, false, true, true);
+    }
+  };
+
+  MyStressTest t;
+  t.Run();
+}
+
+TEST_F(EnvTest, GenerateRandomRawUuidExpensiveTrack2Only) {
+  struct MyStressTest : public NoDuplicateMiniStressTest<RawUuid> {
+    RawUuid Generate() {
+      return GenerateRandomRawUuidExpensive(env, true, false, true);
+    }
+  };
+
+  MyStressTest t;
+  t.Run();
+}
+
+TEST_F(EnvTest, GenerateRandomRawUuidExpensiveTrack3Only) {
+  if (!kRequireRfcUuidFromPlatform) {
+    // Uses GenerateRfcUuidFromPlatform
+    ROCKSDB_GTEST_SKIP("Might not be available on this platform");
+  }
+  struct MyStressTest : public NoDuplicateMiniStressTest<RawUuid> {
+    RawUuid Generate() {
+      return GenerateRandomRawUuidExpensive(env, true, true, false);
+    }
+  };
+
+  MyStressTest t;
+  t.Run();
+}
+
+TEST_F(EnvTest, GenerateRocksMuid) {
+  struct MyStressTest : public NoDuplicateMiniStressTest<RocksMuid> {
+    RocksMuid Generate() { return GenerateMuid(); }
+  };
+
+  MyStressTest t;
+  t.Run();
+}
 
 }  // namespace ROCKSDB_NAMESPACE
 

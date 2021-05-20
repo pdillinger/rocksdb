@@ -9,6 +9,8 @@
 
 #if defined(OS_WIN)
 
+#include "port/win/env_win.h"
+
 #include <direct.h>  // _rmdir, _mkdir, _getcwd
 #include <errno.h>
 #include <io.h>   // _access
@@ -27,7 +29,6 @@
 #include "monitoring/thread_status_util.h"
 #include "port/port.h"
 #include "port/port_dirent.h"
-#include "port/win/env_win.h"
 #include "port/win/io_win.h"
 #include "port/win/win_logger.h"
 #include "rocksdb/env.h"
@@ -1396,25 +1397,6 @@ void WinEnv::IncBackgroundThreadsIfNeeded(int num, Env::Priority pri) {
 }
 
 }  // namespace port
-
-std::string Env::GenerateUniqueId() {
-  std::string result;
-
-  UUID uuid;
-  UuidCreateSequential(&uuid);
-
-  RPC_CSTR rpc_str;
-  auto status = UuidToStringA(&uuid, &rpc_str);
-  (void)status;
-  assert(status == RPC_S_OK);
-
-  result = reinterpret_cast<char*>(rpc_str);
-
-  status = RpcStringFreeA(&rpc_str);
-  assert(status == RPC_S_OK);
-
-  return result;
-}
 
 std::shared_ptr<FileSystem> FileSystem::Default() {
   return port::WinFileSystem::Default();

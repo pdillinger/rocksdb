@@ -69,6 +69,8 @@ extern Slice GetLengthPrefixedSlice(const char* data);
 
 extern Slice GetSliceUntil(Slice* slice, char delimiter);
 
+namespace detail {
+
 // Borrowed from
 // https://github.com/facebook/fbthrift/blob/449a5f77f9f9bae72c9eb5e78093247eef185c04/thrift/lib/cpp/util/VarintUtils-inl.h#L202-L208
 constexpr inline uint64_t i64ToZigzag(const int64_t l) {
@@ -77,6 +79,8 @@ constexpr inline uint64_t i64ToZigzag(const int64_t l) {
 inline int64_t zigzagToI64(uint64_t n) {
   return (n >> 1) ^ -static_cast<int64_t>(n & 1);
 }
+
+}  // namespace detail
 
 // Pointer-based variants of GetVarint...  These either store a value
 // in *v and return a pointer just past the parsed value, or return
@@ -88,7 +92,7 @@ inline const char* GetVarsignedint64Ptr(const char* p, const char* limit,
                                         int64_t* value) {
   uint64_t u = 0;
   const char* ret = GetVarint64Ptr(p, limit, &u);
-  *value = zigzagToI64(u);
+  *value = detail::zigzagToI64(u);
   return ret;
 }
 
@@ -194,7 +198,7 @@ inline void PutVarint64(std::string* dst, uint64_t v) {
 inline void PutVarsignedint64(std::string* dst, int64_t v) {
   char buf[kMaxVarint64Length];
   // Using Zigzag format to convert signed to unsigned
-  char* ptr = EncodeVarint64(buf, i64ToZigzag(v));
+  char* ptr = EncodeVarint64(buf, detail::i64ToZigzag(v));
   dst->append(buf, static_cast<size_t>(ptr - buf));
 }
 

@@ -9,20 +9,28 @@
 
 #include "util/hash.h"
 
+#include <array>
 #include <cstring>
+#include <random>
+#include <set>
 #include <vector>
 
+#include "env/generate_uuid.h"
 #include "test_util/testharness.h"
 #include "util/coding.h"
 #include "util/math128.h"
+#include "util/random.h"
+#include "util/uuid.h"
 
-using ROCKSDB_NAMESPACE::EncodeFixed32;
-using ROCKSDB_NAMESPACE::GetSliceHash64;
-using ROCKSDB_NAMESPACE::Hash;
-using ROCKSDB_NAMESPACE::Hash64;
-using ROCKSDB_NAMESPACE::Lower32of64;
-using ROCKSDB_NAMESPACE::Slice;
-using ROCKSDB_NAMESPACE::Upper32of64;
+#ifndef GFLAGS
+bool FLAGS_extra = false;
+#else
+#include "util/gflags_compat.h"
+using GFLAGS_NAMESPACE::ParseCommandLineFlags;
+DEFINE_bool(extra, false, "Run extra tests");
+#endif  // GFLAGS
+
+namespace ROCKSDB_NAMESPACE {
 
 // The hash algorithm is part of the file format, for example for the Bloom
 // filters. Test that the hash values are stable for a set of random strings of
@@ -218,7 +226,7 @@ TEST(HashTest, Hash64SmallValueSchema) {
             uint64_t{10551812464348219044u});
 }
 
-std::string Hash64TestDescriptor(const char *repeat, size_t limit) {
+static std::string Hash64TestDescriptor(const char *repeat, size_t limit) {
   const char *mod61_encode =
       "abcdefghijklmnopqrstuvwxyz123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
@@ -363,7 +371,6 @@ TEST(FastRange64Test, Values) {
 }
 
 TEST(FastRangeGenericTest, Values) {
-  using ROCKSDB_NAMESPACE::FastRangeGeneric;
   // Generic (including big and small)
   // Note that FastRangeGeneric is also tested indirectly above via
   // FastRange32 and FastRange64.
@@ -382,29 +389,16 @@ TEST(FastRangeGenericTest, Values) {
 }
 
 // for inspection of disassembly
-uint32_t FastRange32(uint32_t hash, uint32_t range) {
+uint32_t MyFastRange32(uint32_t hash, uint32_t range) {
   return ROCKSDB_NAMESPACE::FastRange32(hash, range);
 }
 
 // for inspection of disassembly
-size_t FastRange64(uint64_t hash, size_t range) {
+size_t MyFastRange64(uint64_t hash, size_t range) {
   return ROCKSDB_NAMESPACE::FastRange64(hash, range);
 }
 
 // Tests for math.h / math128.h (not worth a separate test binary)
-using ROCKSDB_NAMESPACE::BitParity;
-using ROCKSDB_NAMESPACE::BitsSetToOne;
-using ROCKSDB_NAMESPACE::CountTrailingZeroBits;
-using ROCKSDB_NAMESPACE::DecodeFixed128;
-using ROCKSDB_NAMESPACE::DecodeFixedGeneric;
-using ROCKSDB_NAMESPACE::EncodeFixed128;
-using ROCKSDB_NAMESPACE::EncodeFixedGeneric;
-using ROCKSDB_NAMESPACE::FloorLog2;
-using ROCKSDB_NAMESPACE::Lower64of128;
-using ROCKSDB_NAMESPACE::Multiply64to128;
-using ROCKSDB_NAMESPACE::Unsigned128;
-using ROCKSDB_NAMESPACE::Upper64of128;
-
 template <typename T>
 static void test_BitOps() {
   // This complex code is to generalize to 128-bit values. Otherwise
@@ -414,14 +408,9 @@ static void test_BitOps() {
     everyOtherBit = (everyOtherBit << 8) | T{0x55};
   }
 
-  // This one built using bit operations, as our 128-bit layer
-  // might not implement arithmetic such as subtraction.
-  T vm1 = 0;  // "v minus one"
-
   for (int i = 0; i < int{8 * sizeof(T)}; ++i) {
     T v = T{1} << i;
-    // If we could directly use arithmetic:
-    // T vm1 = static_cast<T>(v - 1);
+    T vm1 = static_cast<T>(v - 1);
 
     // FloorLog2
     if (v > 0) {
@@ -453,7 +442,14 @@ static void test_BitOps() {
     EXPECT_EQ(BitParity(vm1), i & 1);
     EXPECT_EQ(BitParity(vm1 & everyOtherBit), ((i + 1) / 2) & 1);
 
-    vm1 = (vm1 << 1) | 1;
+    // EndianSwapValue
+    T ev = T{1} << (((sizeof(T) - 1 - (i / 8)) * 8) + i % 8);
+    EXPECT_EQ(EndianSwapValue(v), ev);
+
+    // ReverseBits
+    T rv = T{1} << (8 * sizeof(T) - 1 - i);
+    EXPECT_EQ(ReverseBits(v), static_cast<T>(T{1} << (8 * sizeof(T) - 1 - i)));
+    EXPECT_EQ(ReverseBits(vm1), static_cast<T>(rv * ~T{1}));
   }
 }
 
@@ -532,6 +528,27 @@ TEST(MathTest, Math128) {
       Multiply64to128(0x1111111111111111U, 0x2222222222222222U);
   EXPECT_EQ(Lower64of128(product), 2295594818061633090U);
   EXPECT_EQ(Upper64of128(product), 163971058432973792U);
+
+  // Test 128x128->256 multiply
+  Unsigned128 big1 = (Unsigned128{0x8c7d1ebeae} << 64) + 0xea18f0547f9ec4cfU;
+  Unsigned128 big2 = (Unsigned128{0x1846d550e37} << 64) + 0xb5063df43be64e08U;
+  Unsigned128 p_upper;
+  Unsigned128 p_lower;
+  Multiply128to256(big1, big2, &p_upper, &p_lower);
+  EXPECT_EQ(Upper64of128(p_upper), 54569U);
+  EXPECT_EQ(Lower64of128(p_upper), 11712860883347098737U);
+  EXPECT_EQ(Upper64of128(p_lower), 8294330302176911072U);
+  EXPECT_EQ(Lower64of128(p_lower), 13792390213309773944U);
+
+  // And 128x128->128 multiply (truncated)
+  EXPECT_EQ(big1 * big2, p_lower);
+
+  // And also in a fastrange sort of way. (2/3rd of 666666...)
+  Unsigned128 two_thirds =
+      (Unsigned128{0xaaaaaaaaaaaaaaaa} << 64) + 0xaaaaaaaaaaaaaaabU;
+  Multiply128to256(two_thirds, 0x66666666666666U, &p_upper, &p_lower);
+  uint64_t result = Lower64of128(p_upper);
+  EXPECT_EQ(result, 0x44444444444444U);
 }
 
 TEST(MathTest, Coding128) {
@@ -584,10 +601,586 @@ TEST(MathTest, CodingGeneric) {
   EXPECT_EQ(std::string("_12"), std::string(out));
 }
 
+// Tests for uuid.h (not worth a separate test binary)
+// (See env_test for generate_uuid.h tests.)
+
+// This is a proof-of-concept Monte Carlo test demonstrating, in short,
+// that more randomness is not always better for uniqueness. For example,
+// suppose that we are generating UUIDs, sometimes with knowledge and
+// "ownership" of the recent UUID we generated and sometimes with
+// no such knowledge or guarantees, so we are forced to choose a UUID at
+// random.
+//
+// The question is what is the best approach for generating unique UUIDs
+// after that first random UUID, when we know (with high probability) that no
+// one else is also building from that same UUID? Is it better to use a
+// structured approach (e.g. add 1 to previous UUID) or to ignore history and
+// keep being random?
+//
+// This test shows that the structured approach is better. In fact, building
+// on previously-generated UUIDs using xor is slightly better than addition.
+//
+// Note that all these approaches have the same AVERAGE (EXPECTED) number of
+// collisions. Because we consider the "badness" of a single collision to be
+// similar to the "badness" of many collisions, by clustering the rare cases
+// of collisions, we reduce the overall probability of any collisions.
+TEST(UuidTest, Approaches) {
+  if (!FLAGS_extra) {
+    ROCKSDB_GTEST_BYPASS("Demonstration/investigation purposes only");
+    return;
+  }
+
+  ROCKSDB_NAMESPACE::Random64 r{std::random_device()()};
+
+  constexpr uint64_t kMaxIter = 100000;
+  constexpr int kBits = 20;
+  constexpr size_t kSize = size_t{1} << kBits;
+  constexpr size_t kMask = kSize - 1;
+
+  enum Approach {
+    kRandom,
+    kAddition,
+    kXor,
+    kMultAddition,
+    kMultXor,
+  };
+
+  std::vector<bool> v;
+  for (auto approach : {kRandom, kAddition, kXor, kMultAddition, kMultXor}) {
+    uint64_t threshold_total = 0;
+    for (uint64_t iter = 0; iter < kMaxIter; ++iter) {
+      v.assign(kSize, false);
+      bool collision = false;
+      do {
+        size_t start = static_cast<size_t>(r.Next()) & kMask;
+        size_t count;
+        if (approach == kRandom) {
+          count = 1;
+        } else {
+          count = 1000;
+        }
+        for (size_t i = 0; i < count && !collision; ++i) {
+          size_t pos;
+          size_t mult_offset = static_cast<size_t>(
+              (i * uint64_t{0xf01f39c13d6a7d81}) >> (64 - kBits));
+          if (approach == kAddition) {
+            pos = (start + i) & kMask;
+          } else if (approach == kMultAddition) {
+            pos = (start + mult_offset) & kMask;
+          } else if (approach == kMultXor) {
+            pos = start ^ mult_offset;
+          } else {
+            pos = start ^ i;
+          }
+          if (v[pos]) {
+            collision = true;
+          } else {
+            v[pos] = true;
+            ++threshold_total;
+          }
+        }
+      } while (!collision);
+    }
+    const char *name = approach == kAddition       ? "addition"
+                       : approach == kXor          ? "xor"
+                       : approach == kMultAddition ? "multaddition"
+                       : approach == kMultXor      ? "multxor"
+                                                   : "random";
+    fprintf(stderr, "Average threshold with %s: %g / %u\n", name,
+            1.0 * threshold_total / kMaxIter, (unsigned)kSize);
+  }
+  // Example output with non-random count=1000:
+  // Average threshold with random: 1283.67 / 1048576
+  // Average threshold with addition: 28653.2 / 1048576
+  // Average threshold with xor: 39762.9 / 1048576
+  // Average threshold with multaddition: 20369.2 / 1048576
+  // Average threshold with multxor: 2810.48 / 1048576
+  //
+  // Winner is xor because there's lowest chance of any overlap, but addition
+  // is close. Multiplicative hash + addition is within a factor of two, which
+  // 1-2 bits of uniqueness (1 structured, e.g. counter, or 2 unstructured,
+  // e.g. hash). Note that the random case matches roughly sqrt(n) we would
+  // expect from the Birthday paradox.
+  //
+  // Example output with non-random count=50:
+  // Average threshold with random: 1284.02 / 1048576
+  // Average threshold with addition: 6460.97 / 1048576
+  // Average threshold with xor: 8001.48 / 1048576
+  // Average threshold with multaddition: 4665.97 / 1048576
+  // Average threshold with multxor: 2057.52 / 1048576
+}
+
+TEST(UuidTest, RfcUuidTest) {
+  // Default ctor
+  RfcUuid u0;
+  EXPECT_TRUE(u0.IsEmpty());
+  EXPECT_EQ(u0.GetVariant(), 0);
+  EXPECT_EQ(u0.GetVersion(), 0);
+  EXPECT_EQ(u0.data, Unsigned128{0});
+
+  // Parse valid, check ordering relation, etc.
+  ASSERT_OK(RfcUuid::Parse("00000000-0000-0000-0000-000000000000", &u0));
+  EXPECT_TRUE(u0.IsEmpty());
+  EXPECT_EQ(u0.GetVariant(), 0);
+  EXPECT_EQ(u0.GetVersion(), 0);
+  EXPECT_EQ(u0.data, Unsigned128{0});
+  EXPECT_EQ(u0.ToString(), "00000000-0000-0000-0000-000000000000");
+
+  RfcUuid u1;
+  ASSERT_OK(RfcUuid::Parse("00000000-0000-0000-0000-000000000001", &u1));
+  EXPECT_FALSE(u1.IsEmpty());
+  EXPECT_EQ(u1.GetVariant(), 0);
+  EXPECT_EQ(u1.GetVersion(), 0);
+  EXPECT_EQ(u1.data, Unsigned128{1});
+  EXPECT_TRUE(u0 < u1);
+  EXPECT_TRUE(u0.data < u1.data);  // implementation detail
+  EXPECT_FALSE(u1 < u0);
+  EXPECT_FALSE(u0 == u1);
+
+  RfcUuid u2;
+  ASSERT_OK(RfcUuid::Parse("00000000-0000-0000-0001-000000000000", &u2));
+  EXPECT_EQ(u2.data, Unsigned128{1} << 48);
+  EXPECT_TRUE(u1 < u2);
+  EXPECT_TRUE(u1.data < u2.data);
+  EXPECT_FALSE(u2 < u1);
+
+  RfcUuid u3;
+  ASSERT_OK(RfcUuid::Parse("00000000-0000-0001-0000-000000000000", &u3));
+  EXPECT_EQ(u3.data, Unsigned128{1} << 64);
+  EXPECT_TRUE(u2 < u3);
+  EXPECT_TRUE(u2.data < u3.data);
+  EXPECT_FALSE(u3 < u2);
+
+  RfcUuid u4;
+  ASSERT_OK(RfcUuid::Parse("00000000-0001-0000-0000-000000000000", &u4));
+  EXPECT_EQ(u4.data, Unsigned128{1} << 80);
+  EXPECT_TRUE(u3 < u4);
+  EXPECT_TRUE(u3.data < u4.data);
+  EXPECT_FALSE(u4 < u3);
+
+  RfcUuid u5;
+  ASSERT_OK(RfcUuid::Parse("00000001-0000-0000-0000-000000000000", &u5));
+  EXPECT_EQ(u5.data, Unsigned128{1} << 96);
+  EXPECT_TRUE(u4 < u5);
+  EXPECT_TRUE(u4.data < u5.data);
+  EXPECT_FALSE(u5 < u4);
+
+  std::string s = "123e4567-e89b-12d3-a456-426614174000";
+  RfcUuid ua;
+  ASSERT_OK(RfcUuid::Parse(s, &ua));
+  EXPECT_FALSE(ua.IsEmpty());
+  EXPECT_EQ(ua.GetVariant(), 1);
+  EXPECT_EQ(ua.GetVersion(), 1);
+  EXPECT_EQ(ua.ToString(), s);
+
+  // Upper case OK
+  RfcUuid ua2;
+  std::string s2 = s;
+  s2[3] = 'E';
+  s2[12] = 'B';
+  ASSERT_OK(RfcUuid::Parse(s2, &ua2));
+  EXPECT_TRUE(ua == ua2);
+  EXPECT_EQ(ua.ToString(), s);
+
+  // Test version
+  for (int i = 0; i < 16; ++i) {
+    ua.SetVersion(i);
+    EXPECT_EQ(ua.GetVersion(), i);
+    s[14] = "0123456789abcdef"[i];
+    EXPECT_EQ(ua.ToString(), s);
+  }
+
+  // Test variant (weird because of variable number of bits)
+  ua.SetVariant(0);
+  EXPECT_EQ(ua.GetVariant(), 0);
+  s[19] = '2';
+  EXPECT_EQ(ua.ToString(), s);
+
+  ua.SetVariant(1);
+  EXPECT_EQ(ua.GetVariant(), 1);
+  s[19] = 'a';
+  EXPECT_EQ(ua.ToString(), s);
+
+  ua.SetVariant(2);
+  EXPECT_EQ(ua.GetVariant(), 2);
+  s[19] = 'c';
+  EXPECT_EQ(ua.ToString(), s);
+
+  ua.SetVariant(1);
+  EXPECT_EQ(ua.GetVariant(), 1);
+  s[19] = '8';
+  EXPECT_EQ(ua.ToString(), s);
+
+  ua.SetVariant(3);
+  EXPECT_EQ(ua.GetVariant(), 3);
+  s[19] = 'e';
+  EXPECT_EQ(ua.ToString(), s);
+
+  // Pseudorandom, ensure coverage of the value space (assuming
+  // version 4 variant 1) based on strings
+  ROCKSDB_NAMESPACE::Random64 r{42U};
+  std::array<std::set<char>, 36U> seen{};
+
+  for (int i = 0; i < 1000; ++i) {
+    // Generate random bits
+    RawUuid ru = r.Next();
+    ru = (ru << 64) | r.Next();
+
+    RfcUuid ur = RfcUuid::FromRawLoseData(ru);
+    std::array<char, 36U> buf;
+    ur.PutString(buf.data());
+
+    for (uint32_t j = 0; j < 36U; ++j) {
+      seen[j].insert(buf[j]);
+    }
+
+    // Also check ToString
+    s = ur.ToString();
+    EXPECT_EQ(s, std::string(buf.data(), 36U));
+
+    // Check that bottom 6 bits are completely ignored by FromRawLoseData.
+    RawUuid ru2 = ru ^ (r.Next() & 0x3fU);
+    RfcUuid ur2 = RfcUuid::FromRawLoseData(ru2);
+    EXPECT_EQ(ur, ur2);
+  }
+
+  // Values covered for various positions
+  for (uint32_t j = 0; j < 36U; ++j) {
+    if (j == 8 || j == 13 || j == 18 || j == 23) {
+      // Dash positions
+      ASSERT_EQ(seen[j].size(), 1);
+    } else if (j == 14) {
+      // Version
+      ASSERT_EQ(seen[j].size(), 1);
+    } else if (j == 19) {
+      // Variant + 2 bits data
+      ASSERT_EQ(seen[j].size(), 4);
+    } else {
+      ASSERT_EQ(seen[j].size(), 16);
+    }
+  }
+}
+
+TEST(UuidTest, RocksMuidTest) {
+  // Default ctor
+  RocksMuid m0;
+  EXPECT_EQ(m0.scaled_data, 0U);
+  EXPECT_EQ(m0.ToString(), "00000000000000000000");
+
+  // Valid
+  ASSERT_OK(RocksMuid::Parse("00000000000000000000", &m0));
+  EXPECT_EQ(m0.scaled_data, 0U);
+  EXPECT_EQ(m0.ToString(), "00000000000000000000");
+
+  RocksMuid m1;
+  ASSERT_OK(RocksMuid::Parse("00000000000000000001", &m1));
+  EXPECT_EQ(m1.scaled_data, Unsigned128{25455958});  // implementation detail
+  EXPECT_EQ(m1.ToString(), "00000000000000000001");
+
+  EXPECT_FALSE(m0 == m1);
+  EXPECT_TRUE(m0 < m1);
+  EXPECT_FALSE(m1 < m0);
+  EXPECT_FALSE(m0 < m0);
+
+  // Upper and lower case OK
+  RocksMuid ma;
+  ASSERT_OK(RocksMuid::Parse("abcdeABCDEvwxyzVWXYZ", &ma));
+  RocksMuid mb;
+  ASSERT_OK(RocksMuid::Parse("ABCDEabcdeVWXYZvwxyz", &mb));
+  EXPECT_EQ(ma, mb);
+  EXPECT_TRUE(m0 < ma);
+  EXPECT_TRUE(m0.scaled_data < ma.scaled_data);
+
+  // Pseudorandom, ensure coverage of the value space based on strings
+  ROCKSDB_NAMESPACE::Random64 r{42U};
+  std::array<std::set<char>, 20U> seen{};
+
+  for (int i = 0; i < 1000; ++i) {
+    // Generate random bits
+    RawUuid u = r.Next();
+    u = (u << 64) | r.Next();
+
+    RocksMuid mr = RocksMuid::FromRawLoseData(u);
+    std::array<char, 20U> buf;
+    mr.PutString(buf.data());
+
+    for (uint32_t j = 0; j < 20U; ++j) {
+      seen[j].insert(buf[j]);
+    }
+
+    // Also check ToString
+    std::string s = mr.ToString();
+    EXPECT_EQ(s, std::string(buf.data(), 20U));
+
+    // Check that bottom 24 bits play little role in FromRawLoseData. Such a
+    // range can hit at most two output values.
+    RawUuid u2 = u + (r.Next() & 0xffffffU);
+    RawUuid u3 = u + (r.Next() & 0xffffffU);
+    RocksMuid mr2 = RocksMuid::FromRawLoseData(u2);
+    RocksMuid mr3 = RocksMuid::FromRawLoseData(u3);
+    EXPECT_TRUE(mr == mr2 || mr2 == mr3 || mr == mr3);
+  }
+
+  // All values covered in each position
+  for (uint32_t j = 0; j < 20U; ++j) {
+    ASSERT_EQ(seen[j].size(), 36);
+  }
+
+  // Invalid, too short or long
+  EXPECT_TRUE(RocksMuid::Parse("0", &ma).IsCorruption());
+  EXPECT_TRUE(RocksMuid::Parse("0000011111222220000", &ma).IsCorruption());
+  EXPECT_TRUE(RocksMuid::Parse("000001111122222000000", &ma).IsCorruption());
+  // Bad character
+  EXPECT_TRUE(RocksMuid::Parse("000001111122222-00000", &ma).IsCorruption());
+  EXPECT_TRUE(RocksMuid::Parse("000001111122222-0000", &ma).IsCorruption());
+  EXPECT_TRUE(RocksMuid::Parse("0000011111222220000-", &ma).IsCorruption());
+  EXPECT_TRUE(RocksMuid::Parse("-0000011111222220000", &ma).IsCorruption());
+  EXPECT_TRUE(RocksMuid::Parse("-00000111112222200000", &ma).IsCorruption());
+}
+
+namespace {
+
+RawUuid GetCacheKey(const RocksMuid& base_session, uint64_t session_counter, uint64_t file_number, uint64_t file_offset) {
+  RawUuid u = base_session.scaled_data;
+  u = XorInMiddleOf3Counter(u, session_counter);
+  u = XorInBottomOf3Counter(u, file_number);
+  u = XorInTopOf3Counter(u, file_offset);
+  return u;
+}
+
+struct ReverseEngineerCacheKey {
+  // Input:
+  int session_counter_max_bits;
+  int file_number_max_bits;
+  int file_offset_max_bits;
+
+  // Computed on Prepare():
+  RawUuid base_session_provide_mask;
+
+  // Computed on Execute():
+  RawUuid base_session;
+  uint64_t session_counter;
+  uint64_t file_number;
+  uint64_t file_offset;
+
+  void Prepare() {
+    // To recover fields added, we need to be provided the bits that overlap
+    // with them.
+    RawUuid provide = 0;
+
+    // File offset uses top counter
+    // TODO: support reverse engineering overflow
+    assert(file_offset_max_bits <= 44);
+    provide |= ((Unsigned128{1} << file_offset_max_bits) - 1) << 84;
+
+    // Session counter uses middle counter
+    // TODO: support reverse engineering overflow
+    assert(session_counter_max_bits <= 40);
+    provide |= ((Unsigned128{1} << session_counter_max_bits) - 1) << 44;
+
+    // File number uses bottom counter
+    // TODO: support reverse engineering overflow
+    assert(file_number_max_bits <= 44);
+    provide |= (Unsigned128{1} << file_number_max_bits) - 1;
+
+    /*
+    TODO:
+    // Except RocksMuid only has roughly 104 bits entropy, essentially in
+    // upper bits, so we can always infer the bottom 24 bits.
+    provide &= (Unsigned128{0} - 1) << 24;
+    */
+
+    base_session_provide_mask = provide;
+  }
+
+  void Execute(RawUuid cache_key, RawUuid base_session_provided_bits) {
+    RawUuid base_session_infer_mask = ~base_session_provide_mask;
+
+    assert((base_session_provided_bits & base_session_infer_mask) == 0);
+
+    RawUuid tmp = cache_key;
+    tmp ^= base_session_provided_bits;
+
+    file_offset =
+        ((uint64_t{1} << file_offset_max_bits) - 1) & Lower64of128(tmp >> 84);
+
+    session_counter = ((uint64_t{1} << session_counter_max_bits) - 1) &
+                      Lower64of128(tmp >> 44);
+
+    file_number =
+        ((uint64_t{1} << file_number_max_bits) - 1) & Lower64of128(tmp);
+
+    tmp = GetCacheKey(RocksMuid(), session_counter, file_number, file_offset);
+
+    base_session = tmp ^ cache_key;
+  }
+};
+
+}  // namespace
+
+TEST(UuidTest, PrototypeCacheKeys) {
+  ReverseEngineerCacheKey r;
+  r.file_offset_max_bits = 33;
+  r.session_counter_max_bits = 34;
+  r.file_number_max_bits = 35;
+  r.Prepare();
+
+  RocksMuid base_session = GenerateMuid();
+  Random64 rnd{Upper64of128(base_session.scaled_data)};
+  uint64_t file_offset =
+      rnd.Next() & ((uint64_t{1} << r.file_offset_max_bits) - 1);
+  uint64_t session_counter =
+      rnd.Next() & ((uint64_t{1} << r.session_counter_max_bits) - 1);
+  uint64_t file_number =
+      rnd.Next() & ((uint64_t{1} << r.file_number_max_bits) - 1);
+
+  RawUuid cache_key =
+      GetCacheKey(base_session, session_counter, file_number, file_offset);
+
+  ASSERT_EQ(BitsSetToOne(r.base_session_provide_mask),
+            r.file_offset_max_bits + r.session_counter_max_bits +
+                r.file_number_max_bits);
+  r.Execute(cache_key, base_session.scaled_data & r.base_session_provide_mask);
+
+  ASSERT_EQ(base_session.scaled_data, r.base_session);
+  ASSERT_EQ(file_offset, r.file_offset);
+  ASSERT_EQ(session_counter, r.session_counter);
+  ASSERT_EQ(file_number, r.file_number);
+}
+
+TEST(UuidTest, AltCacheKeys) {
+  if (!FLAGS_extra) {
+    ROCKSDB_GTEST_BYPASS("Demonstration/investigation purposes only");
+    return;
+  }
+
+  // constexpr uint64_t kPrime64_A = 0xe6143049bc367e43;
+  ROCKSDB_NAMESPACE::Random64 r{(unsigned)getpid()};
+  // constexpr uint64_t kPrime64_B = ~kPrime64_A + 1;
+
+  for (;;) {
+    // Trying 5017b98a1afc9a77, bd6cabd1a6fc377b (through 6, all three)
+    // Trying 5017b6d8a311cdd3, bd6ca47d7851ca6f (through 7, all three)
+    // Trying 5017b7356eeab2d5, bd6ca483db871c93 (through 8, all three)
+
+    // Trying 0x743e68b4fd45a8b3, 0xcd01262457eccf07 (through 13, +1both only)
+    // Trying 0x743e68a6f2adcaad, 0xcd01260710abfd79 (through 14)
+
+    /*
+  Trying 0x751661862ec6fe55, 0x40c555e660a9a045
+  bits: 15 +1both: 0
+  Trying 0xd8a79bdb867e1f5b, 0xd0ebc28596340057
+  bits: 15 +1both: 0
+  Trying 0xa0898ccaf49385a9, 0x8602c470d97d60cf
+  bits: 15 +1both: 0
+  Trying 0x7d0024c10a1deac9, 0x4def1b4e0405da21
+  bits: 15 +1both: 0
+  Trying 0x79f3ddc0516a5977, 0x2f6f520b223eccc9
+  bits: 15 +1both: 0
+  Trying 0xf582d7ad09e998ed, 0x9daf788867c13f09
+  bits: 15 +1both: 0
+  */
+
+    /*
+    Found 0x3d0e38c0003322e9, 0x75ae5cdff2030a3d
+    bits: 12 +1both: 0 +2ao: 0 +2bo: 0
+    Found 0xbc8e6deacbbb03ab, 0x31e8a2c7285ffedb
+    bits: 12 +1both: 0 +2ao: 0 +2bo: 0
+    Found 0x6be3888d41b849d9, 0xe179e1bc0e6d04fb
+    bits: 12 +1both: 0 +2ao: 0 +2bo: 0
+    Found 0x6be3888d41b849d9, 0xe179e1bc0e6d04fb
+    bits: 13 +1both: 0 +2ao: 0 +2bo: 0
+    Found 0x736759a8b0fde6ff, 0xa1763a3f6726d87d
+    bits: 12 +1both: 0 +2ao: 0 +2bo: 0
+    Found 0x736759a8b0fde6ff, 0xa1763a3f6726d87d
+    bits: 13 +1both: 0 +2ao: 0 +2bo: 0
+    */
+
+    /*
+    Found 0xf01f39c13d6a7d81, 0x9683ac7883fc67b7
+    bits: 15 +1both: 0 +2ao: 0 +2bo: 0
+    WINNER!!!!!!!!!!!!! 0xf01f39c13d6a7d81, 0x9683ac7883fc67b7
+    */
+
+    uint64_t factorA = r.Next() | 1;
+    uint64_t factorB = r.Next() | 1;
+
+    std::vector<bool> seen_plus1both;
+    // std::vector<bool> seen_plus2a;
+    // std::vector<bool> seen_plus2b;
+    std::vector<bool> seen_plus2ao;
+    std::vector<bool> seen_plus2bo;
+
+    for (int bits = 1; bits <= 17; ++bits) {
+      int nbits = 64 - bits;
+      uint64_t max = uint64_t{1} << (2 * bits);
+      seen_plus1both.assign(max << 2, false);
+      // seen_plus2a.assign(max << 2, false);
+      // seen_plus2b.assign(max << 2, false);
+      seen_plus2ao.assign(max << 2, false);
+      seen_plus2bo.assign(max << 2, false);
+
+      int plus1both_collision = 0;
+      // int plus2a_collision = 0;
+      // int plus2b_collision = 0;
+      int plus2ao_collision = 0;
+      int plus2bo_collision = 0;
+
+      for (uint64_t i = 0; i < max; ++i) {
+        uint64_t a = i * factorA;
+        uint64_t b = i * factorB;
+
+        uint64_t v = ((a >> (nbits - 1)) << (bits + 1)) | (b >> (nbits - 1));
+        plus1both_collision += seen_plus1both[v];
+        seen_plus1both[v] = true;
+
+        /*
+        v = ((a >> (nbits - 2)) << bits) | (b >> nbits);
+        plus2a_collision += seen_plus2a[v];
+        seen_plus2a[v] = true;
+
+        v = ((a >> nbits) << (bits + 2)) | (b >> (nbits - 2));
+        plus2b_collision += seen_plus2b[v];
+        seen_plus2b[v] = true;
+        */
+
+        v = a >> (nbits * 2 - 2);
+        plus2ao_collision += seen_plus2ao[v];
+        seen_plus2ao[v] = true;
+
+        v = b >> (nbits * 2 - 2);
+        plus2bo_collision += seen_plus2bo[v];
+        seen_plus2bo[v] = true;
+      }
+
+      // fprintf(stderr, "bits: %d +1both: %d +1ao: %d +1bo: %d +2ao: %d +2bo:
+      // %d\n", bits, plus1both_collision, plus1ao_collision, plus1bo_collision,
+      // plus2ao_collision, plus2bo_collision);
+      if (plus1both_collision || plus2ao_collision || plus2bo_collision) break;
+      // if (bits > 8 && (plus2a_collision || plus2b_collision)) break;
+      //*
+      if (bits >= 13) {
+        fprintf(stderr, "Found 0x%lx, 0x%lx\n", factorA, factorB);
+        fprintf(stderr, "bits: %d +1both: %d +2ao: %d +2bo: %d\n", bits,
+                plus1both_collision, plus2ao_collision, plus2bo_collision);
+      }
+      if (bits >= 15) {
+        fprintf(stderr, "WINNER!!!!!!!!!!!!! 0x%lx, 0x%lx\n", factorA, factorB);
+      }
+      //*/
+    }
+  }
+}
+
+}  // namespace ROCKSDB_NAMESPACE
+
 int main(int argc, char** argv) {
   fprintf(stderr, "NPHash64 id: %x\n",
           static_cast<int>(ROCKSDB_NAMESPACE::GetSliceNPHash64("RocksDB")));
   ::testing::InitGoogleTest(&argc, argv);
+#ifdef GFLAGS
+  ParseCommandLineFlags(&argc, &argv, true);
+#endif  // GFLAGS
 
   return RUN_ALL_TESTS();
 }
