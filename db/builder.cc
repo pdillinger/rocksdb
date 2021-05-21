@@ -34,7 +34,9 @@
 #include "rocksdb/env.h"
 #include "rocksdb/iterator.h"
 #include "rocksdb/options.h"
+#include "rocksdb/statistics.h"
 #include "rocksdb/table.h"
+#include "rocksdb/types.h"
 #include "table/block_based/block_based_table_builder.h"
 #include "table/format.h"
 #include "table/internal_iterator.h"
@@ -252,6 +254,10 @@ Status BuildTable(
       meta->fd.file_size = file_size;
       meta->marked_for_compaction = builder->NeedCompact();
       assert(meta->fd.GetFileSize() > 0);
+      if (tboptions.reason == TableFileCreationReason::kFlush) {
+        RecordTick(ioptions.statistics.get(), FLUSH_WRITE_UNCOMPRESSED_SIZE,
+                   builder->UncompressedSize());
+      }
       tp = builder->GetTableProperties(); // refresh now that builder is finished
       if (table_properties) {
         *table_properties = tp;

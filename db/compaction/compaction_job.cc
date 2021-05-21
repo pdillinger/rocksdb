@@ -1632,6 +1632,8 @@ Status CompactionJob::FinishCompactionOutputFile(
   }
   sub_compact->current_output()->finished = true;
   sub_compact->total_bytes += current_bytes;
+  RecordTick(stats_, COMPACT_WRITE_UNCOMPRESSED_SIZE,
+             sub_compact->builder->UncompressedSize());
 
   // Finish and check for file errors
   if (s.ok()) {

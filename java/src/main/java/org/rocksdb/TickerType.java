@@ -752,6 +752,16 @@ public enum TickerType {
     ERROR_HANDLER_AUTORESUME_RETRY_TOTAL_COUNT((byte) -0x1A),
     ERROR_HANDLER_AUTORESUME_SUCCESS_COUNT((byte) -0x1B),
 
+    /**
+     * Uncompressed size of data (maybe compressed) written during compaction.
+     */
+    COMPACT_WRITE_UNCOMPRESSED_SIZE((byte) -0x1C),
+
+    /**
+     * Uncompressed size of data (maybe compressed) written during flush.
+     */
+    FLUSH_WRITE_UNCOMPRESSED_SIZE((byte) -0x1D),
+
     TICKER_ENUM_MAX((byte) 0x5F);
 
     private final byte value;

@@ -4996,6 +4996,10 @@ class TickerTypeJni {
         return -0x1A;
       case ROCKSDB_NAMESPACE::Tickers::ERROR_HANDLER_AUTORESUME_SUCCESS_COUNT:
         return -0x1B;
+      case ROCKSDB_NAMESPACE::Tickers::COMPACT_WRITE_UNCOMPRESSED_SIZE:
+        return -0x1C;
+      case ROCKSDB_NAMESPACE::Tickers::FLUSH_WRITE_UNCOMPRESSED_SIZE:
+        return -0x1D;
       case ROCKSDB_NAMESPACE::Tickers::TICKER_ENUM_MAX:
         // 0x5F for backwards compatibility on current minor version.
         return 0x5F;

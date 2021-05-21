@@ -201,6 +201,9 @@ const std::vector<std::pair<Tickers, std::string>> TickersNameMap = {
      "rocksdb.error.handler.autoresume.retry.total.count"},
     {ERROR_HANDLER_AUTORESUME_SUCCESS_COUNT,
      "rocksdb.error.handler.autoresume.success.count"},
+    {COMPACT_WRITE_UNCOMPRESSED_SIZE,
+     "rocksdb.compact.write.uncompressed.size"},
+    {FLUSH_WRITE_UNCOMPRESSED_SIZE, "rocksdb.flush.write.uncompressed.size"},
 };
 
 const std::vector<std::pair<Histograms, std::string>> HistogramsNameMap = {

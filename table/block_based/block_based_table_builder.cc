@@ -10,6 +10,7 @@
 #include "table/block_based/block_based_table_builder.h"
 
 #include <assert.h>
+#include <bits/stdint-intn.h>
 #include <stdio.h>
 
 #include <atomic>
@@ -279,6 +280,7 @@ struct BlockBasedTableBuilder::Rep {
   std::vector<std::unique_ptr<CompressionContext>> compression_ctxs;
   std::vector<std::unique_ptr<UncompressionContext>> verify_ctxs;
   std::unique_ptr<UncompressionDict> verify_dict;
+  uint64_t bytes_saved_with_compression = 0;
 
   size_t data_begin_offset = 0;
 
@@ -1030,6 +1032,8 @@ void BlockBasedTableBuilder::WriteBlock(const Slice& raw_block_contents,
   if (!ok()) {
     return;
   }
+  r->bytes_saved_with_compression +=
+        raw_block_contents.size() - block_contents.size();
   WriteRawBlock(block_contents, type, handle, is_data_block);
   r->compressed_output.clear();
   if (is_data_block) {
@@ -1312,6 +1316,8 @@ void BlockBasedTableBuilder::BGWorkWriteRawBlock() {
     }
 
     r->pc_rep->file_size_estimator.SetCurrBlockRawSize(block_rep->data->size());
+    r->bytes_saved_with_compression +=
+        block_rep->data->size() - block_rep->compressed_contents.size();
     WriteRawBlock(block_rep->compressed_contents, block_rep->compression_type,
                   &r->pending_handle, true /* is_data_block*/);
     if (!ok()) {
@@ -1890,6 +1896,10 @@ bool BlockBasedTableBuilder::IsEmpty() const {
 }
 
 uint64_t BlockBasedTableBuilder::FileSize() const { return rep_->offset; }
+
+uint64_t BlockBasedTableBuilder::UncompressedSize() const {
+  return rep_->offset + rep_->bytes_saved_with_compression;
+}
 
 uint64_t BlockBasedTableBuilder::EstimatedFileSize() const {
   if (rep_->IsParallelCompressionEnabled()) {

@@ -383,6 +383,11 @@ enum Tickers : uint32_t {
   ERROR_HANDLER_AUTORESUME_RETRY_TOTAL_COUNT,
   ERROR_HANDLER_AUTORESUME_SUCCESS_COUNT,
 
+  // Uncompressed size of data (maybe compressed) written during
+  // compaction or flush
+  COMPACT_WRITE_UNCOMPRESSED_SIZE,
+  FLUSH_WRITE_UNCOMPRESSED_SIZE,
+
   TICKER_ENUM_MAX
 };
 
