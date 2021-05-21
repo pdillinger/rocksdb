@@ -4590,7 +4590,10 @@ class Benchmark {
     }
 
     RandomGenerator gen;
+    RandomGenerator gen2;
     WriteBatch batch(/*reserved_bytes=*/0, /*max_bytes=*/0,
+                     user_timestamp_size_);
+    WriteBatch batch2(/*reserved_bytes=*/0, /*max_bytes=*/0,
                      user_timestamp_size_);
     Status s;
     int64_t bytes = 0;
@@ -4632,12 +4635,14 @@ class Benchmark {
       size_t id = thread->rand.Next() % num_key_gens;
       DBWithColumnFamilies* db_with_cfh = SelectDBWithCfh(id);
       batch.Clear();
+      batch2.Clear();
       int64_t batch_bytes = 0;
 
       for (int64_t j = 0; j < entries_per_batch_; j++) {
         int64_t rand_num = key_gens[id]->Next();
         GenerateKeyFromInt(rand_num, FLAGS_num, &key);
         Slice val = gen.Generate();
+        Slice val2 = gen2.Generate();
         if (use_blob_db_) {
 #ifndef ROCKSDB_LITE
           // Stacked BlobDB
@@ -4652,12 +4657,15 @@ class Benchmark {
 #endif  //  ROCKSDB_LITE
         } else if (FLAGS_num_column_families <= 1) {
           batch.Put(key, val);
+          batch2.Put(key, val2);
         } else {
           // We use same rand_num as seed for key and column family so that we
           // can deterministically find the cfh corresponding to a particular
           // key while reading the key.
           batch.Put(db_with_cfh->GetCfh(rand_num), key,
                     val);
+          batch2.Put(db_with_cfh->GetCfh(rand_num), key,
+                    val2);
         }
         batch_bytes += val.size() + key_size_ + user_timestamp_size_;
         bytes += val.size() + key_size_ + user_timestamp_size_;
@@ -4730,6 +4738,9 @@ class Benchmark {
       if (!use_blob_db_) {
         // Not stacked BlobDB
         s = db_with_cfh->db->Write(write_options_, &batch);
+        if (s.ok()) {
+          s = db_with_cfh->db->Write(write_options_, &batch2);
+        }
       }
       thread->stats.FinishedOps(db_with_cfh, db_with_cfh->db,
                                 entries_per_batch_, kWrite);

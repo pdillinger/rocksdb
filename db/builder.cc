@@ -256,7 +256,8 @@ Status BuildTable(
       assert(meta->fd.GetFileSize() > 0);
       if (tboptions.reason == TableFileCreationReason::kFlush) {
         RecordTick(ioptions.statistics.get(), FLUSH_WRITE_UNCOMPRESSED_SIZE,
-                   builder->UncompressedSize());
+                  c_iter.iter_stats().total_input_raw_key_bytes + c_iter.iter_stats().total_input_raw_value_bytes);
+                   //builder->UncompressedSize());
       }
       tp = builder->GetTableProperties(); // refresh now that builder is finished
       if (table_properties) {
