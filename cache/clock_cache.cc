@@ -9,6 +9,130 @@
 
 #include "cache/clock_cache.h"
 
+#include "rocksdb/cache.h"
+
+namespace ROCKSDB_NAMESPACE {
+
+namespace clock_cache {
+
+struct ClockHandle : public Cache::Handle {
+
+};
+
+class ClockCache : public Cache {
+ public:
+  ClockCache(size_t capacity, size_t num_entries) : capacity_(capacity), num_entries_(num_entries) {
+
+  }
+
+  const char* Name() const override { return "ClockCacheV2"; };
+
+  Status Insert(const Slice& key, void* value, size_t charge,
+                        DeleterFn deleter, Handle** handle,
+                        Priority priority) override {
+    // TODO
+    return Status();
+  }
+
+  Handle* Lookup(const Slice& key, Statistics* stats = nullptr) override {
+    // TODO
+    return nullptr;
+  }
+
+  bool Ref(Handle* handle) override {
+    // TODO
+    return true;
+  }
+
+  bool Release(Handle* handle, bool force_erase) override {
+    // TODO
+    return true;
+  }
+
+  void* Value(Handle* handle) override {
+    // TODO
+    return true;
+  }
+
+  void Erase(const Slice& key) override {
+    // TODO
+  }
+
+  uint64_t NewId() override {
+
+  }
+
+  void SetCapacity(size_t capacity) override {
+    // TODO
+  }
+
+  void SetStrictCapacityLimit(bool strict_capacity_limit) override {
+    // TODO
+  }
+
+  bool HasStrictCapacityLimit() const override {
+    // TODO
+    return false;
+  }
+
+  size_t GetCapacity() const override {
+    return capacity_;
+  }
+
+  size_t GetUsage() const override {
+    // TODO
+    return 0;
+  }
+
+  size_t GetUsage(Handle* handle) const override {
+    // TODO
+  }
+
+  size_t GetPinnedUsage() const override {
+    // TODO
+  }
+
+  size_t GetCharge(Handle* handle) const override {
+    // TODO
+  }
+
+  DeleterFn GetDeleter(Handle* handle) const override {
+    // TODO
+  }
+
+  void DisownData() override {
+    // TODO
+  }
+
+  void ApplyToAllEntries(
+      const std::function<void(const Slice& key, void* value, size_t charge,
+                               DeleterFn deleter)>& callback,
+      const ApplyToAllEntriesOptions& opts) override {
+    // TODO
+    (void)callback;
+    (void)opts;
+  }
+
+  void EraseUnRefEntries() override {
+    // TODO
+  }
+ private:
+  size_t capacity_;
+  size_t num_entries_;
+};
+
+} // namespace clock_cache
+
+std::shared_ptr<Cache> NewClockCache(
+    size_t capacity, int /*num_shard_bits*/, bool /*strict_capacity_limit*/,
+    CacheMetadataChargePolicy /*metadata_charge_policy*/) {
+
+  return std::make_shared<ClockCache>(capacity, /*entries*/capacity / 3072);
+}
+
+}  // namespace ROCKSDB_NAMESPACE
+
+
 #ifndef SUPPORT_CLOCK_CACHE
 
 namespace ROCKSDB_NAMESPACE {
@@ -41,9 +165,6 @@ std::shared_ptr<Cache> NewClockCache(
 #include "util/autovector.h"
 #include "util/mutexlock.h"
 
-namespace ROCKSDB_NAMESPACE {
-
-namespace {
 
 // An implementation of the Cache interface based on CLOCK algorithm, with
 // better concurrent performance than LRUCache. The idea of CLOCK algorithm
@@ -824,16 +945,5 @@ class ClockCache final : public ShardedCache {
 
 }  // end anonymous namespace
 
-std::shared_ptr<Cache> NewClockCache(
-    size_t capacity, int num_shard_bits, bool strict_capacity_limit,
-    CacheMetadataChargePolicy metadata_charge_policy) {
-  if (num_shard_bits < 0) {
-    num_shard_bits = GetDefaultCacheShardBits(capacity);
-  }
-  return std::make_shared<ClockCache>(
-      capacity, num_shard_bits, strict_capacity_limit, metadata_charge_policy);
-}
-
-}  // namespace ROCKSDB_NAMESPACE
 
 #endif  // SUPPORT_CLOCK_CACHE
