@@ -20,6 +20,7 @@
 #include "cache/sharded_cache.h"
 #include "port/lang.h"
 #include "port/malloc.h"
+#include "port/mmap.h"
 #include "port/port.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/secondary_cache.h"
@@ -312,11 +313,13 @@ struct ClockHandleBasicData {
   UniqueId64x2 hashed_key = kNullUniqueId64x2;
   size_t total_charge = 0;
 
+  // ************* FIXME?
   // For total_charge_and_flags
   // "Detached" means the handle is allocated separately from hash table.
   static constexpr uint64_t kFlagDetached = uint64_t{1} << 63;
   // Extract just the total charge
   static constexpr uint64_t kTotalChargeMask = kFlagDetached - 1;
+  // *************
 
   inline size_t GetTotalCharge() const { return total_charge; }
 
@@ -555,6 +558,140 @@ class HyperClockTable {
   std::atomic<size_t> detached_usage_{};
 };  // class HyperClockTable
 
+class FastClockTable {
+ public:
+  // Target size to be exactly a common cache line size (see static_assert in
+  // clock_cache.cc)
+  struct ALIGN_AS(64U) HandleImpl : public ClockHandle {
+    // TODO: doc
+    std::atomic<uint32_t> next{};
+
+    // TODO: doc & can we eliminate?
+    static constexpr uint32_t kNextFollowFlag = uint32_t{1} << 31;
+    static constexpr uint32_t kNextInsertableFlag = uint32_t{1} << 30;
+    static constexpr uint32_t kNextNoFlagsMask =
+        ~(kNextFollowFlag | kNextInsertableFlag);
+
+    // Whether this is a "deteched" handle that is independently allocated
+    // with `new` (so must be deleted with `delete`).
+    // TODO: ideally this would be packed into some other data field, such
+    // as upper bits of total_charge, but that incurs a measurable performance
+    // regression.
+    bool detached = false;
+
+    inline bool IsDetached() const { return detached; }
+
+    inline void SetDetached() { detached = true; }
+  };  // struct HandleImpl
+
+  struct Opts {
+    size_t min_avg_value_size;
+  };
+
+  FastClockTable(size_t capacity, bool strict_capacity_limit,
+                 CacheMetadataChargePolicy metadata_charge_policy,
+                 const Opts& opts);
+  ~FastClockTable();
+
+  Status Insert(const ClockHandleBasicData& proto, HandleImpl** handle,
+                Cache::Priority priority, size_t capacity,
+                bool strict_capacity_limit);
+
+  HandleImpl* Lookup(const UniqueId64x2& hashed_key);
+
+  bool Release(HandleImpl* handle, bool useful, bool erase_if_last_ref);
+
+  void Ref(HandleImpl& handle);
+
+  void Erase(const UniqueId64x2& hashed_key);
+
+  void ConstApplyToEntriesRange(std::function<void(const HandleImpl&)> func,
+                                size_t index_begin, size_t index_end,
+                                bool apply_if_will_be_deleted) const;
+
+  void EraseUnRefEntries();
+
+  size_t GetTableSize() const;
+
+  int GetLengthBits() const {
+    return static_cast<int>(threshold_.load() & 255U);
+  }
+
+  size_t GetOccupancy() const {
+    return occupancy_.load(std::memory_order_relaxed);
+  }
+
+  size_t GetUsage() const { return usage_.load(std::memory_order_relaxed); }
+
+  size_t GetDetachedUsage() const {
+    return detached_usage_.load(std::memory_order_relaxed);
+  }
+
+  // Acquire/release N references
+  void TEST_RefN(HandleImpl& handle, size_t n);
+  void TEST_ReleaseN(HandleImpl* handle, size_t n);
+
+ private:  // functions
+  bool GrowIfNeeded(size_t new_occupancy, uint64_t& known_threshold);
+
+  // Takes an "under construction" entry and ... (TODO).
+  // Returns final 'next' of h before (possibly) being copied and wiped.
+  // Could be "out of date" after this operation, though.
+  uint32_t FinishErasure(HandleImpl* h, HandleImpl* possible_prev);
+
+  bool TryEraseHandle(HandleImpl* h, bool holding_ref, bool mark_invisible);
+
+  // Runs the clock eviction algorithm trying to reclaim at least
+  // requested_charge. Returns how much is evicted, which could be less
+  // if it appears impossible to evict the requested amount without blocking.
+  void Evict(size_t requested_charge, uint64_t known_threshold,
+             size_t* freed_charge, size_t* freed_count);
+
+  // Returns the number of bits used to hash an element in the hash
+  // table.
+  static int CalcHashBits(size_t capacity, size_t estimated_value_size,
+                          CacheMetadataChargePolicy metadata_charge_policy);
+
+ private:  // data
+  // std::string debug_history;
+
+  const int max_length_bits_;
+
+  CacheMetadataChargePolicy metadata_charge_policy_;
+
+  const MemMapping array_mem_;
+
+  // Pointer to mmaped area holding handles
+  HandleImpl* const array_;
+
+  // We partition the following members into different cache lines
+  // to avoid false sharing among Lookup, Release, Erase and Insert
+  // operations in ClockCacheShard.
+
+  ALIGN_AS(CACHE_LINE_SIZE)
+  // TODO: doc
+  // Top bit always 1, then hash threshold (always or-in top hash bit)
+  // then bottom bits are min right shift amount. Shift by 1 more if
+  // >= hash threshold.
+  std::atomic<uint64_t> threshold_;
+
+  port::Mutex grow_mutex_;
+
+  ALIGN_AS(CACHE_LINE_SIZE)
+  // Clock algorithm sweep pointer.
+  std::atomic<uint64_t> clock_pointer_{};
+
+  ALIGN_AS(CACHE_LINE_SIZE)
+  // Number of elements in the table.
+  std::atomic<size_t> occupancy_{};
+
+  // Memory usage by entries tracked by the cache (including detached)
+  std::atomic<size_t> usage_{};
+
+  // Part of usage by detached entries (not in table)
+  std::atomic<size_t> detached_usage_{};
+};  // class FastClockTable
+
 // A single shard of sharded cache.
 template <class Table>
 class ALIGN_AS(CACHE_LINE_SIZE) ClockCacheShard final : public CacheShardBase {
@@ -684,6 +821,29 @@ class HyperClockCache
 
   DeleterFn GetDeleter(Handle* handle) const override;
 };  // class HyperClockCache
+
+class FastClockCache
+#ifdef NDEBUG
+    final
+#endif
+    : public ShardedCache<ClockCacheShard<FastClockTable>> {
+ public:
+  using Shard = ClockCacheShard<FastClockTable>;
+
+  FastClockCache(size_t capacity, int num_shard_bits,
+                 bool strict_capacity_limit,
+                 CacheMetadataChargePolicy metadata_charge_policy,
+                 std::shared_ptr<MemoryAllocator> memory_allocator,
+                 size_t min_avg_value_size);
+
+  const char* Name() const override { return "FastClockCache"; }
+
+  void* Value(Handle* handle) override;
+
+  size_t GetCharge(Handle* handle) const override;
+
+  DeleterFn GetDeleter(Handle* handle) const override;
+};  // class FastClockCache
 
 }  // namespace clock_cache
 

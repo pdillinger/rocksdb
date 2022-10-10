@@ -123,6 +123,9 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
                                   FLAGS_block_size /*estimated_entry_charge*/,
                                   num_shard_bits)
         .MakeSharedCache();
+  } else if (FLAGS_cache_type == "fast_clock_cache") {
+    return FastClockCacheOptions(static_cast<size_t>(capacity), num_shard_bits)
+        .MakeSharedCache();
   } else if (FLAGS_cache_type == "lru_cache") {
     LRUCacheOptions opts;
     opts.capacity = capacity;

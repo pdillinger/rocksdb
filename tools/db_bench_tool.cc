@@ -3054,6 +3054,10 @@ class Benchmark {
                                     FLAGS_block_size /*estimated_entry_charge*/,
                                     FLAGS_cache_numshardbits)
           .MakeSharedCache();
+    } else if (FLAGS_cache_type == "fast_clock_cache") {
+      return FastClockCacheOptions(static_cast<size_t>(capacity),
+                                   FLAGS_cache_numshardbits)
+          .MakeSharedCache();
     } else if (FLAGS_cache_type == "lru_cache") {
       LRUCacheOptions opts(
           static_cast<size_t>(capacity), FLAGS_cache_numshardbits,

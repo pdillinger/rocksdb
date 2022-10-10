@@ -352,6 +352,25 @@ struct HyperClockCacheOptions : public ShardedCacheOptions {
   std::shared_ptr<Cache> MakeSharedCache() const;
 };
 
+struct FastClockCacheOptions : public ShardedCacheOptions {
+  size_t min_avg_entry_charge;
+
+  FastClockCacheOptions(
+      size_t _capacity, int _num_shard_bits = -1,
+      bool _strict_capacity_limit = false,
+      std::shared_ptr<MemoryAllocator> _memory_allocator = nullptr,
+      CacheMetadataChargePolicy _metadata_charge_policy =
+          kDefaultCacheMetadataChargePolicy,
+      size_t _min_avg_entry_charge = 400)
+      : ShardedCacheOptions(_capacity, _num_shard_bits, _strict_capacity_limit,
+                            std::move(_memory_allocator),
+                            _metadata_charge_policy),
+        min_avg_entry_charge(_min_avg_entry_charge) {}
+
+  // Construct an instance of HyperClockCache using these options
+  std::shared_ptr<Cache> MakeSharedCache() const;
+};
+
 // DEPRECATED - The old Clock Cache implementation had an unresolved bug and
 // has been removed. The new HyperClockCache requires an additional
 // configuration parameter that is not provided by this API. This function
