@@ -7,8 +7,8 @@
 
 #include <jni.h>
 
+#include "cache/cache_impl.h"
 #include "include/org_rocksdb_WriteBufferManager.h"
-#include "rocksdb/cache.h"
 #include "rocksjni/cplusplus_to_java_convert.h"
 
 /*

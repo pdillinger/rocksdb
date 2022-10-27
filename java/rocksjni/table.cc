@@ -10,10 +10,10 @@
 
 #include <jni.h>
 
+#include "cache/cache_impl.h"
 #include "include/org_rocksdb_BlockBasedTableConfig.h"
 #include "include/org_rocksdb_PlainTableConfig.h"
 #include "portal.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksjni/cplusplus_to_java_convert.h"
 

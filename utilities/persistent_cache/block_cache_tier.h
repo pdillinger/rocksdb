@@ -19,11 +19,11 @@
 #include <string>
 #include <thread>
 
+#include "cache/cache_impl.h"
 #include "memory/arena.h"
 #include "memtable/skiplist.h"
 #include "monitoring/histogram.h"
 #include "port/port.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/persistent_cache.h"
 #include "rocksdb/system_clock.h"

@@ -8,6 +8,8 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "rocksdb/write_buffer_manager.h"
+
+#include "cache/cache_impl.h"
 #include "test_util/testharness.h"
 
 namespace ROCKSDB_NAMESPACE {

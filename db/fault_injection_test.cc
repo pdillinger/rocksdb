@@ -11,12 +11,12 @@
 // the last "sync". It then checks for data loss errors by purposely dropping
 // file data (or entire files) not protected by a "sync".
 
+#include "cache/cache_impl.h"
 #include "db/db_impl/db_impl.h"
 #include "db/log_format.h"
 #include "db/version_set.h"
 #include "env/mock_env.h"
 #include "file/filename.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"

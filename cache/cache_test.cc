@@ -7,14 +7,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include "rocksdb/cache.h"
-
 #include <forward_list>
 #include <functional>
 #include <iostream>
 #include <string>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "cache/fast_lru_cache.h"
 #include "cache/lru_cache.h"
 #include "port/stack_trace.h"

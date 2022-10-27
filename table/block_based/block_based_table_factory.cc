@@ -16,11 +16,11 @@
 #include <string>
 
 #include "cache/cache_entry_roles.h"
+#include "cache/cache_impl.h"
 #include "cache/cache_reservation_manager.h"
 #include "logging/logging.h"
 #include "options/options_helper.h"
 #include "port/port.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/flush_block_policy.h"

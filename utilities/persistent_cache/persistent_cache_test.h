@@ -18,10 +18,10 @@
 #include <thread>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "db/db_test_util.h"
 #include "memory/arena.h"
 #include "port/port.h"
-#include "rocksdb/cache.h"
 #include "table/block_based/block_builder.h"
 #include "test_util/testharness.h"
 #include "util/random.h"

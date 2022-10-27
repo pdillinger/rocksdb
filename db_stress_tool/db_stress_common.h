@@ -35,6 +35,7 @@
 #include <queue>
 #include <thread>
 
+#include "cache/cache_impl.h"
 #include "db/db_impl/db_impl.h"
 #include "db/version_set.h"
 #include "db_stress_tool/db_stress_env_wrapper.h"
@@ -45,7 +46,6 @@
 #include "monitoring/histogram.h"
 #include "options/options_helper.h"
 #include "port/port.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/env.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/slice_transform.h"

@@ -22,10 +22,10 @@
 #include <utility>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "db/db_impl/db_impl.h"
 #include "file/filename.h"
 #include "rocksdb/advanced_options.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"

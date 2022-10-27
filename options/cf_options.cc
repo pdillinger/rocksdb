@@ -10,6 +10,7 @@
 #include <limits>
 #include <string>
 
+#include "cache/cache_impl.h"
 #include "logging/logging.h"
 #include "options/configurable_helper.h"
 #include "options/db_options.h"

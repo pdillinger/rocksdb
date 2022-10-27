@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "cache/cache_impl.h"
 #include "db/blob/blob_index.h"
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
@@ -25,7 +26,6 @@
 #include "db/version_util.h"
 #include "db/write_batch_internal.h"
 #include "file/filename.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/experimental.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/filter_policy.h"

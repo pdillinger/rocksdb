@@ -11,9 +11,9 @@
 #include <unordered_set>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "options/cf_options.h"
 #include "options/db_options.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/filter_policy.h"

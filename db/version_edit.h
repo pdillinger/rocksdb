@@ -14,6 +14,7 @@
 #include <utility>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "db/blob/blob_file_addition.h"
 #include "db/blob/blob_file_garbage.h"
 #include "db/dbformat.h"
@@ -21,7 +22,6 @@
 #include "memory/arena.h"
 #include "port/malloc.h"
 #include "rocksdb/advanced_options.h"
-#include "rocksdb/cache.h"
 #include "table/table_reader.h"
 #include "table/unique_id_impl.h"
 #include "util/autovector.h"

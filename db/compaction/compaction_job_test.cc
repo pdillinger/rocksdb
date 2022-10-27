@@ -14,6 +14,7 @@
 #include <string>
 #include <tuple>
 
+#include "cache/cache_impl.h"
 #include "db/blob/blob_index.h"
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
@@ -22,7 +23,6 @@
 #include "file/random_access_file_reader.h"
 #include "file/writable_file_writer.h"
 #include "options/options_helper.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/file_system.h"

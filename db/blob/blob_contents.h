@@ -7,8 +7,8 @@
 
 #include <memory>
 
+#include "cache/cache_impl.h"
 #include "memory/memory_allocator.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/rocksdb_namespace.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"

@@ -63,7 +63,7 @@ class SecondaryCache : public Customizable {
   // depending on the admission control policy, even if the return status is
   // success.
   virtual Status Insert(const Slice& key, void* value,
-                        const Cache::CacheItemHelper* helper) = 0;
+                        const cache::CacheItemHelper* helper) = 0;
 
   // Lookup the data for the given key in this cache. The create_cb
   // will be used to create the object. The handle returned may not be
@@ -79,7 +79,7 @@ class SecondaryCache : public Customizable {
   // is_in_sec_cache is to indicate whether the handle is possibly erased
   // from the secondary cache after the Lookup.
   virtual std::unique_ptr<SecondaryCacheResultHandle> Lookup(
-      const Slice& key, const Cache::CreateCallback& create_cb, bool wait,
+      const Slice& key, const cache::CreateCallback& create_cb, bool wait,
       bool advise_erase, bool& is_in_sec_cache) = 0;
 
   // Indicate whether a handle can be erased in this secondary cache.

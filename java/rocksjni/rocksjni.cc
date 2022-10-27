@@ -17,8 +17,8 @@
 #include <tuple>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "include/org_rocksdb_RocksDB.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"

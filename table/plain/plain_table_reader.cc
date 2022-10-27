@@ -10,11 +10,11 @@
 #include <string>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "db/dbformat.h"
 #include "memory/arena.h"
 #include "monitoring/histogram.h"
 #include "monitoring/perf_context_imp.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/env.h"
 #include "rocksdb/filter_policy.h"

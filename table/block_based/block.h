@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "db/pinned_iterators_manager.h"
 #include "port/malloc.h"
 #include "rocksdb/iterator.h"

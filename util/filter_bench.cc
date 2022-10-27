@@ -16,10 +16,10 @@ int main() {
 #include <sstream>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "memory/arena.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/env.h"
 #include "rocksdb/system_clock.h"
 #include "rocksdb/table.h"

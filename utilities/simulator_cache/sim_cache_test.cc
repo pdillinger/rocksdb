@@ -85,7 +85,8 @@ TEST_F(SimCacheTest, SimCache) {
   co.strict_capacity_limit = false;
   co.metadata_charge_policy = kDontChargeCacheMetadata;
   std::shared_ptr<SimCache> simCache = NewSimCache(NewLRUCache(co), 20000, 0);
-  table_options.block_cache = simCache;
+  auto cache = simCache->AsCache();
+  table_options.block_cache = cache;
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
   Reopen(options);
   RecordCacheCounters(options);
@@ -106,14 +107,14 @@ TEST_F(SimCacheTest, SimCache) {
   ASSERT_EQ(kNumBlocks, simCache->get_hit_counter() +
                             simCache->get_miss_counter() - base_misses);
   ASSERT_EQ(0, simCache->get_hit_counter());
-  size_t usage = simCache->GetUsage();
+  size_t usage = cache->GetUsage();
   ASSERT_LT(0, usage);
   ASSERT_EQ(usage, simCache->GetSimUsage());
-  simCache->SetCapacity(usage);
-  ASSERT_EQ(usage, simCache->GetPinnedUsage());
+  cache->SetCapacity(usage);
+  ASSERT_EQ(usage, cache->GetPinnedUsage());
 
   // Test with strict capacity limit.
-  simCache->SetStrictCapacityLimit(true);
+  cache->SetStrictCapacityLimit(true);
   iter = db_->NewIterator(read_options);
   iter->Seek(std::to_string(kNumBlocks * 2 - 1));
   ASSERT_TRUE(iter->status().IsMemoryLimit());
@@ -140,7 +141,7 @@ TEST_F(SimCacheTest, SimCache) {
     ASSERT_OK(it->status());
     CheckCacheCounters(options, 1, 0, 1, 0);
   }
-  ASSERT_EQ(0, simCache->GetPinnedUsage());
+  ASSERT_EQ(0, cache->GetPinnedUsage());
   ASSERT_EQ(3 * kNumBlocks + 1, simCache->get_hit_counter() +
                                     simCache->get_miss_counter() - base_misses);
   ASSERT_EQ(6, simCache->get_hit_counter());
@@ -154,7 +155,7 @@ TEST_F(SimCacheTest, SimCacheLogging) {
   co.capacity = 1024 * 1024;
   co.metadata_charge_policy = kDontChargeCacheMetadata;
   std::shared_ptr<SimCache> sim_cache = NewSimCache(NewLRUCache(co), 20000, 0);
-  table_options.block_cache = sim_cache;
+  table_options.block_cache = sim_cache->AsCache();
   options.table_factory.reset(NewBlockBasedTableFactory(table_options));
   Reopen(options);
 

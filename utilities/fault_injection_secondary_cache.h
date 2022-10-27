@@ -32,10 +32,10 @@ class FaultInjectionSecondaryCache : public SecondaryCache {
   const char* Name() const override { return "FaultInjectionSecondaryCache"; }
 
   Status Insert(const Slice& key, void* value,
-                const Cache::CacheItemHelper* helper) override;
+                const cache::CacheItemHelper* helper) override;
 
   std::unique_ptr<SecondaryCacheResultHandle> Lookup(
-      const Slice& key, const Cache::CreateCallback& create_cb, bool wait,
+      const Slice& key, const cache::CreateCallback& create_cb, bool wait,
       bool advise_erase, bool& is_in_sec_cache) override;
 
   bool SupportForceErase() const override { return base_->SupportForceErase(); }

@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "cache/cache_entry_roles.h"
+#include "cache/cache_impl.h"
 #include "cache/cache_key.h"
 #include "db/compaction/compaction_picker.h"
 #include "db/dbformat.h"
@@ -30,7 +31,6 @@
 #include "logging/logging.h"
 #include "monitoring/perf_context_imp.h"
 #include "port/lang.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/env.h"

@@ -8,9 +8,9 @@
 #include <cassert>
 #include <memory>
 
+#include "cache/cache_impl.h"
 #include "db/blob/blob_file_reader.h"
 #include "options/cf_options.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/slice.h"
 #include "test_util/sync_point.h"
 #include "trace_replay/io_tracer.h"

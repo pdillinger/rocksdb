@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "cache/cache_key.h"
 #include "cache/clock_cache.h"
 #include "cache/fast_lru_cache.h"
@@ -15,7 +16,6 @@
 #include "file/sst_file_manager_impl.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/io_status.h"
 #include "rocksdb/sst_file_manager.h"
 #include "rocksdb/utilities/cache_dump_load.h"

@@ -14,7 +14,7 @@
 #include <memory>
 
 #include "cache/cache_entry_roles.h"
-#include "rocksdb/cache.h"
+#include "cache/cache_impl.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "table/block_based/reader_common.h"

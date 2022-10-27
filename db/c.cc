@@ -16,8 +16,8 @@
 #include <unordered_set>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "port/port.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/convenience.h"

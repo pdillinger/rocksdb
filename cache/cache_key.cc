@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <atomic>
 
-#include "rocksdb/cache.h"
+#include "cache/cache_impl.h"
 #include "table/unique_id_impl.h"
 #include "util/hash.h"
 #include "util/math.h"

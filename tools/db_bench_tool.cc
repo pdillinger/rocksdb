@@ -37,6 +37,7 @@
 #include <thread>
 #include <unordered_map>
 
+#include "cache/cache_impl.h"
 #include "cache/fast_lru_cache.h"
 #include "db/db_impl/db_impl.h"
 #include "db/malloc_stats.h"
@@ -46,7 +47,6 @@
 #include "options/cf_options.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"
 #include "rocksdb/env.h"
@@ -3139,9 +3139,10 @@ class Benchmark {
     if (FLAGS_simcache_size >= 0) {
       if (FLAGS_cache_numshardbits >= 1) {
         cache_ =
-            NewSimCache(cache_, FLAGS_simcache_size, FLAGS_cache_numshardbits);
+            NewSimCache(cache_, FLAGS_simcache_size, FLAGS_cache_numshardbits)
+                ->AsCache();
       } else {
-        cache_ = NewSimCache(cache_, FLAGS_simcache_size, 0);
+        cache_ = NewSimCache(cache_, FLAGS_simcache_size, 0)->AsCache();
       }
     }
 
@@ -3821,11 +3822,12 @@ class Benchmark {
     if (FLAGS_statistics) {
       fprintf(stdout, "STATISTICS:\n%s\n", dbstats->ToString().c_str());
     }
+#ifdef ROCKSDB_USE_RTTI
     if (FLAGS_simcache_size >= 0) {
-      fprintf(
-          stdout, "SIMULATOR CACHE STATISTICS:\n%s\n",
-          static_cast_with_check<SimCache>(cache_.get())->ToString().c_str());
+      fprintf(stdout, "SIMULATOR CACHE STATISTICS:\n%s\n",
+              dynamic_cast<SimCache*>(cache_.get())->ToString().c_str());
     }
+#endif  // ROCKSDB_USE_RTTI
 
 #ifndef ROCKSDB_LITE
     if (FLAGS_use_secondary_db) {

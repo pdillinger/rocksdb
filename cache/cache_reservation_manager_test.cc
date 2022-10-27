@@ -13,7 +13,7 @@
 #include <memory>
 
 #include "cache/cache_entry_roles.h"
-#include "rocksdb/cache.h"
+#include "cache/cache_impl.h"
 #include "rocksdb/slice.h"
 #include "test_util/testharness.h"
 #include "util/coding.h"

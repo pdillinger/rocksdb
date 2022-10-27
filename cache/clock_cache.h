@@ -16,12 +16,12 @@
 #include <memory>
 #include <string>
 
+#include "cache/cache_impl.h"
 #include "cache/cache_key.h"
 #include "cache/sharded_cache.h"
 #include "port/lang.h"
 #include "port/malloc.h"
 #include "port/port.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/secondary_cache.h"
 #include "util/autovector.h"
 

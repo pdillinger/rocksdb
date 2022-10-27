@@ -21,6 +21,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "cache/lru_cache.h"
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
@@ -31,7 +32,6 @@
 #include "options/options_helper.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/compression_type.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"

@@ -11,8 +11,8 @@
 
 #include <cassert>
 
+#include "cache/cache_impl.h"
 #include "port/likely.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/cleanable.h"
 
 namespace ROCKSDB_NAMESPACE {

@@ -12,11 +12,11 @@
 #include <cinttypes>
 #include <limits>
 
+#include "cache/cache_impl.h"
 #include "logging/logging.h"
 #include "monitoring/statistics.h"
 #include "options/db_options.h"
 #include "options/options_helper.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/comparator.h"
 #include "rocksdb/env.h"

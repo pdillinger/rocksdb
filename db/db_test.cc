@@ -25,6 +25,7 @@
 #include <alloca.h>
 #endif
 
+#include "cache/cache_impl.h"
 #include "cache/lru_cache.h"
 #include "db/blob/blob_index.h"
 #include "db/blob/blob_log_format.h"
@@ -39,7 +40,6 @@
 #include "monitoring/thread_status_util.h"
 #include "port/port.h"
 #include "port/stack_trace.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"

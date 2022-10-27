@@ -8,6 +8,7 @@
 #include <cassert>
 #include <string>
 
+#include "cache/cache_impl.h"
 #include "db/blob/blob_log_format.h"
 #include "db/blob/blob_log_writer.h"
 #include "env/mock_env.h"
@@ -15,7 +16,6 @@
 #include "file/read_write_util.h"
 #include "file/writable_file_writer.h"
 #include "options/cf_options.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/options.h"

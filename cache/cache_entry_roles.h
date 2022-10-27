@@ -10,7 +10,7 @@
 #include <memory>
 #include <type_traits>
 
-#include "rocksdb/cache.h"
+#include "cache/cache_impl.h"
 #include "util/hash_containers.h"
 
 namespace ROCKSDB_NAMESPACE {

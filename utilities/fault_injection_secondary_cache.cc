@@ -8,6 +8,8 @@
 
 #include "utilities/fault_injection_secondary_cache.h"
 
+#include "cache/cache_impl.h"
+
 namespace ROCKSDB_NAMESPACE {
 
 void FaultInjectionSecondaryCache::ResultHandle::UpdateHandleValue(

@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "rocksdb/cache.h"
+#include "cache/cache_impl.h"
 #include "utilities/persistent_cache/hash_table.h"
 #include "utilities/persistent_cache/hash_table_evictable.h"
 #include "utilities/persistent_cache/persistent_cache_tier.h"

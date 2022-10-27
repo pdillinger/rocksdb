@@ -10,13 +10,13 @@
 #include <map>
 #include <string>
 
+#include "cache/cache_impl.h"
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 #include "db/log_writer.h"
 #include "db/version_set.h"
 #include "env/mock_env.h"
 #include "file/writable_file_writer.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/write_batch.h"
 #include "rocksdb/write_buffer_manager.h"

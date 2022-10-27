@@ -12,12 +12,12 @@
 #include <cstring>
 #include <unordered_map>
 
+#include "cache/cache_impl.h"
 #include "cache/lru_cache.h"
 #include "cache/sharded_cache.h"
 #include "options/options_helper.h"
 #include "options/options_parser.h"
 #include "port/port.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/file_checksum.h"
 #include "rocksdb/memtablerep.h"

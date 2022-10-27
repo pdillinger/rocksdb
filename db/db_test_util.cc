@@ -9,11 +9,11 @@
 
 #include "db/db_test_util.h"
 
+#include "cache/cache_impl.h"
 #include "cache/cache_reservation_manager.h"
 #include "db/forward_iterator.h"
 #include "env/mock_env.h"
 #include "port/lang.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/env_encryption.h"
 #include "rocksdb/unique_id.h"

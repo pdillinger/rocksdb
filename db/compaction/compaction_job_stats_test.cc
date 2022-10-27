@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <utility>
 
+#include "cache/cache_impl.h"
 #include "db/db_impl/db_impl.h"
 #include "db/dbformat.h"
 #include "db/job_context.h"
@@ -27,7 +28,6 @@
 #include "monitoring/statistics.h"
 #include "monitoring/thread_status_util.h"
 #include "port/stack_trace.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/compaction_filter.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/db.h"

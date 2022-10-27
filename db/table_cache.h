@@ -14,11 +14,11 @@
 #include <string>
 #include <vector>
 
+#include "cache/cache_impl.h"
 #include "db/dbformat.h"
 #include "db/range_del_aggregator.h"
 #include "options/cf_options.h"
 #include "port/port.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/env.h"
 #include "rocksdb/options.h"
 #include "rocksdb/table.h"

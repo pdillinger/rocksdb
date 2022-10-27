@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <iomanip>
+#include <memory>
 
 #include "file/writable_file_writer.h"
 #include "monitoring/statistics.h"
@@ -146,7 +147,9 @@ class CacheActivityLogger {
 };
 
 // SimCacheImpl definition
-class SimCacheImpl : public SimCache {
+class SimCacheImpl : public Cache,
+                     public SimCache,
+                     public std::enable_shared_from_this<SimCache> {
  public:
   // capacity for real cache (ShardedLRUCache)
   // test_capacity for key only cache
@@ -158,6 +161,14 @@ class SimCacheImpl : public SimCache {
         stats_(nullptr) {}
 
   ~SimCacheImpl() override {}
+
+  const char* Name() const override { return "SimCache"; }
+
+  std::shared_ptr<Cache> AsCache() override {
+    Cache* this_as_cache = this;
+    return {shared_from_this(), this_as_cache};
+  }
+
   void SetCapacity(size_t capacity) override { cache_->SetCapacity(capacity); }
 
   void SetStrictCapacityLimit(bool strict_capacity_limit) override {

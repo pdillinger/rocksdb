@@ -14,6 +14,7 @@ int main() {
 int main() { return 0; }
 #else
 #include <semaphore.h>
+
 #include <atomic>
 #include <bitset>
 #include <chrono>
@@ -25,8 +26,8 @@ int main() { return 0; }
 #include <random>
 #include <thread>
 
+#include "cache/cache_impl.h"
 #include "port/port.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/db.h"
 #include "rocksdb/status.h"
 #include "rocksdb/table.h"

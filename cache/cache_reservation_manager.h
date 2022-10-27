@@ -17,8 +17,8 @@
 #include <vector>
 
 #include "cache/cache_entry_roles.h"
+#include "cache/cache_impl.h"
 #include "cache/cache_key.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/slice.h"
 #include "rocksdb/status.h"
 #include "util/coding.h"

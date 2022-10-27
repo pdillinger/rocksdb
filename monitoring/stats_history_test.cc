@@ -12,6 +12,7 @@
 #include <string>
 #include <unordered_map>
 
+#include "cache/cache_impl.h"
 #include "db/column_family.h"
 #include "db/db_impl/db_impl.h"
 #include "db/db_test_util.h"
@@ -19,7 +20,6 @@
 #include "monitoring/persistent_stats_history.h"
 #include "options/options_helper.h"
 #include "port/stack_trace.h"
-#include "rocksdb/cache.h"
 #include "rocksdb/convenience.h"
 #include "rocksdb/rate_limiter.h"
 #include "test_util/mock_time_env.h"

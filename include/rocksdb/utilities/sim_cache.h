@@ -42,13 +42,13 @@ extern std::shared_ptr<SimCache> NewSimCache(std::shared_ptr<Cache> sim_cache,
                                              std::shared_ptr<Cache> cache,
                                              int num_shard_bits);
 
-class SimCache : public Cache {
+class SimCache {
  public:
   SimCache() {}
 
-  ~SimCache() override {}
+  virtual ~SimCache() {}
 
-  const char* Name() const override { return "SimCache"; }
+  virtual std::shared_ptr<Cache> AsCache() = 0;
 
   // returns the maximum configured capacity of the simcache for simulation
   virtual size_t GetSimCapacity() const = 0;
