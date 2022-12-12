@@ -1877,6 +1877,19 @@ struct CompactRangeOptions {
   // If true, compacted files will be moved to the minimum level capable
   // of holding the data or given level (specified non-negative target_level).
   bool change_level = false;
+  // If true, will execute immediately even if doing so would cause the DB to
+  // enter write stall mode. Otherwise, it'll sleep until load is low enough.
+  bool allow_write_stall = false;
+  // Normally (false), a few entries within SST files might be queried to
+  // determine whether the compaction range is entirely within a gap between
+  // adjacent entries in a file, which is considered "no overlap". If this
+  // options is set to true, the files for compaction are selected without
+  // regard to overlap within the file, only the first and last keys
+  // of the file. Setting to true is useful if SstPartitionerFactory changes
+  // and specific SST partitionings need to be established. Specifically, if
+  // the begin and end keys cross a partition boundary, any files crossing that
+  // boundary will be considered to overlap if also crossing that boundary.
+  bool use_file_level_overlap = false;
   // If change_level is true and target_level have non-negative value, compacted
   // files will be moved to target_level.
   int target_level = -1;
@@ -1887,9 +1900,6 @@ struct CompactRangeOptions {
   // if there is a compaction filter
   BottommostLevelCompaction bottommost_level_compaction =
       BottommostLevelCompaction::kIfHaveCompactionFilter;
-  // If true, will execute immediately even if doing so would cause the DB to
-  // enter write stall mode. Otherwise, it'll sleep until load is low enough.
-  bool allow_write_stall = false;
   // If > 0, it will replace the option in the DBOptions for this compaction.
   uint32_t max_subcompactions = 0;
   // Set user-defined timestamp low bound, the data with older timestamp than
