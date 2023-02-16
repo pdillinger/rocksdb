@@ -495,9 +495,6 @@ class LRUCache
                kDontChargeCacheMetadata,
            std::shared_ptr<SecondaryCache> secondary_cache = nullptr);
   const char* Name() const override { return "LRUCache"; }
-  ObjectPtr Value(Handle* handle) override;
-  size_t GetCharge(Handle* handle) const override;
-  const CacheItemHelper* GetCacheItemHelper(Handle* handle) const override;
   void WaitAll(std::vector<Handle*>& handles) override;
 
   // Retrieves number of elements in LRU, for unit test purpose only.

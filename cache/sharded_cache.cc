@@ -10,6 +10,7 @@
 #include "cache/sharded_cache.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 
@@ -21,12 +22,13 @@ namespace ROCKSDB_NAMESPACE {
 
 ShardedCacheBase::ShardedCacheBase(size_t capacity, int num_shard_bits,
                                    bool strict_capacity_limit,
-                                   std::shared_ptr<MemoryAllocator> allocator)
+                                   std::shared_ptr<MemoryAllocator> allocator,CacheMetadataChargePolicy metadata_charge_policy)
     : Cache(std::move(allocator)),
       last_id_(1),
       shard_mask_((uint32_t{1} << num_shard_bits) - 1),
       strict_capacity_limit_(strict_capacity_limit),
-      capacity_(capacity) {}
+      capacity_(capacity),
+      metadata_charge_policy_(metadata_charge_policy) {}
 
 size_t ShardedCacheBase::ComputePerShardCapacity(size_t capacity) const {
   uint32_t num_shards = GetNumShards();
@@ -96,5 +98,18 @@ int ShardedCacheBase::GetNumShardBits() const {
 }
 
 uint32_t ShardedCacheBase::GetNumShards() const { return shard_mask_ + 1; }
+
+Cache::ObjectPtr ShardedCacheBase::Value(Handle* handle) {
+  auto h = static_cast<const CacheHandleBase*>(handle);
+  auto v = h->value.load(std::memory_order_relaxed);
+  assert(!h->IsPending() || v == nullptr);
+  return v;
+}
+
+const Cache::CacheItemHelper* ShardedCacheBase::GetCacheItemHelper(
+    Handle* handle) const {
+  auto h = static_cast<const CacheHandleBase*>(handle);
+  return h->helper;
+}
 
 }  // namespace ROCKSDB_NAMESPACE

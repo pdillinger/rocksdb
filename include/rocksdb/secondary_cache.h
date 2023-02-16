@@ -22,7 +22,8 @@ namespace ROCKSDB_NAMESPACE {
 // ready, and call Wait() in order to block until it becomes ready.
 // The caller must call Value() after it becomes ready to determine if the
 // handle successfullly read the item.
-class SecondaryCacheResultHandle {
+// NOTE: alignas used internally (ShardedCache)
+class alignas(16) SecondaryCacheResultHandle {
  public:
   virtual ~SecondaryCacheResultHandle() = default;
 
