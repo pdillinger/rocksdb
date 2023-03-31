@@ -94,14 +94,14 @@ class StackableDB : public DB {
   }
 
   using DB::Get;
-  virtual Status Get(const ReadOptions& options,
+  virtual Status Get(const PointReadOptions& options,
                      ColumnFamilyHandle* column_family, const Slice& key,
                      PinnableSlice* value) override {
     return db_->Get(options, column_family, key, value);
   }
 
   using DB::GetEntity;
-  Status GetEntity(const ReadOptions& options,
+  Status GetEntity(const PointReadOptions& options,
                    ColumnFamilyHandle* column_family, const Slice& key,
                    PinnableWideColumns* columns) override {
     return db_->GetEntity(options, column_family, key, columns);
@@ -109,7 +109,7 @@ class StackableDB : public DB {
 
   using DB::GetMergeOperands;
   virtual Status GetMergeOperands(
-      const ReadOptions& options, ColumnFamilyHandle* column_family,
+      const PointReadOptions& options, ColumnFamilyHandle* column_family,
       const Slice& key, PinnableSlice* slice,
       GetMergeOperandsOptions* get_merge_operands_options,
       int* number_of_operands) override {
@@ -120,14 +120,14 @@ class StackableDB : public DB {
 
   using DB::MultiGet;
   virtual std::vector<Status> MultiGet(
-      const ReadOptions& options,
+      const PointReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_family,
       const std::vector<Slice>& keys,
       std::vector<std::string>* values) override {
     return db_->MultiGet(options, column_family, keys, values);
   }
 
-  virtual void MultiGet(const ReadOptions& options,
+  virtual void MultiGet(const PointReadOptions& options,
                         ColumnFamilyHandle* column_family,
                         const size_t num_keys, const Slice* keys,
                         PinnableSlice* values, Status* statuses,
@@ -138,7 +138,7 @@ class StackableDB : public DB {
 
   using DB::MultiGetEntity;
 
-  void MultiGetEntity(const ReadOptions& options,
+  void MultiGetEntity(const PointReadOptions& options,
                       ColumnFamilyHandle* column_family, size_t num_keys,
                       const Slice* keys, PinnableWideColumns* results,
                       Status* statuses, bool sorted_input) override {
@@ -146,7 +146,7 @@ class StackableDB : public DB {
                         statuses, sorted_input);
   }
 
-  void MultiGetEntity(const ReadOptions& options, size_t num_keys,
+  void MultiGetEntity(const PointReadOptions& options, size_t num_keys,
                       ColumnFamilyHandle** column_families, const Slice* keys,
                       PinnableWideColumns* results, Status* statuses,
                       bool sorted_input) override {
@@ -190,7 +190,7 @@ class StackableDB : public DB {
   }
 
   using DB::KeyMayExist;
-  virtual bool KeyMayExist(const ReadOptions& options,
+  virtual bool KeyMayExist(const PointReadOptions& options,
                            ColumnFamilyHandle* column_family, const Slice& key,
                            std::string* value,
                            bool* value_found = nullptr) override {

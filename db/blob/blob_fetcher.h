@@ -19,7 +19,7 @@ class BlobIndex;
 // A thin wrapper around the blob retrieval functionality of Version.
 class BlobFetcher {
  public:
-  BlobFetcher(const Version* version, const ReadOptions& read_options)
+  BlobFetcher(const Version* version, const PointReadOptions& read_options)
       : version_(version), read_options_(read_options) {}
 
   Status FetchBlob(const Slice& user_key, const Slice& blob_index_slice,
@@ -32,6 +32,6 @@ class BlobFetcher {
 
  private:
   const Version* version_;
-  ReadOptions read_options_;
+  PointReadOptions read_options_;
 };
 }  // namespace ROCKSDB_NAMESPACE

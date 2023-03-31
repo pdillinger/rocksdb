@@ -862,7 +862,7 @@ class Version {
   //    merge_context.operands_list and don't merge the operands
   // REQUIRES: lock is not held
   // REQUIRES: pinned_iters_mgr != nullptr
-  void Get(const ReadOptions&, const LookupKey& key, PinnableSlice* value,
+  void Get(const PointReadOptions&, const LookupKey& key, PinnableSlice* value,
            PinnableWideColumns* columns, std::string* timestamp, Status* status,
            MergeContext* merge_context,
            SequenceNumber* max_covering_tombstone_seq,
@@ -871,21 +871,21 @@ class Version {
            SequenceNumber* seq = nullptr, ReadCallback* callback = nullptr,
            bool* is_blob = nullptr, bool do_merge = true);
 
-  void MultiGet(const ReadOptions&, MultiGetRange* range,
+  void MultiGet(const PointReadOptions&, MultiGetRange* range,
                 ReadCallback* callback = nullptr);
 
   // Interprets blob_index_slice as a blob reference, and (assuming the
   // corresponding blob file is part of this Version) retrieves the blob and
   // saves it in *value.
   // REQUIRES: blob_index_slice stores an encoded blob reference
-  Status GetBlob(const ReadOptions& read_options, const Slice& user_key,
+  Status GetBlob(const PointReadOptions& read_options, const Slice& user_key,
                  const Slice& blob_index_slice,
                  FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
                  uint64_t* bytes_read) const;
 
   // Retrieves a blob using a blob reference and saves it in *value,
   // assuming the corresponding blob file is part of this Version.
-  Status GetBlob(const ReadOptions& read_options, const Slice& user_key,
+  Status GetBlob(const PointReadOptions& read_options, const Slice& user_key,
                  const BlobIndex& blob_index,
                  FilePrefetchBuffer* prefetch_buffer, PinnableSlice* value,
                  uint64_t* bytes_read) const;
@@ -900,7 +900,7 @@ class Version {
   };
 
   using BlobReadContexts = std::vector<BlobReadContext>;
-  void MultiGetBlob(const ReadOptions& read_options, MultiGetRange& range,
+  void MultiGetBlob(const PointReadOptions& read_options, MultiGetRange& range,
                     std::unordered_map<uint64_t, BlobReadContexts>& blob_ctxs);
 
   // Loads some stats information from files (if update_stats is set) and
@@ -1026,7 +1026,7 @@ class Version {
 
   DECLARE_SYNC_AND_ASYNC(
       /* ret_type */ Status, /* func_name */ MultiGetFromSST,
-      const ReadOptions& read_options, MultiGetRange file_range,
+      const PointReadOptions& read_options, MultiGetRange file_range,
       int hit_file_level, bool skip_filters, bool skip_range_deletions,
       FdWithKeyRange* f,
       std::unordered_map<uint64_t, BlobReadContexts>& blob_ctxs,
@@ -1037,7 +1037,7 @@ class Version {
   // MultiGet using async IO to read data blocks from SST files in parallel
   // within and across levels
   Status MultiGetAsync(
-      const ReadOptions& options, MultiGetRange* range,
+      const PointReadOptions& options, MultiGetRange* range,
       std::unordered_map<uint64_t, BlobReadContexts>* blob_ctxs);
 
   // A helper function to lookup a batch of keys in a single level. It will
@@ -1045,7 +1045,7 @@ class Version {
   // by creating a new batch with keys definitely not in this level and
   // enqueuing it to to_process.
   Status ProcessBatch(
-      const ReadOptions& read_options, FilePickerMultiGet* batch,
+      const PointReadOptions& read_options, FilePickerMultiGet* batch,
       std::vector<folly::coro::Task<Status>>& mget_tasks,
       std::unordered_map<uint64_t, BlobReadContexts>* blob_ctxs,
       autovector<FilePickerMultiGet, 4>& batches, std::deque<size_t>& waiting,

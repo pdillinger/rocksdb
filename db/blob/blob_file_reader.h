@@ -20,7 +20,7 @@ class Status;
 struct ImmutableOptions;
 struct FileOptions;
 class HistogramImpl;
-struct ReadOptions;
+struct PointReadOptions;
 class Slice;
 class FilePrefetchBuffer;
 class BlobContents;
@@ -41,7 +41,7 @@ class BlobFileReader {
 
   ~BlobFileReader();
 
-  Status GetBlob(const ReadOptions& read_options, const Slice& user_key,
+  Status GetBlob(const PointReadOptions& read_options, const Slice& user_key,
                  uint64_t offset, uint64_t value_size,
                  CompressionType compression_type,
                  FilePrefetchBuffer* prefetch_buffer,
@@ -51,7 +51,7 @@ class BlobFileReader {
 
   // offsets must be sorted in ascending order by caller.
   void MultiGetBlob(
-      const ReadOptions& read_options, MemoryAllocator* allocator,
+      const PointReadOptions& read_options, MemoryAllocator* allocator,
       autovector<std::pair<BlobReadRequest*, std::unique_ptr<BlobContents>>>&
           blob_reqs,
       uint64_t* bytes_read) const;

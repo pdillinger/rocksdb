@@ -1904,13 +1904,13 @@ ColumnFamilyHandle* DBImpl::PersistentStatsColumnFamily() const {
   return persist_stats_cf_handle_;
 }
 
-Status DBImpl::Get(const ReadOptions& read_options,
+Status DBImpl::Get(const PointReadOptions& read_options,
                    ColumnFamilyHandle* column_family, const Slice& key,
                    PinnableSlice* value) {
   return Get(read_options, column_family, key, value, /*timestamp=*/nullptr);
 }
 
-Status DBImpl::Get(const ReadOptions& read_options,
+Status DBImpl::Get(const PointReadOptions& read_options,
                    ColumnFamilyHandle* column_family, const Slice& key,
                    PinnableSlice* value, std::string* timestamp) {
   assert(value != nullptr);
@@ -1923,7 +1923,7 @@ Status DBImpl::Get(const ReadOptions& read_options,
   return s;
 }
 
-Status DBImpl::GetEntity(const ReadOptions& read_options,
+Status DBImpl::GetEntity(const PointReadOptions& read_options,
                          ColumnFamilyHandle* column_family, const Slice& key,
                          PinnableWideColumns* columns) {
   if (!column_family) {
@@ -1973,7 +1973,7 @@ bool DBImpl::ShouldReferenceSuperVersion(const MergeContext& merge_context) {
              merge_context.GetOperands().size();
 }
 
-Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
+Status DBImpl::GetImpl(const PointReadOptions& read_options, const Slice& key,
                        GetImplOptions& get_impl_options) {
   assert(get_impl_options.value != nullptr ||
          get_impl_options.merge_operands != nullptr ||
@@ -2265,7 +2265,7 @@ Status DBImpl::GetImpl(const ReadOptions& read_options, const Slice& key,
 }
 
 std::vector<Status> DBImpl::MultiGet(
-    const ReadOptions& read_options,
+    const PointReadOptions& read_options,
     const std::vector<ColumnFamilyHandle*>& column_family,
     const std::vector<Slice>& keys, std::vector<std::string>* values) {
   return MultiGet(read_options, column_family, keys, values,
@@ -2273,7 +2273,7 @@ std::vector<Status> DBImpl::MultiGet(
 }
 
 std::vector<Status> DBImpl::MultiGet(
-    const ReadOptions& read_options,
+    const PointReadOptions& read_options,
     const std::vector<ColumnFamilyHandle*>& column_family,
     const std::vector<Slice>& keys, std::vector<std::string>* values,
     std::vector<std::string>* timestamps) {
@@ -2596,7 +2596,7 @@ bool DBImpl::MultiCFSnapshot(
   return last_try;
 }
 
-void DBImpl::MultiGet(const ReadOptions& read_options, const size_t num_keys,
+void DBImpl::MultiGet(const PointReadOptions& read_options, const size_t num_keys,
                       ColumnFamilyHandle** column_families, const Slice* keys,
                       PinnableSlice* values, Status* statuses,
                       const bool sorted_input) {
@@ -2604,7 +2604,7 @@ void DBImpl::MultiGet(const ReadOptions& read_options, const size_t num_keys,
            /* timestamps */ nullptr, statuses, sorted_input);
 }
 
-void DBImpl::MultiGet(const ReadOptions& read_options, const size_t num_keys,
+void DBImpl::MultiGet(const PointReadOptions& read_options, const size_t num_keys,
                       ColumnFamilyHandle** column_families, const Slice* keys,
                       PinnableSlice* values, std::string* timestamps,
                       Status* statuses, const bool sorted_input) {
@@ -2612,7 +2612,7 @@ void DBImpl::MultiGet(const ReadOptions& read_options, const size_t num_keys,
                  /* columns */ nullptr, timestamps, statuses, sorted_input);
 }
 
-void DBImpl::MultiGetCommon(const ReadOptions& read_options,
+void DBImpl::MultiGetCommon(const PointReadOptions& read_options,
                             const size_t num_keys,
                             ColumnFamilyHandle** column_families,
                             const Slice* keys, PinnableSlice* values,
@@ -2797,7 +2797,7 @@ void DBImpl::PrepareMultiGetKeys(
             CompareKeyContext());
 }
 
-void DBImpl::MultiGet(const ReadOptions& read_options,
+void DBImpl::MultiGet(const PointReadOptions& read_options,
                       ColumnFamilyHandle* column_family, const size_t num_keys,
                       const Slice* keys, PinnableSlice* values,
                       Status* statuses, const bool sorted_input) {
@@ -2805,7 +2805,7 @@ void DBImpl::MultiGet(const ReadOptions& read_options,
            /* timestamps */ nullptr, statuses, sorted_input);
 }
 
-void DBImpl::MultiGet(const ReadOptions& read_options,
+void DBImpl::MultiGet(const PointReadOptions& read_options,
                       ColumnFamilyHandle* column_family, const size_t num_keys,
                       const Slice* keys, PinnableSlice* values,
                       std::string* timestamps, Status* statuses,
@@ -2814,7 +2814,7 @@ void DBImpl::MultiGet(const ReadOptions& read_options,
                  /* columns */ nullptr, timestamps, statuses, sorted_input);
 }
 
-void DBImpl::MultiGetCommon(const ReadOptions& read_options,
+void DBImpl::MultiGetCommon(const PointReadOptions& read_options,
                             ColumnFamilyHandle* column_family,
                             const size_t num_keys, const Slice* keys,
                             PinnableSlice* values, PinnableWideColumns* columns,
@@ -2858,7 +2858,7 @@ void DBImpl::MultiGetCommon(const ReadOptions& read_options,
 }
 
 void DBImpl::MultiGetWithCallback(
-    const ReadOptions& read_options, ColumnFamilyHandle* column_family,
+    const PointReadOptions& read_options, ColumnFamilyHandle* column_family,
     ReadCallback* callback,
     autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* sorted_keys) {
   std::array<MultiGetColumnFamilyData, 1> multiget_cf_data;
@@ -2927,7 +2927,7 @@ void DBImpl::MultiGetWithCallback(
 // values being Status::OK() and Status::TimedOut(). The latter indicates
 // that the call exceeded read_options.deadline
 Status DBImpl::MultiGetImpl(
-    const ReadOptions& read_options, size_t start_key, size_t num_keys,
+    const PointReadOptions& read_options, size_t start_key, size_t num_keys,
     autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* sorted_keys,
     SuperVersion* super_version, SequenceNumber snapshot,
     ReadCallback* callback) {
@@ -3042,7 +3042,7 @@ Status DBImpl::MultiGetImpl(
   return s;
 }
 
-void DBImpl::MultiGetEntity(const ReadOptions& options, size_t num_keys,
+void DBImpl::MultiGetEntity(const PointReadOptions& options, size_t num_keys,
                             ColumnFamilyHandle** column_families,
                             const Slice* keys, PinnableWideColumns* results,
                             Status* statuses, bool sorted_input) {
@@ -3050,7 +3050,7 @@ void DBImpl::MultiGetEntity(const ReadOptions& options, size_t num_keys,
                  results, /* timestamps */ nullptr, statuses, sorted_input);
 }
 
-void DBImpl::MultiGetEntity(const ReadOptions& options,
+void DBImpl::MultiGetEntity(const PointReadOptions& options,
                             ColumnFamilyHandle* column_family, size_t num_keys,
                             const Slice* keys, PinnableWideColumns* results,
                             Status* statuses, bool sorted_input) {
@@ -3319,7 +3319,7 @@ Status DBImpl::DropColumnFamilyImpl(ColumnFamilyHandle* column_family) {
   return s;
 }
 
-bool DBImpl::KeyMayExist(const ReadOptions& read_options,
+bool DBImpl::KeyMayExist(const PointReadOptions& read_options,
                          ColumnFamilyHandle* column_family, const Slice& key,
                          std::string* value, std::string* timestamp,
                          bool* value_found) {
@@ -3328,7 +3328,7 @@ bool DBImpl::KeyMayExist(const ReadOptions& read_options,
     // falsify later if key-may-exist but can't fetch value
     *value_found = true;
   }
-  ReadOptions roptions = read_options;
+  PointReadOptions roptions = read_options;
   roptions.read_tier = kBlockCacheTier;  // read from block cache only
   PinnableSlice pinnable_val;
   GetImplOptions get_impl_options;
@@ -5034,7 +5034,7 @@ Status DBImpl::GetLatestSequenceForKey(
   MergeContext merge_context;
   SequenceNumber max_covering_tombstone_seq = 0;
 
-  ReadOptions read_options;
+  PointReadOptions read_options;
   SequenceNumber current_seq = versions_->LastSequence();
 
   ColumnFamilyData* cfd = sv->cfd;

@@ -61,14 +61,14 @@ class MemTableListVersion {
            PinnableWideColumns* columns, std::string* timestamp, Status* s,
            MergeContext* merge_context,
            SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
-           const ReadOptions& read_opts, ReadCallback* callback = nullptr,
+           const PointReadOptions& read_opts, ReadCallback* callback = nullptr,
            bool* is_blob_index = nullptr);
 
   bool Get(const LookupKey& key, std::string* value,
            PinnableWideColumns* columns, std::string* timestamp, Status* s,
            MergeContext* merge_context,
            SequenceNumber* max_covering_tombstone_seq,
-           const ReadOptions& read_opts, ReadCallback* callback = nullptr,
+           const PointReadOptions& read_opts, ReadCallback* callback = nullptr,
            bool* is_blob_index = nullptr) {
     SequenceNumber seq;
     return Get(key, value, columns, timestamp, s, merge_context,
@@ -76,7 +76,7 @@ class MemTableListVersion {
                is_blob_index);
   }
 
-  void MultiGet(const ReadOptions& read_options, MultiGetRange* range,
+  void MultiGet(const PointReadOptions& read_options, MultiGetRange* range,
                 ReadCallback* callback);
 
   // Returns all the merge operands corresponding to the key by searching all
@@ -84,7 +84,7 @@ class MemTableListVersion {
   bool GetMergeOperands(const LookupKey& key, Status* s,
                         MergeContext* merge_context,
                         SequenceNumber* max_covering_tombstone_seq,
-                        const ReadOptions& read_opts);
+                        const PointReadOptions& read_opts);
 
   // Similar to Get(), but searches the Memtable history of memtables that
   // have already been flushed.  Should only be used from in-memory only
@@ -94,13 +94,13 @@ class MemTableListVersion {
                       PinnableWideColumns* columns, std::string* timestamp,
                       Status* s, MergeContext* merge_context,
                       SequenceNumber* max_covering_tombstone_seq,
-                      SequenceNumber* seq, const ReadOptions& read_opts,
+                      SequenceNumber* seq, const PointReadOptions& read_opts,
                       bool* is_blob_index = nullptr);
   bool GetFromHistory(const LookupKey& key, std::string* value,
                       PinnableWideColumns* columns, std::string* timestamp,
                       Status* s, MergeContext* merge_context,
                       SequenceNumber* max_covering_tombstone_seq,
-                      const ReadOptions& read_opts,
+                      const PointReadOptions& read_opts,
                       bool* is_blob_index = nullptr) {
     SequenceNumber seq;
     return GetFromHistory(key, value, columns, timestamp, s, merge_context,

@@ -50,6 +50,7 @@ class WritableFile;
 struct BlockBasedTableOptions;
 struct EnvOptions;
 struct ReadOptions;
+struct PointReadOptions;
 class GetContext;
 
 using KVPairBlock = std::vector<std::pair<std::string, std::string>>;
@@ -93,7 +94,7 @@ class BlockBasedTable : public TableReader {
   // @param force_direct_prefetch if true, always prefetching to RocksDB
   //    buffer, rather than calling RandomAccessFile::Prefetch().
   static Status Open(
-      const ReadOptions& ro, const ImmutableOptions& ioptions,
+      const PointReadOptions& ro, const ImmutableOptions& ioptions,
       const EnvOptions& env_options,
       const BlockBasedTableOptions& table_options,
       const InternalKeyComparator& internal_key_comparator,

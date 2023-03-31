@@ -154,7 +154,7 @@ Status BlobSource::InsertEntryIntoCache(const Slice& key, BlobContents* value,
                                 lowest_used_cache_tier_);
 }
 
-Status BlobSource::GetBlob(const ReadOptions& read_options,
+Status BlobSource::GetBlob(const PointReadOptions& read_options,
                            const Slice& user_key, uint64_t file_number,
                            uint64_t offset, uint64_t file_size,
                            uint64_t value_size,
@@ -255,7 +255,7 @@ Status BlobSource::GetBlob(const ReadOptions& read_options,
   return s;
 }
 
-void BlobSource::MultiGetBlob(const ReadOptions& read_options,
+void BlobSource::MultiGetBlob(const PointReadOptions& read_options,
                               autovector<BlobFileReadRequests>& blob_reqs,
                               uint64_t* bytes_read) {
   assert(blob_reqs.size() > 0);
@@ -282,7 +282,7 @@ void BlobSource::MultiGetBlob(const ReadOptions& read_options,
   }
 }
 
-void BlobSource::MultiGetBlobFromOneFile(const ReadOptions& read_options,
+void BlobSource::MultiGetBlobFromOneFile(const PointReadOptions& read_options,
                                          uint64_t file_number,
                                          uint64_t /*file_size*/,
                                          autovector<BlobReadRequest>& blob_reqs,

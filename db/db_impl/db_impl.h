@@ -231,20 +231,20 @@ class DBImpl : public DB {
                        WriteBatch* updates) override;
 
   using DB::Get;
-  virtual Status Get(const ReadOptions& options,
+  virtual Status Get(const PointReadOptions& options,
                      ColumnFamilyHandle* column_family, const Slice& key,
                      PinnableSlice* value) override;
-  virtual Status Get(const ReadOptions& options,
+  virtual Status Get(const PointReadOptions& options,
                      ColumnFamilyHandle* column_family, const Slice& key,
                      PinnableSlice* value, std::string* timestamp) override;
 
   using DB::GetEntity;
-  Status GetEntity(const ReadOptions& options,
+  Status GetEntity(const PointReadOptions& options,
                    ColumnFamilyHandle* column_family, const Slice& key,
                    PinnableWideColumns* columns) override;
 
   using DB::GetMergeOperands;
-  Status GetMergeOperands(const ReadOptions& options,
+  Status GetMergeOperands(const PointReadOptions& options,
                           ColumnFamilyHandle* column_family, const Slice& key,
                           PinnableSlice* merge_operands,
                           GetMergeOperandsOptions* get_merge_operands_options,
@@ -260,12 +260,12 @@ class DBImpl : public DB {
 
   using DB::MultiGet;
   virtual std::vector<Status> MultiGet(
-      const ReadOptions& options,
+      const PointReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_family,
       const std::vector<Slice>& keys,
       std::vector<std::string>* values) override;
   virtual std::vector<Status> MultiGet(
-      const ReadOptions& options,
+      const PointReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_family,
       const std::vector<Slice>& keys, std::vector<std::string>* values,
       std::vector<std::string>* timestamps) override;
@@ -277,36 +277,36 @@ class DBImpl : public DB {
   // The values and statuses parameters are arrays with number of elements
   // equal to keys.size(). This allows the storage for those to be alloacted
   // by the caller on the stack for small batches
-  void MultiGet(const ReadOptions& options, ColumnFamilyHandle* column_family,
+  void MultiGet(const PointReadOptions& options, ColumnFamilyHandle* column_family,
                 const size_t num_keys, const Slice* keys, PinnableSlice* values,
                 Status* statuses, const bool sorted_input = false) override;
-  void MultiGet(const ReadOptions& options, ColumnFamilyHandle* column_family,
+  void MultiGet(const PointReadOptions& options, ColumnFamilyHandle* column_family,
                 const size_t num_keys, const Slice* keys, PinnableSlice* values,
                 std::string* timestamps, Status* statuses,
                 const bool sorted_input = false) override;
 
-  void MultiGet(const ReadOptions& options, const size_t num_keys,
+  void MultiGet(const PointReadOptions& options, const size_t num_keys,
                 ColumnFamilyHandle** column_families, const Slice* keys,
                 PinnableSlice* values, Status* statuses,
                 const bool sorted_input = false) override;
-  void MultiGet(const ReadOptions& options, const size_t num_keys,
+  void MultiGet(const PointReadOptions& options, const size_t num_keys,
                 ColumnFamilyHandle** column_families, const Slice* keys,
                 PinnableSlice* values, std::string* timestamps,
                 Status* statuses, const bool sorted_input = false) override;
 
   void MultiGetWithCallback(
-      const ReadOptions& options, ColumnFamilyHandle* column_family,
+      const PointReadOptions& options, ColumnFamilyHandle* column_family,
       ReadCallback* callback,
       autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* sorted_keys);
 
   using DB::MultiGetEntity;
 
-  void MultiGetEntity(const ReadOptions& options,
+  void MultiGetEntity(const PointReadOptions& options,
                       ColumnFamilyHandle* column_family, size_t num_keys,
                       const Slice* keys, PinnableWideColumns* results,
                       Status* statuses, bool sorted_input) override;
 
-  void MultiGetEntity(const ReadOptions& options, size_t num_keys,
+  void MultiGetEntity(const PointReadOptions& options, size_t num_keys,
                       ColumnFamilyHandle** column_families, const Slice* keys,
                       PinnableWideColumns* results, Status* statuses,
                       bool sorted_input) override;
@@ -330,7 +330,7 @@ class DBImpl : public DB {
   // memory. On return, if value was found, then value_found will be set to true
   // , otherwise false.
   using DB::KeyMayExist;
-  virtual bool KeyMayExist(const ReadOptions& options,
+  virtual bool KeyMayExist(const PointReadOptions& options,
                            ColumnFamilyHandle* column_family, const Slice& key,
                            std::string* value, std::string* timestamp,
                            bool* value_found = nullptr) override;
@@ -629,7 +629,7 @@ class DBImpl : public DB {
   // get_impl_options.key via get_impl_options.value
   // If get_impl_options.get_value = false get merge operands associated with
   // get_impl_options.key via get_impl_options.merge_operands
-  Status GetImpl(const ReadOptions& options, const Slice& key,
+  Status GetImpl(const PointReadOptions& options, const Slice& key,
                  GetImplOptions& get_impl_options);
 
   // If `snapshot` == kMaxSequenceNumber, set a recent one inside the file.
@@ -2210,13 +2210,13 @@ class DBImpl : public DB {
       const size_t num_keys, bool sorted,
       autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* key_ptrs);
 
-  void MultiGetCommon(const ReadOptions& options,
+  void MultiGetCommon(const PointReadOptions& options,
                       ColumnFamilyHandle* column_family, const size_t num_keys,
                       const Slice* keys, PinnableSlice* values,
                       PinnableWideColumns* columns, std::string* timestamps,
                       Status* statuses, bool sorted_input);
 
-  void MultiGetCommon(const ReadOptions& options, const size_t num_keys,
+  void MultiGetCommon(const PointReadOptions& options, const size_t num_keys,
                       ColumnFamilyHandle** column_families, const Slice* keys,
                       PinnableSlice* values, PinnableWideColumns* columns,
                       std::string* timestamps, Status* statuses,
@@ -2286,7 +2286,7 @@ class DBImpl : public DB {
   // in order to construct the LookupKeys. The start_key and num_keys specify
   // the range of keys in the sorted_keys vector for a single column family.
   Status MultiGetImpl(
-      const ReadOptions& read_options, size_t start_key, size_t num_keys,
+      const PointReadOptions& read_options, size_t start_key, size_t num_keys,
       autovector<KeyContext*, MultiGetContext::MAX_BATCH_SIZE>* sorted_keys,
       SuperVersion* sv, SequenceNumber snap_seqnum, ReadCallback* callback);
 

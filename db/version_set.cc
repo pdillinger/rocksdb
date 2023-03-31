@@ -2124,7 +2124,7 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
       io_tracer_(io_tracer),
       use_async_io_(env_->GetFileSystem()->use_async_io()) {}
 
-Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
+Status Version::GetBlob(const PointReadOptions& read_options, const Slice& user_key,
                         const Slice& blob_index_slice,
                         FilePrefetchBuffer* prefetch_buffer,
                         PinnableSlice* value, uint64_t* bytes_read) const {
@@ -2141,7 +2141,7 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
                  bytes_read);
 }
 
-Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
+Status Version::GetBlob(const PointReadOptions& read_options, const Slice& user_key,
                         const BlobIndex& blob_index,
                         FilePrefetchBuffer* prefetch_buffer,
                         PinnableSlice* value, uint64_t* bytes_read) const {
@@ -2169,7 +2169,7 @@ Status Version::GetBlob(const ReadOptions& read_options, const Slice& user_key,
 }
 
 void Version::MultiGetBlob(
-    const ReadOptions& read_options, MultiGetRange& range,
+    const PointReadOptions& read_options, MultiGetRange& range,
     std::unordered_map<uint64_t, BlobReadContexts>& blob_ctxs) {
   assert(!blob_ctxs.empty());
 
@@ -2253,7 +2253,7 @@ void Version::MultiGetBlob(
   }
 }
 
-void Version::Get(const ReadOptions& read_options, const LookupKey& k,
+void Version::Get(const PointReadOptions& read_options, const LookupKey& k,
                   PinnableSlice* value, PinnableWideColumns* columns,
                   std::string* timestamp, Status* status,
                   MergeContext* merge_context,
@@ -2459,7 +2459,7 @@ void Version::Get(const ReadOptions& read_options, const LookupKey& k,
   }
 }
 
-void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
+void Version::MultiGet(const PointReadOptions& read_options, MultiGetRange* range,
                        ReadCallback* callback) {
   PinnedIteratorsManager pinned_iters_mgr;
 
@@ -2721,7 +2721,7 @@ void Version::MultiGet(const ReadOptions& read_options, MultiGetRange* range,
 
 #ifdef USE_COROUTINES
 Status Version::ProcessBatch(
-    const ReadOptions& read_options, FilePickerMultiGet* batch,
+    const PointReadOptions& read_options, FilePickerMultiGet* batch,
     std::vector<folly::coro::Task<Status>>& mget_tasks,
     std::unordered_map<uint64_t, BlobReadContexts>* blob_ctxs,
     autovector<FilePickerMultiGet, 4>& batches, std::deque<size_t>& waiting,
@@ -2830,7 +2830,7 @@ Status Version::ProcessBatch(
 }
 
 Status Version::MultiGetAsync(
-    const ReadOptions& options, MultiGetRange* range,
+    const PointReadOptions& options, MultiGetRange* range,
     std::unordered_map<uint64_t, BlobReadContexts>* blob_ctxs) {
   autovector<FilePickerMultiGet, 4> batches;
   std::deque<size_t> waiting;

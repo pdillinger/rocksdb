@@ -37,13 +37,13 @@ size_t CompactedDBImpl::FindFile(const Slice& key) {
       files_.files);
 }
 
-Status CompactedDBImpl::Get(const ReadOptions& options, ColumnFamilyHandle*,
+Status CompactedDBImpl::Get(const PointReadOptions& options, ColumnFamilyHandle*,
                             const Slice& key, PinnableSlice* value) {
   return Get(options, /*column_family*/ nullptr, key, value,
              /*timestamp*/ nullptr);
 }
 
-Status CompactedDBImpl::Get(const ReadOptions& options, ColumnFamilyHandle*,
+Status CompactedDBImpl::Get(const PointReadOptions& options, ColumnFamilyHandle*,
                             const Slice& key, PinnableSlice* value,
                             std::string* timestamp) {
   assert(user_comparator_);
@@ -95,13 +95,13 @@ Status CompactedDBImpl::Get(const ReadOptions& options, ColumnFamilyHandle*,
 }
 
 std::vector<Status> CompactedDBImpl::MultiGet(
-    const ReadOptions& options, const std::vector<ColumnFamilyHandle*>&,
+    const PointReadOptions& options, const std::vector<ColumnFamilyHandle*>&,
     const std::vector<Slice>& keys, std::vector<std::string>* values) {
   return MultiGet(options, keys, values, /*timestamps*/ nullptr);
 }
 
 std::vector<Status> CompactedDBImpl::MultiGet(
-    const ReadOptions& options, const std::vector<ColumnFamilyHandle*>&,
+    const PointReadOptions& options, const std::vector<ColumnFamilyHandle*>&,
     const std::vector<Slice>& keys, std::vector<std::string>* values,
     std::vector<std::string>* timestamps) {
   assert(user_comparator_);

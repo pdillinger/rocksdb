@@ -263,7 +263,7 @@ class MemTable {
            PinnableWideColumns* columns, std::string* timestamp, Status* s,
            MergeContext* merge_context,
            SequenceNumber* max_covering_tombstone_seq, SequenceNumber* seq,
-           const ReadOptions& read_opts, bool immutable_memtable,
+           const PointReadOptions& read_opts, bool immutable_memtable,
            ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
            bool do_merge = true);
 
@@ -271,7 +271,7 @@ class MemTable {
            PinnableWideColumns* columns, std::string* timestamp, Status* s,
            MergeContext* merge_context,
            SequenceNumber* max_covering_tombstone_seq,
-           const ReadOptions& read_opts, bool immutable_memtable,
+           const PointReadOptions& read_opts, bool immutable_memtable,
            ReadCallback* callback = nullptr, bool* is_blob_index = nullptr,
            bool do_merge = true) {
     SequenceNumber seq;
@@ -283,7 +283,7 @@ class MemTable {
   // @param immutable_memtable Whether this memtable is immutable. Used
   // internally by NewRangeTombstoneIterator(). See comment above
   // NewRangeTombstoneIterator() for more detail.
-  void MultiGet(const ReadOptions& read_options, MultiGetRange* range,
+  void MultiGet(const PointReadOptions& read_options, MultiGetRange* range,
                 ReadCallback* callback, bool immutable_memtable);
 
   // If `key` exists in current memtable with type value_type and the existing

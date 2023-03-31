@@ -556,7 +556,7 @@ CacheKey BlockBasedTable::GetCacheKey(const OffsetableCacheKey& base_cache_key,
 }
 
 Status BlockBasedTable::Open(
-    const ReadOptions& read_options, const ImmutableOptions& ioptions,
+    const PointReadOptions& read_options, const ImmutableOptions& ioptions,
     const EnvOptions& env_options, const BlockBasedTableOptions& table_options,
     const InternalKeyComparator& internal_comparator,
     std::unique_ptr<RandomAccessFileReader>&& file, uint64_t file_size,
@@ -578,7 +578,7 @@ Status BlockBasedTable::Open(
 
   // From read_options, retain deadline, io_timeout, rate_limiter_priority, and
   // verify_checksums. In future, we may retain more options.
-  ReadOptions ro;
+  PointReadOptions ro;
   ro.deadline = read_options.deadline;
   ro.io_timeout = read_options.io_timeout;
   ro.rate_limiter_priority = read_options.rate_limiter_priority;

@@ -109,7 +109,7 @@ class TableCache {
   // @param skip_filters Disables loading/accessing the filter block
   // @param level The level this table is at, -1 for "not set / don't know"
   Status Get(
-      const ReadOptions& options,
+      const PointReadOptions& options,
       const InternalKeyComparator& internal_comparator,
       const FileMetaData& file_meta, const Slice& k, GetContext* get_context,
       const std::shared_ptr<const SliceTransform>& prefix_extractor = nullptr,
@@ -130,7 +130,7 @@ class TableCache {
   // is returned in table_handle. This handle should be passed back to
   // MultiGet() so it can be released.
   Status MultiGetFilter(
-      const ReadOptions& options,
+      const PointReadOptions& options,
       const InternalKeyComparator& internal_comparator,
       const FileMetaData& file_meta,
       const std::shared_ptr<const SliceTransform>& prefix_extractor,
@@ -147,7 +147,7 @@ class TableCache {
   // @param skip_filters Disables loading/accessing the filter block
   // @param level The level this table is at, -1 for "not set / don't know"
   DECLARE_SYNC_AND_ASYNC(
-      Status, MultiGet, const ReadOptions& options,
+      Status, MultiGet, const PointReadOptions& options,
       const InternalKeyComparator& internal_comparator,
       const FileMetaData& file_meta, const MultiGetContext::Range* mget_range,
       const std::shared_ptr<const SliceTransform>& prefix_extractor = nullptr,
@@ -162,7 +162,7 @@ class TableCache {
   // @param skip_filters Disables loading/accessing the filter block
   // @param level == -1 means not specified
   Status FindTable(
-      const ReadOptions& ro, const FileOptions& toptions,
+      const PointReadOptions& ro, const FileOptions& toptions,
       const InternalKeyComparator& internal_comparator,
       const FileMetaData& file_meta, TypedHandle**,
       const std::shared_ptr<const SliceTransform>& prefix_extractor = nullptr,
@@ -186,7 +186,7 @@ class TableCache {
       const std::shared_ptr<const SliceTransform>& prefix_extractor = nullptr,
       bool no_io = false);
 
-  Status ApproximateKeyAnchors(const ReadOptions& ro,
+  Status ApproximateKeyAnchors(const PointReadOptions& ro,
                                const InternalKeyComparator& internal_comparator,
                                const FileMetaData& file_meta,
                                std::vector<TableReader::Anchor>& anchors);
@@ -230,7 +230,7 @@ class TableCache {
  private:
   // Build a table reader
   Status GetTableReader(
-      const ReadOptions& ro, const FileOptions& file_options,
+      const PointReadOptions& ro, const FileOptions& file_options,
       const InternalKeyComparator& internal_comparator,
       const FileMetaData& file_meta, bool sequential_mode,
       bool record_read_stats, HistogramImpl* file_read_hist,
@@ -249,7 +249,7 @@ class TableCache {
   // Create a key prefix for looking up the row cache. The prefix is of the
   // format row_cache_id + fd_number + seq_no. Later, the user key can be
   // appended to form the full key
-  void CreateRowCacheKeyPrefix(const ReadOptions& options,
+  void CreateRowCacheKeyPrefix(const PointReadOptions& options,
                                const FileDescriptor& fd,
                                const Slice& internal_key,
                                GetContext* get_context, IterKey& row_cache_key);

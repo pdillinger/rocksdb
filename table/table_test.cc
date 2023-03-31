@@ -5619,6 +5619,9 @@ TEST_F(CacheUsageOptionsOverridesTest, SanitizeAndValidateOptions) {
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {
+  fprintf(stderr, "%d\n", (int)sizeof(rocksdb::PointReadOptions)); // 64
+  fprintf(stderr, "%d\n", (int)sizeof(rocksdb::ReadOptions)); // originally 144, now 136
+  return 0;
   ROCKSDB_NAMESPACE::port::InstallStackTraceHandler();
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
