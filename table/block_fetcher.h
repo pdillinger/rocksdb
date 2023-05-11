@@ -79,6 +79,7 @@ class BlockFetcher {
   inline size_t GetBlockSizeWithTrailer() const {
     return block_size_with_trailer_;
   }
+  Status DoDecompress(BlockContents* decompressed);
 
 #ifndef NDEBUG
   int TEST_GetNumStackBufMemcpy() const { return num_stack_buf_memcpy_; }

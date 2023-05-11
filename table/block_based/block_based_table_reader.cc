@@ -71,6 +71,7 @@
 #include "test_util/sync_point.h"
 #include "util/coding.h"
 #include "util/crc32c.h"
+#include "util/random.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 
@@ -2372,6 +2373,43 @@ Status BlockBasedTable::VerifyChecksumInBlocks(
       readahead_size /* max_readahead_size */,
       !rep_->ioptions.allow_mmap_reads /* enable */);
 
+  bool prev_compressed = true;
+  size_t comp_count = 0;
+  size_t change_count = 0;
+  size_t block_count = 0;
+
+  // strategy 1: decay to some minimum rate, no buffer/backtracking
+  size_t max_skip = 9;
+  if (char* blah = getenv("MAX_SKIP")) {
+    max_skip = atoi(blah);
+  }
+  size_t settle_setting = 5;
+  size_t settle_counter = 0;
+  size_t next_skip = 1;
+  size_t cur_skip = 0;
+  size_t skip_countdown = 0;
+  size_t s1_saved_compressions = 0;
+  size_t s1_missed_compressions = 0;
+
+  // strategy 2: exponential history, no backtracking
+  double est_keep_rate = 1.0;
+  double allowed_keep_rate = 0.2;
+  if (char* blah = getenv("ALLOWED_KEEP_RATE")) {
+    allowed_keep_rate = atof(blah);
+  }
+  size_t s2_saved_compressions = 0;
+  size_t s2_missed_compressions = 0;
+
+  // strategy 3: window/buffer
+  std::vector<bool> history_for_buffer;
+  size_t s3_saved_compressions = 0;
+  size_t s3_missed_compressions = 0;
+
+  // TODO: strategy 4: size aware variant of 3
+
+
+  Random* rnd = Random::GetTLSInstance();
+
   for (index_iter->SeekToFirst(); index_iter->Valid(); index_iter->Next()) {
     s = index_iter->status();
     if (!s.ok()) {
@@ -2385,10 +2423,99 @@ Status BlockBasedTable::VerifyChecksumInBlocks(
         false /*maybe_compressed*/, BlockType::kData,
         UncompressionDict::GetEmptyDict(), rep_->persistent_cache_options);
     s = block_fetcher.ReadBlockContents();
+    bool compressed = GetBlockCompressionType(contents) != kNoCompression;
+
+    /* TODO
+    BlockContents uncompressed;
+    size_t comp_size = 0;
+    size_t uncomp_size = 0;
+    if (compressed) {
+      s = block_fetcher.DoDecompress(&uncompressed);
+      comp_size = contents.data.size();
+      uncomp_size = uncompressed.data.size();
+    }
+    */
+
+    comp_count += compressed;
+    if (compressed != prev_compressed) {
+      ++change_count;
+      prev_compressed = compressed;
+    }
+    ++block_count;
+
+    // strategy 1 + strategy 3
+    if (skip_countdown > 0) {
+      --skip_countdown;
+      if (compressed) {
+        ++s1_missed_compressions;
+        ++s3_missed_compressions;  // tentative
+      } else {
+        ++s1_saved_compressions;
+        ++s3_saved_compressions;  // tentative
+      }
+      history_for_buffer.push_back(compressed);
+    } else if (compressed) {
+      // reset
+      next_skip = 1;
+      cur_skip = 0;
+      settle_counter = 0;
+      // backtrack for strategy 3
+      size_t buf_size = history_for_buffer.size();
+      if (buf_size > 0) {
+        size_t pos = buf_size / 2;
+        size_t distance = pos / 2;
+        while (distance > 0) {
+          assert(pos < buf_size);
+          assert(pos >= distance);
+          if (history_for_buffer[pos]) {
+            // compressible; keep backtracking
+            pos -= distance;
+          } else {
+            // incompressible; jump ahead
+            pos += distance;
+            // and correct tentative count because we won't re-scan this
+            // below.
+            --s3_saved_compressions;
+          }
+          distance /= 2;
+        }
+        // We landed somewhere where we estimate is the start of the
+        // "compressed region." Attempt everything from here for simplicity.
+        // (Correct tentative stats)
+        for (; pos < buf_size; ++pos) {
+          if (history_for_buffer[pos]) {
+            --s3_missed_compressions;
+          } else {
+            --s3_saved_compressions;
+          }
+        }
+        history_for_buffer.clear();
+      }
+    } else if (settle_counter < settle_setting) {
+      ++settle_counter;
+    } else {
+      // Fibonacci decay
+      skip_countdown = cur_skip;
+      size_t tmp = std::min(cur_skip + next_skip, max_skip);
+      cur_skip = next_skip;
+      next_skip = tmp;
+    }
+
+    // strategy 2
+    if (max_skip > 0 && est_keep_rate < allowed_keep_rate && !rnd->OneIn(max_skip)) {
+      if (compressed) {
+        ++s2_missed_compressions;
+      } else {
+        ++s2_saved_compressions;
+      }
+    }
+    est_keep_rate = (1.0 - allowed_keep_rate) * est_keep_rate + (allowed_keep_rate * compressed);
+
     if (!s.ok()) {
       break;
     }
   }
+  fprintf(stderr, "Comp: %zu Un: %zu Ch: %zu Of: %zu S1S: %zu S1M: %zu S2S: %zu S2M: %zu S3S: %zu S3M: %zu\n", comp_count, block_count - comp_count, change_count, block_count, s1_saved_compressions, s1_missed_compressions, s2_saved_compressions, s2_missed_compressions, s3_saved_compressions, s3_missed_compressions);
   if (s.ok()) {
     // In the case of two level indexes, we would have exited the above loop
     // by checking index_iter->Valid(), but Valid() might have returned false

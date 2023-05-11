@@ -342,6 +342,14 @@ IOStatus BlockFetcher::ReadBlockContents() {
   return io_status_;
 }
 
+Status BlockFetcher::DoDecompress(BlockContents* decompressed) {
+    UncompressionContext context(compression_type_);
+    UncompressionInfo info(context, uncompression_dict_, compression_type_);
+    return UncompressSerializedBlock(
+        info, contents_->data.data(), contents_->data.size(), decompressed, footer_.format_version(),
+        ioptions_, memory_allocator_);
+}
+
 IOStatus BlockFetcher::ReadAsyncBlockContents() {
   if (TryGetUncompressBlockFromPersistentCache()) {
     compression_type_ = kNoCompression;
