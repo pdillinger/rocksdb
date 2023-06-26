@@ -20,6 +20,7 @@
 #include "cache/sharded_cache.h"
 #include "port/lang.h"
 #include "port/malloc.h"
+#include "port/mmap.h"
 #include "port/port.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/secondary_cache.h"
@@ -373,17 +374,6 @@ struct ClockHandle : public ClockHandleBasicData {
 
   // See above. Mutable for read reference counting.
   mutable std::atomic<uint64_t> meta{};
-
-  // Whether this is a "deteched" handle that is independently allocated
-  // with `new` (so must be deleted with `delete`).
-  // TODO: ideally this would be packed into some other data field, such
-  // as upper bits of total_charge, but that incurs a measurable performance
-  // regression.
-  bool standalone = false;
-
-  inline bool IsStandalone() const { return standalone; }
-
-  inline void SetStandalone() { standalone = true; }
 };  // struct ClockHandle
 
 class BaseClockTable {
@@ -507,6 +497,16 @@ class HyperClockTable : public BaseClockTable {
     // up in this slot or a higher one.
     std::atomic<uint32_t> displacements{};
 
+    // Whether this is a "deteched" handle that is independently allocated
+    // with `new` (so must be deleted with `delete`).
+    // TODO: ideally this would be packed into some other data field, such
+    // as upper bits of total_charge, but that incurs a measurable performance
+    // regression.
+    bool standalone = false;
+
+    inline bool IsStandalone() const { return standalone; }
+
+    inline void SetStandalone() { standalone = true; }
   };  // struct HandleImpl
 
   struct Opts {
@@ -613,6 +613,145 @@ class HyperClockTable : public BaseClockTable {
   const std::unique_ptr<HandleImpl[]> array_;
 };  // class HyperClockTable
 
+class FastClockTable : public BaseClockTable {
+ public:
+  // Target size to be exactly a common cache line size (see static_assert in
+  // clock_cache.cc)
+  struct ALIGN_AS(64U) HandleImpl : public ClockHandle {
+    // TODO: doc
+    static constexpr uint64_t kNextEndFlag = uint64_t{1} << 6;
+    static constexpr int kNextShift = 8;
+    static constexpr int kShiftMask = 63;
+
+    static constexpr uint64_t kStandaloneMarker = UINT64_MAX;
+    static constexpr uint64_t kUnusedMarker = 0;
+
+    // TODO: doc
+    // Lowest 8 bits are a shift count (lower 6/8 bits) and flags (upper 2).
+    // Upper 56 bits are the "next pointer" specified by an array index.
+    // There is not empty/null; the end is specified by circling back to the
+    // head with the "end" flag set to indicate it should normally not be
+    // traversed further, only for verification of reaching correct endpoint.
+    // When marked with all 1 bits, indicates a standalone entry.
+    //
+    // Why do we need shift on each pointer? To make Lookup wait-free, we need
+    // to be able to query a chain without missing anything, and preferably
+    // avoid synchronously double-checking the length_info. Without the shifts,
+    // there is a risk that we start down a chain and while paused on an entry
+    // that goes to a new home, we then follow the rest of the
+    // partially-migrated chain to see the shared ending with the old home, but
+    // for a time were following the chain for the new home, missing some
+    // entries for the old home.
+    //
+    std::atomic<uint64_t> head_next_with_shift{};
+    std::atomic<uint64_t> chain_next_with_shift{kUnusedMarker};
+
+    inline bool IsStandalone() const {
+      return head_next_with_shift.load(std::memory_order_acquire) ==
+             kStandaloneMarker;
+    }
+
+    inline void SetStandalone() {
+      head_next_with_shift.store(kStandaloneMarker, std::memory_order_release);
+    }
+  };  // struct HandleImpl
+
+  struct Opts {
+    size_t min_avg_value_size;
+  };
+
+  FastClockTable(size_t capacity, bool strict_capacity_limit,
+                 CacheMetadataChargePolicy metadata_charge_policy,
+                 MemoryAllocator* allocator,
+                 const Cache::EvictionCallback* eviction_callback,
+                 const uint32_t* hash_seed, const Opts& opts);
+  ~FastClockTable();
+
+  // For BaseClockTable::Insert
+  struct InsertState {
+    uint64_t saved_length_info = 0;
+  };
+
+  void StartInsert(InsertState& state);
+
+  // Does initial check for whether there's hash table room for another
+  // inserted entry, possibly growing if needed. Returns true iff (after
+  // the call) there is room for the proposed number of entries.
+  bool GrowIfNeeded(size_t new_occupancy, InsertState& state);
+
+  HandleImpl* DoInsert(const ClockHandleBasicData& proto,
+                       uint64_t initial_countdown, bool take_ref,
+                       InsertState& state);
+
+  // Runs the clock eviction algorithm trying to reclaim at least
+  // requested_charge. Returns how much is evicted, which could be less
+  // if it appears impossible to evict the requested amount without blocking.
+  void Evict(size_t requested_charge, InsertState& state, EvictionData* data);
+
+  HandleImpl* Lookup(const UniqueId64x2& hashed_key);
+
+  bool Release(HandleImpl* handle, bool useful, bool erase_if_last_ref);
+
+  void Erase(const UniqueId64x2& hashed_key);
+
+  void EraseUnRefEntries();
+
+  size_t GetTableSize() const;
+
+  size_t GetOccupancyLimit() const;
+
+  const HandleImpl* HandlePtr(size_t idx) const { return &array_[idx]; }
+
+#ifndef NDEBUG
+  // Release N references
+  void TEST_ReleaseN(HandleImpl* handle, size_t n);
+#endif
+
+ private:  // functions
+  // Takes an "under construction" entry and ... (TODO).
+  void Remove(HandleImpl* h);
+
+  bool TryEraseHandle(HandleImpl* h, bool holding_ref, bool mark_invisible);
+
+  static size_t CalcMaxUsableLength(
+      size_t capacity, size_t min_avg_value_size,
+      CacheMetadataChargePolicy metadata_charge_policy);
+
+  template <class OpData>
+  HandleImpl* OmnibusWalkChain(size_t home, int home_shift, OpData* op_data);
+
+ private:  // data
+  // std::string debug_history;
+
+  // TODO: use/revise
+  const size_t max_usable_length_;
+
+  const MemMapping array_mem_;
+
+  // Pointer to mmaped area holding handles
+  HandleImpl* const array_;
+
+  // Metadata for table size under linear hashing.
+  //
+  // Lowest 8 bits are the minimum number of lowest hash bits to use.
+  // The upper 56 bits are a threshold. If that minumum number of bits
+  // taken from a hash value is < this threshold, then one more bit of
+  // hash value is take and used.
+  //
+  // NOTES: length_info_ is only updated at the end of a Grow operation,
+  // so that waiting in Grow operations isn't done while entries are pinned
+  // for internal operation purposes. Thus, Lookup and Insert have to
+  // detect and support cases where length_info hasn't caught up to updated
+  // chains. Winning grow thread is the one that transitions
+  // head_next_with_shift from zeros. Grow threads can spin/yield wait for
+  // preconditions and postconditions to be met.
+  std::atomic<uint64_t> length_info_;
+
+  // TODO
+  std::atomic<size_t> clock_pointer_mask_;
+
+};  // class FastClockTable
+
 // A single shard of sharded cache.
 template <class Table>
 class ALIGN_AS(CACHE_LINE_SIZE) ClockCacheShard final : public CacheShardBase {
@@ -710,6 +849,7 @@ class ALIGN_AS(CACHE_LINE_SIZE) ClockCacheShard final : public CacheShardBase {
   }
 
 #ifndef NDEBUG
+  template <class = void>  // Not available in all instantiations of the class
   size_t& TEST_MutableOccupancyLimit() const {
     return table_.TEST_MutableOccupancyLimit();
   }
@@ -749,6 +889,28 @@ class HyperClockCache
   void ReportProblems(
       const std::shared_ptr<Logger>& /*info_log*/) const override;
 };  // class HyperClockCache
+
+class FastClockCache
+#ifdef NDEBUG
+    final
+#endif
+    : public ShardedCache<ClockCacheShard<FastClockTable>> {
+ public:
+  using Shard = ClockCacheShard<FastClockTable>;
+
+  FastClockCache(const FastClockCacheOptions& opts);
+
+  const char* Name() const override { return "FastClockCache"; }
+
+  void* Value(Handle* handle) override;
+
+  size_t GetCharge(Handle* handle) const override;
+
+  const CacheItemHelper* GetCacheItemHelper(Handle* handle) const override;
+
+  void ReportProblems(
+      const std::shared_ptr<Logger>& /*info_log*/) const override;
+};  // class FastClockCache
 
 }  // namespace clock_cache
 

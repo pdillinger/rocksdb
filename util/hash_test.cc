@@ -20,6 +20,7 @@
 #include "util/math.h"
 #include "util/math128.h"
 
+// TODO: test BottomNBits
 using ROCKSDB_NAMESPACE::BijectiveHash2x64;
 using ROCKSDB_NAMESPACE::BijectiveUnhash2x64;
 using ROCKSDB_NAMESPACE::DecodeFixed64;
