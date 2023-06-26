@@ -3055,6 +3055,16 @@ class Benchmark {
       } else {
         return hcco.MakeSharedCache();
       }
+    } else if (FLAGS_cache_type == "fast_clock_cache") {
+      FastClockCacheOptions fcco{static_cast<size_t>(capacity),
+                                 FLAGS_cache_numshardbits};
+      fcco.hash_seed = GetCacheHashSeed();
+      if (use_tiered_cache) {
+        fprintf(stderr, "TODO: use_tiered_cache\n");
+        exit(1);
+      } else {
+        return fcco.MakeSharedCache();
+      }
     } else if (FLAGS_cache_type == "lru_cache") {
       LRUCacheOptions opts(
           static_cast<size_t>(capacity), FLAGS_cache_numshardbits,

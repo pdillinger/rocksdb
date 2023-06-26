@@ -121,7 +121,7 @@ class CacheTest : public testing::Test,
   // LRUCache doesn't, so the encoding depends on the cache type.
   std::string EncodeKey(int k) {
     auto type = GetParam();
-    if (type == kHyperClock) {
+    if (type == kHyperClock || type == kFastClock) {
       return EncodeKey16Bytes(k);
     } else {
       return EncodeKey32Bits(k);
@@ -130,7 +130,7 @@ class CacheTest : public testing::Test,
 
   int DecodeKey(const Slice& k) {
     auto type = GetParam();
-    if (type == kHyperClock) {
+    if (type == kHyperClock || type == kFastClock) {
       return DecodeKey16Bytes(k);
     } else {
       return DecodeKey32Bits(k);
@@ -190,7 +190,7 @@ TEST_P(CacheTest, UsageTest) {
   auto precise_cache = NewCache(kCapacity, 0, false, kFullChargeCacheMetadata);
   ASSERT_EQ(0, cache->GetUsage());
   size_t baseline_meta_usage = precise_cache->GetUsage();
-  if (type != kHyperClock) {
+  if (type != kHyperClock && type != kFastClock) {
     ASSERT_EQ(0, baseline_meta_usage);
   }
 
@@ -209,7 +209,7 @@ TEST_P(CacheTest, UsageTest) {
     ASSERT_OK(precise_cache->Insert(key, value, &kDumbHelper, kv_size));
     usage += kv_size;
     ASSERT_EQ(usage, cache->GetUsage());
-    if (type == kHyperClock) {
+    if (type == kHyperClock || type == kFastClock) {
       ASSERT_EQ(baseline_meta_usage + usage, precise_cache->GetUsage());
     } else {
       ASSERT_LT(usage, precise_cache->GetUsage());
@@ -237,7 +237,7 @@ TEST_P(CacheTest, UsageTest) {
   ASSERT_GT(kCapacity, cache->GetUsage());
   ASSERT_GT(kCapacity, precise_cache->GetUsage());
   ASSERT_LT(kCapacity * 0.95, cache->GetUsage());
-  if (type != kHyperClock) {
+  if (type != kHyperClock && type != kFastClock) {
     ASSERT_LT(kCapacity * 0.95, precise_cache->GetUsage());
   } else {
     // estimated value size of 1 is weird for clock cache, because
@@ -263,7 +263,7 @@ TEST_P(CacheTest, PinnedUsageTest) {
   auto cache = NewCache(kCapacity, 8, false, kDontChargeCacheMetadata);
   auto precise_cache = NewCache(kCapacity, 8, false, kFullChargeCacheMetadata);
   size_t baseline_meta_usage = precise_cache->GetUsage();
-  if (type != kHyperClock) {
+  if (type != kHyperClock && type != kFastClock) {
     ASSERT_EQ(0, baseline_meta_usage);
   }
 
@@ -368,7 +368,7 @@ TEST_P(CacheTest, HitAndMiss) {
   ASSERT_EQ(-1, Lookup(300));
 
   Insert(100, 102);
-  if (GetParam() == kHyperClock) {
+  if (type_ == kHyperClock || type_ == kFastClock) {
     // ClockCache usually doesn't overwrite on Insert
     ASSERT_EQ(101, Lookup(100));
   } else {
@@ -378,7 +378,7 @@ TEST_P(CacheTest, HitAndMiss) {
   ASSERT_EQ(-1, Lookup(300));
 
   ASSERT_EQ(1U, deleted_values_.size());
-  if (GetParam() == kHyperClock) {
+  if (GetParam() == kHyperClock || type_ == kFastClock) {
     ASSERT_EQ(102, deleted_values_[0]);
   } else {
     ASSERT_EQ(101, deleted_values_[0]);
@@ -386,7 +386,7 @@ TEST_P(CacheTest, HitAndMiss) {
 }
 
 TEST_P(CacheTest, InsertSameKey) {
-  if (GetParam() == kHyperClock) {
+  if (type_ == kHyperClock || type_ == kFastClock) {
     ROCKSDB_GTEST_BYPASS(
         "ClockCache doesn't guarantee Insert overwrite same key.");
     return;
@@ -415,7 +415,7 @@ TEST_P(CacheTest, Erase) {
 }
 
 TEST_P(CacheTest, EntriesArePinned) {
-  if (GetParam() == kHyperClock) {
+  if (type_ == kHyperClock || type_ == kFastClock) {
     ROCKSDB_GTEST_BYPASS(
         "ClockCache doesn't guarantee Insert overwrite same key.");
     return;
@@ -479,7 +479,7 @@ TEST_P(CacheTest, ExternalRefPinsEntries) {
       Insert(1000 + j, 2000 + j);
     }
     // Clock cache is even more stateful and needs more churn to evict
-    if (GetParam() == kHyperClock) {
+    if (type_ == kHyperClock || type_ == kFastClock) {
       for (int j = 0; j < kCacheSize; j++) {
         Insert(11000 + j, 11000 + j);
       }
@@ -517,20 +517,20 @@ TEST_P(CacheTest, EvictionPolicyRef) {
   // Check whether the entries inserted in the beginning
   // are evicted. Ones without extra ref are evicted and
   // those with are not.
-  ASSERT_EQ(-1, Lookup(100));
-  ASSERT_EQ(-1, Lookup(101));
-  ASSERT_EQ(-1, Lookup(102));
-  ASSERT_EQ(-1, Lookup(103));
+  EXPECT_EQ(-1, Lookup(100));
+  EXPECT_EQ(-1, Lookup(101));
+  EXPECT_EQ(-1, Lookup(102));
+  EXPECT_EQ(-1, Lookup(103));
 
-  ASSERT_EQ(-1, Lookup(300));
-  ASSERT_EQ(-1, Lookup(301));
-  ASSERT_EQ(-1, Lookup(302));
-  ASSERT_EQ(-1, Lookup(303));
+  EXPECT_EQ(-1, Lookup(300));
+  EXPECT_EQ(-1, Lookup(301));
+  EXPECT_EQ(-1, Lookup(302));
+  EXPECT_EQ(-1, Lookup(303));
 
-  ASSERT_EQ(101, Lookup(200));
-  ASSERT_EQ(102, Lookup(201));
-  ASSERT_EQ(103, Lookup(202));
-  ASSERT_EQ(104, Lookup(203));
+  EXPECT_EQ(101, Lookup(200));
+  EXPECT_EQ(102, Lookup(201));
+  EXPECT_EQ(103, Lookup(202));
+  EXPECT_EQ(104, Lookup(203));
 
   // Cleaning up all the handles
   cache_->Release(h201);
@@ -679,7 +679,7 @@ using TypedHandle = SharedCache::TypedHandle;
 
 TEST_P(CacheTest, SetCapacity) {
   auto type = GetParam();
-  if (type == kHyperClock) {
+  if (type == kHyperClock || type == kFastClock) {
     ROCKSDB_GTEST_BYPASS(
         "FastLRUCache and HyperClockCache don't support arbitrary capacity "
         "adjustments.");
@@ -811,7 +811,7 @@ TEST_P(CacheTest, OverCapacity) {
     cache.Release(handles[i]);
   }
 
-  if (GetParam() == kHyperClock) {
+  if (type_ == kHyperClock || type_ == kFastClock) {
     // Make sure eviction is triggered.
     ASSERT_OK(cache.Insert(EncodeKey(-1), nullptr, 1, &handles[0]));
 
@@ -924,7 +924,8 @@ TEST_P(CacheTest, DefaultShardBits) {
   estimated_value_size_ = 100000;
   // Implementations use different minimum shard sizes
   size_t min_shard_size =
-      (GetParam() == kHyperClock ? 32U * 1024U : 512U) * 1024U;
+      ((type_ == kHyperClock || type_ == kFastClock) ? 32U * 1024U : 512U) *
+      1024U;
 
   std::shared_ptr<Cache> cache = NewCache(32U * min_shard_size);
   ShardedCacheBase* sc = dynamic_cast<ShardedCacheBase*>(cache.get());

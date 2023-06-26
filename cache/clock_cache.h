@@ -20,6 +20,7 @@
 #include "cache/sharded_cache.h"
 #include "port/lang.h"
 #include "port/malloc.h"
+#include "port/mmap.h"
 #include "port/port.h"
 #include "rocksdb/cache.h"
 #include "rocksdb/secondary_cache.h"
@@ -601,6 +602,113 @@ class HyperClockTable : public BaseClockTable {
   const std::unique_ptr<HandleImpl[]> array_;
 };  // class HyperClockTable
 
+class FastClockTable : public BaseClockTable {
+ public:
+  // Target size to be exactly a common cache line size (see static_assert in
+  // clock_cache.cc)
+  struct ALIGN_AS(64U) HandleImpl : public ClockHandle {
+    // TODO: doc
+    std::atomic<uint32_t> next{};
+
+    // TODO: doc & can we eliminate?
+    static constexpr uint32_t kNextFollowFlag = uint32_t{1} << 31;
+    static constexpr uint32_t kNextInsertableFlag = uint32_t{1} << 30;
+    static constexpr uint32_t kNextNoFlagsMask =
+        ~(kNextFollowFlag | kNextInsertableFlag);
+  };  // struct HandleImpl
+
+  struct Opts {
+    size_t min_avg_value_size;
+  };
+
+  FastClockTable(size_t capacity, bool strict_capacity_limit,
+                 CacheMetadataChargePolicy metadata_charge_policy,
+                 MemoryAllocator* allocator,
+                 const Cache::EvictionCallback* eviction_callback,
+                 const uint32_t* hash_seed, const Opts& opts);
+  ~FastClockTable();
+
+  // For BaseClockTable::Insert
+  struct InsertState {
+    uint64_t saved_threshold = 0;
+  };
+
+  void StartInsert(InsertState& state);
+
+  // Does initial check for whether there's hash table room for another
+  // inserted entry, possibly growing if needed. Returns true iff (after
+  // the call) there is room for the proposed number of entries.
+  bool GrowIfNeeded(size_t new_occupancy, InsertState& state);
+
+  HandleImpl* DoInsert(const ClockHandleBasicData& proto,
+                       uint64_t initial_countdown, bool take_ref,
+                       InsertState& state);
+
+  // Runs the clock eviction algorithm trying to reclaim at least
+  // requested_charge. Returns how much is evicted, which could be less
+  // if it appears impossible to evict the requested amount without blocking.
+  void Evict(size_t requested_charge, size_t* freed_charge, size_t* freed_count,
+             InsertState& state);
+
+  HandleImpl* Lookup(const UniqueId64x2& hashed_key);
+
+  bool Release(HandleImpl* handle, bool useful, bool erase_if_last_ref);
+
+  void Ref(HandleImpl& handle);
+
+  void Erase(const UniqueId64x2& hashed_key);
+
+  void ConstApplyToEntriesRange(std::function<void(const HandleImpl&)> func,
+                                size_t index_begin, size_t index_end,
+                                bool apply_if_will_be_deleted) const;
+
+  void EraseUnRefEntries();
+
+  size_t GetTableSize() const;
+
+  int GetLengthBits() const {
+    return static_cast<int>(threshold_.load() & 255U);
+  }
+
+  size_t GetOccupancyLimit() const;
+
+  // Acquire/release N references
+  void TEST_RefN(HandleImpl& handle, size_t n);
+  void TEST_ReleaseN(HandleImpl* handle, size_t n);
+
+ private:  // functions
+  // Takes an "under construction" entry and ... (TODO).
+  // Returns final 'next' of h before (possibly) being copied and wiped.
+  // Could be "out of date" after this operation, though.
+  uint32_t FinishErasure(HandleImpl* h, HandleImpl* possible_prev);
+
+  bool TryEraseHandle(HandleImpl* h, bool holding_ref, bool mark_invisible);
+
+  // Returns the number of bits used to hash an element in the hash
+  // table.
+  static int CalcHashBits(size_t capacity, size_t estimated_value_size,
+                          CacheMetadataChargePolicy metadata_charge_policy);
+
+ private:  // data
+  // std::string debug_history;
+
+  const int max_length_bits_;
+
+  const MemMapping array_mem_;
+
+  // Pointer to mmaped area holding handles
+  HandleImpl* const array_;
+
+  ALIGN_AS(CACHE_LINE_SIZE)
+  // TODO: doc
+  // Top bit always 1, then hash threshold (always or-in top hash bit)
+  // then bottom bits are min right shift amount. Shift by 1 more if
+  // >= hash threshold.
+  std::atomic<uint64_t> threshold_;
+
+  port::Mutex grow_mutex_;
+};  // class FastClockTable
+
 // A single shard of sharded cache.
 template <class Table>
 class ALIGN_AS(CACHE_LINE_SIZE) ClockCacheShard final : public CacheShardBase {
@@ -732,6 +840,28 @@ class HyperClockCache
   void ReportProblems(
       const std::shared_ptr<Logger>& /*info_log*/) const override;
 };  // class HyperClockCache
+
+class FastClockCache
+#ifdef NDEBUG
+    final
+#endif
+    : public ShardedCache<ClockCacheShard<FastClockTable>> {
+ public:
+  using Shard = ClockCacheShard<FastClockTable>;
+
+  FastClockCache(const FastClockCacheOptions& opts);
+
+  const char* Name() const override { return "FastClockCache"; }
+
+  void* Value(Handle* handle) override;
+
+  size_t GetCharge(Handle* handle) const override;
+
+  const CacheItemHelper* GetCacheItemHelper(Handle* handle) const override;
+
+  void ReportProblems(
+      const std::shared_ptr<Logger>& /*info_log*/) const override;
+};  // class FastClockCache
 
 }  // namespace clock_cache
 

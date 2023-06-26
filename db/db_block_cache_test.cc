@@ -745,7 +745,8 @@ TEST_F(DBBlockCacheTest, AddRedundantStats) {
             capacity,
             BlockBasedTableOptions().block_size /*estimated_value_size*/,
             num_shard_bits)
-            .MakeSharedCache()}) {
+            .MakeSharedCache(),
+        FastClockCacheOptions(capacity, num_shard_bits).MakeSharedCache()}) {
     if (!base_cache) {
       // Skip clock cache when not supported
       continue;

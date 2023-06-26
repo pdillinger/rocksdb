@@ -135,6 +135,10 @@ std::shared_ptr<Cache> StressTest::NewCache(size_t capacity,
                                 num_shard_bits);
     opts.secondary_cache = std::move(secondary_cache);
     return opts.MakeSharedCache();
+  } else if (FLAGS_cache_type == "fast_clock_cache") {
+    FastClockCacheOptions opts(static_cast<size_t>(capacity), num_shard_bits);
+    opts.secondary_cache = std::move(secondary_cache);
+    return opts.MakeSharedCache();
   } else if (FLAGS_cache_type == "lru_cache") {
     LRUCacheOptions opts;
     opts.capacity = capacity;

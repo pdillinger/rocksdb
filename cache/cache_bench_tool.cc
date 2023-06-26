@@ -302,6 +302,9 @@ class CacheBench {
       cache_ = HyperClockCacheOptions(FLAGS_cache_size, FLAGS_value_bytes,
                                       FLAGS_num_shard_bits)
                    .MakeSharedCache();
+    } else if (FLAGS_cache_type == "fast_clock_cache") {
+      cache_ = FastClockCacheOptions(FLAGS_cache_size, FLAGS_num_shard_bits)
+                   .MakeSharedCache();
     } else if (FLAGS_cache_type == "lru_cache") {
       LRUCacheOptions opts(FLAGS_cache_size, FLAGS_num_shard_bits,
                            false /* strict_capacity_limit */,

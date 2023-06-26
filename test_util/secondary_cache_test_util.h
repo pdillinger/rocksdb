@@ -43,6 +43,7 @@ class WithCacheType : public TestCreateContext {
 
   static constexpr auto kLRU = "lru";
   static constexpr auto kHyperClock = "hyper_clock";
+  static constexpr auto kFastClock = "fast_clock";
 
   // For options other than capacity
   size_t estimated_value_size_ = 1;
@@ -69,6 +70,13 @@ class WithCacheType : public TestCreateContext {
         modify_opts_fn(hc_opts);
       }
       return hc_opts.MakeSharedCache();
+    }
+    if (type == kFastClock) {
+      FastClockCacheOptions fc_opts{capacity};
+      if (modify_opts_fn) {
+        modify_opts_fn(fc_opts);
+      }
+      return fc_opts.MakeSharedCache();
     }
     assert(false);
     return nullptr;
@@ -110,9 +118,11 @@ class WithCacheTypeParam : public WithCacheType,
 
 constexpr auto kLRU = WithCacheType::kLRU;
 constexpr auto kHyperClock = WithCacheType::kHyperClock;
+constexpr auto kFastClock = WithCacheType::kFastClock;
 
 inline auto GetTestingCacheTypes() {
-  return testing::Values(std::string(kLRU), std::string(kHyperClock));
+  return testing::Values(std::string(kLRU), std::string(kHyperClock),
+                         std::string(kFastClock));
 }
 
 }  // namespace secondary_cache_test_util
