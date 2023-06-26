@@ -9,6 +9,7 @@
 
 #include "cache/clock_cache.h"
 
+#include <cassert>
 #include <functional>
 #include <numeric>
 
@@ -126,21 +127,298 @@ void ClockHandleBasicData::FreeData(MemoryAllocator* allocator) const {
   }
 }
 
+template <class HandleImpl>
+HandleImpl* BaseClockTable::StandaloneInsert(
+    const ClockHandleBasicData& proto) {
+  // Heap allocated separate from table
+  HandleImpl* h = new HandleImpl();
+  ClockHandleBasicData* h_alias = h;
+  *h_alias = proto;
+  h->SetStandalone();
+  // Single reference (standalone entries only created if returning a refed
+  // Handle back to user)
+  uint64_t meta = uint64_t{ClockHandle::kStateInvisible}
+                  << ClockHandle::kStateShift;
+  meta |= uint64_t{1} << ClockHandle::kAcquireCounterShift;
+  h->meta.store(meta, std::memory_order_release);
+  // Keep track of how much of usage is standalone
+  standalone_usage_.fetch_add(proto.GetTotalCharge(),
+                              std::memory_order_relaxed);
+  return h;
+}
+
+template <class Table>
+typename Table::HandleImpl* BaseClockTable::CreateStandalone(
+    ClockHandleBasicData& proto, size_t capacity, bool strict_capacity_limit,
+    bool allow_uncharged) {
+  Table& derived = static_cast<Table&>(*this);
+  typename Table::InsertState state;
+  derived.StartInsert(state);
+
+  const size_t total_charge = proto.GetTotalCharge();
+  if (strict_capacity_limit) {
+    Status s = ChargeUsageMaybeEvictStrict<Table>(
+        total_charge, capacity,
+        /*need_evict_for_occupancy=*/false, state);
+    if (!s.ok()) {
+      if (allow_uncharged) {
+        proto.total_charge = 0;
+      } else {
+        return nullptr;
+      }
+    }
+  } else {
+    // Case strict_capacity_limit == false
+    bool success = ChargeUsageMaybeEvictNonStrict<Table>(
+        total_charge, capacity,
+        /*need_evict_for_occupancy=*/false, state);
+    if (!success) {
+      // Force the issue
+      usage_.fetch_add(total_charge, std::memory_order_relaxed);
+    }
+  }
+
+  return StandaloneInsert<typename Table::HandleImpl>(proto);
+}
+
+template <class Table>
+Status BaseClockTable::ChargeUsageMaybeEvictStrict(
+    size_t total_charge, size_t capacity, bool need_evict_for_occupancy,
+    typename Table::InsertState& state) {
+  if (total_charge > capacity) {
+    return Status::MemoryLimit(
+        "Cache entry too large for a single cache shard: " +
+        std::to_string(total_charge) + " > " + std::to_string(capacity));
+  }
+  // Grab any available capacity, and free up any more required.
+  size_t old_usage = usage_.load(std::memory_order_relaxed);
+  size_t new_usage;
+  if (LIKELY(old_usage != capacity)) {
+    do {
+      new_usage = std::min(capacity, old_usage + total_charge);
+    } while (!usage_.compare_exchange_weak(old_usage, new_usage,
+                                           std::memory_order_relaxed));
+  } else {
+    new_usage = old_usage;
+  }
+  // How much do we need to evict then?
+  size_t need_evict_charge = old_usage + total_charge - new_usage;
+  size_t request_evict_charge = need_evict_charge;
+  if (UNLIKELY(need_evict_for_occupancy) && request_evict_charge == 0) {
+    // Require at least 1 eviction.
+    request_evict_charge = 1;
+  }
+  if (request_evict_charge > 0) {
+    size_t evicted_charge = 0;
+    size_t evicted_count = 0;
+    static_cast<Table*>(this)->Evict(request_evict_charge, &evicted_charge,
+                                     &evicted_count, state);
+    occupancy_.fetch_sub(evicted_count, std::memory_order_release);
+    if (LIKELY(evicted_charge > need_evict_charge)) {
+      assert(evicted_count > 0);
+      // Evicted more than enough
+      usage_.fetch_sub(evicted_charge - need_evict_charge,
+                       std::memory_order_relaxed);
+    } else if (evicted_charge < need_evict_charge ||
+               (UNLIKELY(need_evict_for_occupancy) && evicted_count == 0)) {
+      // Roll back to old usage minus evicted
+      usage_.fetch_sub(evicted_charge + (new_usage - old_usage),
+                       std::memory_order_relaxed);
+      if (evicted_charge < need_evict_charge) {
+        return Status::MemoryLimit(
+            "Insert failed because unable to evict entries to stay within "
+            "capacity limit.");
+      } else {
+        return Status::MemoryLimit(
+            "Insert failed because unable to evict entries to stay within "
+            "table occupancy limit.");
+      }
+    }
+    // If we needed to evict something and we are proceeding, we must have
+    // evicted something.
+    assert(evicted_count > 0);
+  }
+  return Status::OK();
+}
+
+template <class Table>
+inline bool BaseClockTable::ChargeUsageMaybeEvictNonStrict(
+    size_t total_charge, size_t capacity, bool need_evict_for_occupancy,
+    typename Table::InsertState& state) {
+  // For simplicity, we consider that either the cache can accept the insert
+  // with no evictions, or we must evict enough to make (at least) enough
+  // space. It could lead to unnecessary failures or excessive evictions in
+  // some extreme cases, but allows a fast, simple protocol. If we allow a
+  // race to get us over capacity, then we might never get back to capacity
+  // limit if the sizes of entries allow each insertion to evict the minimum
+  // charge. Thus, we should evict some extra if it's not a signifcant
+  // portion of the shard capacity. This can have the side benefit of
+  // involving fewer threads in eviction.
+  size_t old_usage = usage_.load(std::memory_order_relaxed);
+  size_t need_evict_charge;
+  // NOTE: if total_charge > old_usage, there isn't yet enough to evict
+  // `total_charge` amount. Even if we only try to evict `old_usage` amount,
+  // there's likely something referenced and we would eat CPU looking for
+  // enough to evict.
+  if (old_usage + total_charge <= capacity || total_charge > old_usage) {
+    // Good enough for me (might run over with a race)
+    need_evict_charge = 0;
+  } else {
+    // Try to evict enough space, and maybe some extra
+    need_evict_charge = total_charge;
+    if (old_usage > capacity) {
+      // Not too much to avoid thundering herd while avoiding strict
+      // synchronization, such as the compare_exchange used with strict
+      // capacity limit.
+      need_evict_charge += std::min(capacity / 1024, total_charge) + 1;
+    }
+  }
+  if (UNLIKELY(need_evict_for_occupancy) && need_evict_charge == 0) {
+    // Special case: require at least 1 eviction if we only have to
+    // deal with occupancy
+    need_evict_charge = 1;
+  }
+  size_t evicted_charge = 0;
+  size_t evicted_count = 0;
+  if (need_evict_charge > 0) {
+    static_cast<Table*>(this)->Evict(need_evict_charge, &evicted_charge,
+                                     &evicted_count, state);
+    // Deal with potential occupancy deficit
+    if (UNLIKELY(need_evict_for_occupancy) && evicted_count == 0) {
+      assert(evicted_charge == 0);
+      // Can't meet occupancy requirement
+      return false;
+    } else {
+      // Update occupancy for evictions
+      occupancy_.fetch_sub(evicted_count, std::memory_order_release);
+    }
+  }
+  // Track new usage even if we weren't able to evict enough
+  usage_.fetch_add(total_charge - evicted_charge, std::memory_order_relaxed);
+  // No underflow
+  assert(usage_.load(std::memory_order_relaxed) < SIZE_MAX / 2);
+  // Success
+  return true;
+}
+
+template <class Table>
+Status BaseClockTable::Insert(const ClockHandleBasicData& proto,
+                              typename Table::HandleImpl** handle,
+                              Cache::Priority priority, size_t capacity,
+                              bool strict_capacity_limit) {
+  using HandleImpl = typename Table::HandleImpl;
+  Table& derived = static_cast<Table&>(*this);
+
+  typename Table::InsertState state;
+  derived.StartInsert(state);
+
+  // Do we have the available occupancy? Optimistically assume we do
+  // and deal with it if we don't.
+  size_t old_occupancy = occupancy_.fetch_add(1, std::memory_order_acquire);
+  auto revert_occupancy_fn = [&]() {
+    occupancy_.fetch_sub(1, std::memory_order_relaxed);
+  };
+  // Whether we over-committed and need an eviction to make up for it
+  bool need_evict_for_occupancy =
+      !derived.GrowIfNeeded(old_occupancy + 1, state);
+
+  // Usage/capacity handling is somewhat different depending on
+  // strict_capacity_limit, but mostly pessimistic.
+  bool use_standalone_insert = false;
+  const size_t total_charge = proto.GetTotalCharge();
+  if (strict_capacity_limit) {
+    Status s = ChargeUsageMaybeEvictStrict<Table>(
+        total_charge, capacity, need_evict_for_occupancy, state);
+    if (!s.ok()) {
+      revert_occupancy_fn();
+      return s;
+    }
+  } else {
+    // Case strict_capacity_limit == false
+    bool success = ChargeUsageMaybeEvictNonStrict<Table>(
+        total_charge, capacity, need_evict_for_occupancy, state);
+    if (!success) {
+      revert_occupancy_fn();
+      if (handle == nullptr) {
+        // Don't insert the entry but still return ok, as if the entry
+        // inserted into cache and evicted immediately.
+        proto.FreeData(allocator_);
+        return Status::OK();
+      } else {
+        // Need to track usage of fallback standalone insert
+        usage_.fetch_add(total_charge, std::memory_order_relaxed);
+        use_standalone_insert = true;
+      }
+    }
+  }
+  auto revert_usage_fn = [&]() {
+    usage_.fetch_sub(total_charge, std::memory_order_relaxed);
+    // No underflow
+    assert(usage_.load(std::memory_order_relaxed) < SIZE_MAX / 2);
+  };
+
+  if (!use_standalone_insert) {
+    // Attempt a table insert, but abort if we find an existing entry for the
+    // key. If we were to overwrite old entries, we would either
+    // * Have to gain ownership over an existing entry to overwrite it, which
+    // would only work if there are no outstanding (read) references and would
+    // create a small gap in availability of the entry (old or new) to lookups.
+    // * Have to insert into a suboptimal location (more probes) so that the
+    // old entry can be kept around as well.
+
+    uint64_t initial_countdown = GetInitialCountdown(priority);
+    assert(initial_countdown > 0);
+
+    HandleImpl* e =
+        derived.DoInsert(proto, initial_countdown, handle != nullptr, state);
+
+    if (e) {
+      // Successfully inserted
+      if (handle) {
+        *handle = e;
+      }
+      return Status::OK();
+    }
+    // Not inserted
+    revert_occupancy_fn();
+    // Maybe fall back on standalone insert
+    if (handle == nullptr) {
+      revert_usage_fn();
+      // As if unrefed entry immdiately evicted
+      proto.FreeData(allocator_);
+      return Status::OK();
+    }
+
+    use_standalone_insert = true;
+  }
+
+  // Run standalone insert
+  assert(use_standalone_insert);
+
+  *handle = StandaloneInsert<HandleImpl>(proto);
+
+  // The OkOverwritten status is used to count "redundant" insertions into
+  // block cache. This implementation doesn't strictly check for redundant
+  // insertions, but we instead are probably interested in how many insertions
+  // didn't go into the table (instead "standalone"), which could be redundant
+  // Insert or some other reason (use_standalone_insert reasons above).
+  return Status::OkOverwritten();
+}
+
 HyperClockTable::HyperClockTable(
     size_t capacity, bool /*strict_capacity_limit*/,
     CacheMetadataChargePolicy metadata_charge_policy,
     MemoryAllocator* allocator,
     const Cache::EvictionCallback* eviction_callback, const uint32_t* hash_seed,
     const Opts& opts)
-    : length_bits_(CalcHashBits(capacity, opts.estimated_value_size,
+    : BaseClockTable(metadata_charge_policy, allocator, eviction_callback,
+                     hash_seed),
+      length_bits_(CalcHashBits(capacity, opts.estimated_value_size,
                                 metadata_charge_policy)),
       length_bits_mask_((size_t{1} << length_bits_) - 1),
       occupancy_limit_(static_cast<size_t>((uint64_t{1} << length_bits_) *
                                            kStrictLoadFactor)),
-      array_(new HandleImpl[size_t{1} << length_bits_]),
-      allocator_(allocator),
-      eviction_callback_(*eviction_callback),
-      hash_seed_(*hash_seed) {
+      array_(new HandleImpl[size_t{1} << length_bits_]) {
   if (metadata_charge_policy ==
       CacheMetadataChargePolicy::kFullChargeCacheMetadata) {
     usage_ += size_t{GetTableSize()} * sizeof(HandleImpl);
@@ -259,356 +537,122 @@ inline void CorrectNearOverflow(uint64_t old_meta,
   }
 }
 
-inline Status HyperClockTable::ChargeUsageMaybeEvictStrict(
-    size_t total_charge, size_t capacity, bool need_evict_for_occupancy) {
-  if (total_charge > capacity) {
-    return Status::MemoryLimit(
-        "Cache entry too large for a single cache shard: " +
-        std::to_string(total_charge) + " > " + std::to_string(capacity));
-  }
-  // Grab any available capacity, and free up any more required.
-  size_t old_usage = usage_.load(std::memory_order_relaxed);
-  size_t new_usage;
-  if (LIKELY(old_usage != capacity)) {
-    do {
-      new_usage = std::min(capacity, old_usage + total_charge);
-    } while (!usage_.compare_exchange_weak(old_usage, new_usage,
-                                           std::memory_order_relaxed));
-  } else {
-    new_usage = old_usage;
-  }
-  // How much do we need to evict then?
-  size_t need_evict_charge = old_usage + total_charge - new_usage;
-  size_t request_evict_charge = need_evict_charge;
-  if (UNLIKELY(need_evict_for_occupancy) && request_evict_charge == 0) {
-    // Require at least 1 eviction.
-    request_evict_charge = 1;
-  }
-  if (request_evict_charge > 0) {
-    size_t evicted_charge = 0;
-    size_t evicted_count = 0;
-    Evict(request_evict_charge, &evicted_charge, &evicted_count);
-    occupancy_.fetch_sub(evicted_count, std::memory_order_release);
-    if (LIKELY(evicted_charge > need_evict_charge)) {
-      assert(evicted_count > 0);
-      // Evicted more than enough
-      usage_.fetch_sub(evicted_charge - need_evict_charge,
-                       std::memory_order_relaxed);
-    } else if (evicted_charge < need_evict_charge ||
-               (UNLIKELY(need_evict_for_occupancy) && evicted_count == 0)) {
-      // Roll back to old usage minus evicted
-      usage_.fetch_sub(evicted_charge + (new_usage - old_usage),
-                       std::memory_order_relaxed);
-      if (evicted_charge < need_evict_charge) {
-        return Status::MemoryLimit(
-            "Insert failed because unable to evict entries to stay within "
-            "capacity limit.");
-      } else {
-        return Status::MemoryLimit(
-            "Insert failed because unable to evict entries to stay within "
-            "table occupancy limit.");
-      }
-    }
-    // If we needed to evict something and we are proceeding, we must have
-    // evicted something.
-    assert(evicted_count > 0);
-  }
-  return Status::OK();
+void HyperClockTable::StartInsert(InsertState&) {}
+
+bool HyperClockTable::GrowIfNeeded(size_t new_occupancy, InsertState&) {
+  return new_occupancy <= occupancy_limit_;
 }
 
-inline bool HyperClockTable::ChargeUsageMaybeEvictNonStrict(
-    size_t total_charge, size_t capacity, bool need_evict_for_occupancy) {
-  // For simplicity, we consider that either the cache can accept the insert
-  // with no evictions, or we must evict enough to make (at least) enough
-  // space. It could lead to unnecessary failures or excessive evictions in
-  // some extreme cases, but allows a fast, simple protocol. If we allow a
-  // race to get us over capacity, then we might never get back to capacity
-  // limit if the sizes of entries allow each insertion to evict the minimum
-  // charge. Thus, we should evict some extra if it's not a signifcant
-  // portion of the shard capacity. This can have the side benefit of
-  // involving fewer threads in eviction.
-  size_t old_usage = usage_.load(std::memory_order_relaxed);
-  size_t need_evict_charge;
-  // NOTE: if total_charge > old_usage, there isn't yet enough to evict
-  // `total_charge` amount. Even if we only try to evict `old_usage` amount,
-  // there's likely something referenced and we would eat CPU looking for
-  // enough to evict.
-  if (old_usage + total_charge <= capacity || total_charge > old_usage) {
-    // Good enough for me (might run over with a race)
-    need_evict_charge = 0;
-  } else {
-    // Try to evict enough space, and maybe some extra
-    need_evict_charge = total_charge;
-    if (old_usage > capacity) {
-      // Not too much to avoid thundering herd while avoiding strict
-      // synchronization, such as the compare_exchange used with strict
-      // capacity limit.
-      need_evict_charge += std::min(capacity / 1024, total_charge) + 1;
-    }
-  }
-  if (UNLIKELY(need_evict_for_occupancy) && need_evict_charge == 0) {
-    // Special case: require at least 1 eviction if we only have to
-    // deal with occupancy
-    need_evict_charge = 1;
-  }
-  size_t evicted_charge = 0;
-  size_t evicted_count = 0;
-  if (need_evict_charge > 0) {
-    Evict(need_evict_charge, &evicted_charge, &evicted_count);
-    // Deal with potential occupancy deficit
-    if (UNLIKELY(need_evict_for_occupancy) && evicted_count == 0) {
-      assert(evicted_charge == 0);
-      // Can't meet occupancy requirement
-      return false;
-    } else {
-      // Update occupancy for evictions
-      occupancy_.fetch_sub(evicted_count, std::memory_order_release);
-    }
-  }
-  // Track new usage even if we weren't able to evict enough
-  usage_.fetch_add(total_charge - evicted_charge, std::memory_order_relaxed);
-  // No underflow
-  assert(usage_.load(std::memory_order_relaxed) < SIZE_MAX / 2);
-  // Success
-  return true;
-}
+HyperClockTable::HandleImpl* HyperClockTable::DoInsert(
+    const ClockHandleBasicData& proto, uint64_t initial_countdown,
+    bool take_ref, InsertState&) {
+  size_t probe = 0;
+  bool need_rollback = false;
+  HandleImpl* e = FindSlot(
+      proto.hashed_key,
+      [&](HandleImpl* h) {
+        // Optimistically transition the slot from "empty" to
+        // "under construction" (no effect on other states)
+        uint64_t old_meta =
+            h->meta.fetch_or(uint64_t{ClockHandle::kStateOccupiedBit}
+                                 << ClockHandle::kStateShift,
+                             std::memory_order_acq_rel);
+        uint64_t old_state = old_meta >> ClockHandle::kStateShift;
 
-inline HyperClockTable::HandleImpl* HyperClockTable::StandaloneInsert(
-    const ClockHandleBasicData& proto) {
-  // Heap allocated separate from table
-  HandleImpl* h = new HandleImpl();
-  ClockHandleBasicData* h_alias = h;
-  *h_alias = proto;
-  h->SetStandalone();
-  // Single reference (standalone entries only created if returning a refed
-  // Handle back to user)
-  uint64_t meta = uint64_t{ClockHandle::kStateInvisible}
-                  << ClockHandle::kStateShift;
-  meta |= uint64_t{1} << ClockHandle::kAcquireCounterShift;
-  h->meta.store(meta, std::memory_order_release);
-  // Keep track of how much of usage is standalone
-  standalone_usage_.fetch_add(proto.GetTotalCharge(),
-                              std::memory_order_relaxed);
-  return h;
-}
+        if (old_state == ClockHandle::kStateEmpty) {
+          // We've started inserting into an available slot, and taken
+          // ownership Save data fields
+          ClockHandleBasicData* h_alias = h;
+          *h_alias = proto;
 
-Status HyperClockTable::Insert(const ClockHandleBasicData& proto,
-                               HandleImpl** handle, Cache::Priority priority,
-                               size_t capacity, bool strict_capacity_limit) {
-  // Do we have the available occupancy? Optimistically assume we do
-  // and deal with it if we don't.
-  size_t old_occupancy = occupancy_.fetch_add(1, std::memory_order_acquire);
-  auto revert_occupancy_fn = [&]() {
-    occupancy_.fetch_sub(1, std::memory_order_relaxed);
-  };
-  // Whether we over-committed and need an eviction to make up for it
-  bool need_evict_for_occupancy = old_occupancy >= occupancy_limit_;
+          // Transition from "under construction" state to "visible" state
+          uint64_t new_meta = uint64_t{ClockHandle::kStateVisible}
+                              << ClockHandle::kStateShift;
 
-  // Usage/capacity handling is somewhat different depending on
-  // strict_capacity_limit, but mostly pessimistic.
-  bool use_standalone_insert = false;
-  const size_t total_charge = proto.GetTotalCharge();
-  if (strict_capacity_limit) {
-    Status s = ChargeUsageMaybeEvictStrict(total_charge, capacity,
-                                           need_evict_for_occupancy);
-    if (!s.ok()) {
-      revert_occupancy_fn();
-      return s;
-    }
-  } else {
-    // Case strict_capacity_limit == false
-    bool success = ChargeUsageMaybeEvictNonStrict(total_charge, capacity,
-                                                  need_evict_for_occupancy);
-    if (!success) {
-      revert_occupancy_fn();
-      if (handle == nullptr) {
-        // Don't insert the entry but still return ok, as if the entry
-        // inserted into cache and evicted immediately.
-        proto.FreeData(allocator_);
-        return Status::OK();
-      } else {
-        // Need to track usage of fallback standalone insert
-        usage_.fetch_add(total_charge, std::memory_order_relaxed);
-        use_standalone_insert = true;
-      }
-    }
-  }
-  auto revert_usage_fn = [&]() {
-    usage_.fetch_sub(total_charge, std::memory_order_relaxed);
-    // No underflow
-    assert(usage_.load(std::memory_order_relaxed) < SIZE_MAX / 2);
-  };
-
-  if (!use_standalone_insert) {
-    // Attempt a table insert, but abort if we find an existing entry for the
-    // key. If we were to overwrite old entries, we would either
-    // * Have to gain ownership over an existing entry to overwrite it, which
-    // would only work if there are no outstanding (read) references and would
-    // create a small gap in availability of the entry (old or new) to lookups.
-    // * Have to insert into a suboptimal location (more probes) so that the
-    // old entry can be kept around as well.
-
-    uint64_t initial_countdown = GetInitialCountdown(priority);
-    assert(initial_countdown > 0);
-
-    size_t probe = 0;
-    HandleImpl* e = FindSlot(
-        proto.hashed_key,
-        [&](HandleImpl* h) {
-          // Optimistically transition the slot from "empty" to
-          // "under construction" (no effect on other states)
-          uint64_t old_meta =
-              h->meta.fetch_or(uint64_t{ClockHandle::kStateOccupiedBit}
-                                   << ClockHandle::kStateShift,
-                               std::memory_order_acq_rel);
-          uint64_t old_state = old_meta >> ClockHandle::kStateShift;
-
-          if (old_state == ClockHandle::kStateEmpty) {
-            // We've started inserting into an available slot, and taken
-            // ownership Save data fields
-            ClockHandleBasicData* h_alias = h;
-            *h_alias = proto;
-
-            // Transition from "under construction" state to "visible" state
-            uint64_t new_meta = uint64_t{ClockHandle::kStateVisible}
-                                << ClockHandle::kStateShift;
-
-            // Maybe with an outstanding reference
-            new_meta |= initial_countdown << ClockHandle::kAcquireCounterShift;
-            new_meta |= (initial_countdown - (handle != nullptr))
-                        << ClockHandle::kReleaseCounterShift;
+          // Maybe with an outstanding reference
+          new_meta |= initial_countdown << ClockHandle::kAcquireCounterShift;
+          new_meta |= (initial_countdown - take_ref)
+                      << ClockHandle::kReleaseCounterShift;
 
 #ifndef NDEBUG
-            // Save the state transition, with assertion
-            old_meta = h->meta.exchange(new_meta, std::memory_order_release);
-            assert(old_meta >> ClockHandle::kStateShift ==
-                   ClockHandle::kStateConstruction);
+          // Save the state transition, with assertion
+          old_meta = h->meta.exchange(new_meta, std::memory_order_release);
+          assert(old_meta >> ClockHandle::kStateShift ==
+                 ClockHandle::kStateConstruction);
 #else
-            // Save the state transition
-            h->meta.store(new_meta, std::memory_order_release);
+          // Save the state transition
+          h->meta.store(new_meta, std::memory_order_release);
 #endif
+          return true;
+        } else if (old_state != ClockHandle::kStateVisible) {
+          // Slot not usable / touchable now
+          return false;
+        }
+        // Existing, visible entry, which might be a match.
+        // But first, we need to acquire a ref to read it. In fact, number of
+        // refs for initial countdown, so that we boost the clock state if
+        // this is a match.
+        old_meta = h->meta.fetch_add(
+            ClockHandle::kAcquireIncrement * initial_countdown,
+            std::memory_order_acq_rel);
+        // Like Lookup
+        if ((old_meta >> ClockHandle::kStateShift) ==
+            ClockHandle::kStateVisible) {
+          // Acquired a read reference
+          if (h->hashed_key == proto.hashed_key) {
+            // Match. Release in a way that boosts the clock state
+            old_meta = h->meta.fetch_add(
+                ClockHandle::kReleaseIncrement * initial_countdown,
+                std::memory_order_acq_rel);
+            // Correct for possible (but rare) overflow
+            CorrectNearOverflow(old_meta, h->meta);
+            // Insert standalone instead (only if return handle needed)
+            need_rollback = true;
             return true;
-          } else if (old_state != ClockHandle::kStateVisible) {
-            // Slot not usable / touchable now
-            return false;
-          }
-          // Existing, visible entry, which might be a match.
-          // But first, we need to acquire a ref to read it. In fact, number of
-          // refs for initial countdown, so that we boost the clock state if
-          // this is a match.
-          old_meta = h->meta.fetch_add(
-              ClockHandle::kAcquireIncrement * initial_countdown,
-              std::memory_order_acq_rel);
-          // Like Lookup
-          if ((old_meta >> ClockHandle::kStateShift) ==
-              ClockHandle::kStateVisible) {
-            // Acquired a read reference
-            if (h->hashed_key == proto.hashed_key) {
-              // Match. Release in a way that boosts the clock state
-              old_meta = h->meta.fetch_add(
-                  ClockHandle::kReleaseIncrement * initial_countdown,
-                  std::memory_order_acq_rel);
-              // Correct for possible (but rare) overflow
-              CorrectNearOverflow(old_meta, h->meta);
-              // Insert standalone instead (only if return handle needed)
-              use_standalone_insert = true;
-              return true;
-            } else {
-              // Mismatch. Pretend we never took the reference
-              old_meta = h->meta.fetch_sub(
-                  ClockHandle::kAcquireIncrement * initial_countdown,
-                  std::memory_order_acq_rel);
-            }
-          } else if (UNLIKELY((old_meta >> ClockHandle::kStateShift) ==
-                              ClockHandle::kStateInvisible)) {
-            // Pretend we never took the reference
-            // WART: there's a tiny chance we release last ref to invisible
-            // entry here. If that happens, we let eviction take care of it.
+          } else {
+            // Mismatch. Pretend we never took the reference
             old_meta = h->meta.fetch_sub(
                 ClockHandle::kAcquireIncrement * initial_countdown,
                 std::memory_order_acq_rel);
-          } else {
-            // For other states, incrementing the acquire counter has no effect
-            // so we don't need to undo it.
-            // Slot not usable / touchable now.
           }
-          (void)old_meta;
-          return false;
-        },
-        [&](HandleImpl* /*h*/) { return false; },
-        [&](HandleImpl* h) {
-          h->displacements.fetch_add(1, std::memory_order_relaxed);
-        },
-        probe);
-    if (e == nullptr) {
-      // Occupancy check and never abort FindSlot above should generally
-      // prevent this, except it's theoretically possible for other threads
-      // to evict and replace entries in the right order to hit every slot
-      // when it is populated. Assuming random hashing, the chance of that
-      // should be no higher than pow(kStrictLoadFactor, n) for n slots.
-      // That should be infeasible for roughly n >= 256, so if this assertion
-      // fails, that suggests something is going wrong.
-      assert(GetTableSize() < 256);
-      use_standalone_insert = true;
-    }
-    if (!use_standalone_insert) {
-      // Successfully inserted
-      if (handle) {
-        *handle = e;
-      }
-      return Status::OK();
-    }
-    // Roll back table insertion
+        } else if (UNLIKELY((old_meta >> ClockHandle::kStateShift) ==
+                            ClockHandle::kStateInvisible)) {
+          // Pretend we never took the reference
+          // WART: there's a tiny chance we release last ref to invisible
+          // entry here. If that happens, we let eviction take care of it.
+          old_meta = h->meta.fetch_sub(
+              ClockHandle::kAcquireIncrement * initial_countdown,
+              std::memory_order_acq_rel);
+        } else {
+          // For other states, incrementing the acquire counter has no effect
+          // so we don't need to undo it.
+          // Slot not usable / touchable now.
+        }
+        (void)old_meta;
+        return false;
+      },
+      [&](HandleImpl* /*h*/) { return false; },
+      [&](HandleImpl* h) {
+        h->displacements.fetch_add(1, std::memory_order_relaxed);
+      },
+      probe);
+  if (e == nullptr) {
+    // Occupancy check and never abort FindSlot above should generally
+    // prevent this, except it's theoretically possible for other threads
+    // to evict and replace entries in the right order to hit every slot
+    // when it is populated. Assuming random hashing, the chance of that
+    // should be no higher than pow(kStrictLoadFactor, n) for n slots.
+    // That should be infeasible for roughly n >= 256, so if this assertion
+    // fails, that suggests something is going wrong.
+    assert(GetTableSize() < 256);
+    return nullptr;
+  }
+  if (need_rollback) {
     Rollback(proto.hashed_key, e);
-    revert_occupancy_fn();
-    // Maybe fall back on standalone insert
-    if (handle == nullptr) {
-      revert_usage_fn();
-      // As if unrefed entry immdiately evicted
-      proto.FreeData(allocator_);
-      return Status::OK();
-    }
+    return nullptr;
   }
-
-  // Run standalone insert
-  assert(use_standalone_insert);
-
-  *handle = StandaloneInsert(proto);
-
-  // The OkOverwritten status is used to count "redundant" insertions into
-  // block cache. This implementation doesn't strictly check for redundant
-  // insertions, but we instead are probably interested in how many insertions
-  // didn't go into the table (instead "standalone"), which could be redundant
-  // Insert or some other reason (use_standalone_insert reasons above).
-  return Status::OkOverwritten();
-}
-
-HyperClockTable::HandleImpl* HyperClockTable::CreateStandalone(
-    ClockHandleBasicData& proto, size_t capacity, bool strict_capacity_limit,
-    bool allow_uncharged) {
-  const size_t total_charge = proto.GetTotalCharge();
-  if (strict_capacity_limit) {
-    Status s = ChargeUsageMaybeEvictStrict(total_charge, capacity,
-                                           /*need_evict_for_occupancy=*/false);
-    if (!s.ok()) {
-      if (allow_uncharged) {
-        proto.total_charge = 0;
-      } else {
-        return nullptr;
-      }
-    }
-  } else {
-    // Case strict_capacity_limit == false
-    bool success =
-        ChargeUsageMaybeEvictNonStrict(total_charge, capacity,
-                                       /*need_evict_for_occupancy=*/false);
-    if (!success) {
-      // Force the issue
-      usage_.fetch_add(total_charge, std::memory_order_relaxed);
-    }
-  }
-
-  return StandaloneInsert(proto);
+  // Successfully inserted
+  return e;
 }
 
 HyperClockTable::HandleImpl* HyperClockTable::Lookup(
@@ -978,7 +1022,8 @@ inline void HyperClockTable::ReclaimEntryUsage(size_t total_charge) {
 }
 
 inline void HyperClockTable::Evict(size_t requested_charge,
-                                   size_t* freed_charge, size_t* freed_count) {
+                                   size_t* freed_charge, size_t* freed_count,
+                                   InsertState&) {
   // precondition
   assert(requested_charge > 0);
 
@@ -1146,18 +1191,15 @@ Status ClockCacheShard<Table>::Insert(const Slice& key,
   proto.value = value;
   proto.helper = helper;
   proto.total_charge = charge;
-  return table_.Insert(proto, handle, priority,
-                       capacity_.load(std::memory_order_relaxed),
-                       strict_capacity_limit_.load(std::memory_order_relaxed));
+  return table_.template Insert<Table>(
+      proto, handle, priority, capacity_.load(std::memory_order_relaxed),
+      strict_capacity_limit_.load(std::memory_order_relaxed));
 }
 
 template <class Table>
-typename ClockCacheShard<Table>::HandleImpl*
-ClockCacheShard<Table>::CreateStandalone(const Slice& key,
-                                         const UniqueId64x2& hashed_key,
-                                         Cache::ObjectPtr obj,
-                                         const Cache::CacheItemHelper* helper,
-                                         size_t charge, bool allow_uncharged) {
+typename Table::HandleImpl* ClockCacheShard<Table>::CreateStandalone(
+    const Slice& key, const UniqueId64x2& hashed_key, Cache::ObjectPtr obj,
+    const Cache::CacheItemHelper* helper, size_t charge, bool allow_uncharged) {
   if (UNLIKELY(key.size() != kCacheKeySize)) {
     return nullptr;
   }
@@ -1166,7 +1208,7 @@ ClockCacheShard<Table>::CreateStandalone(const Slice& key,
   proto.value = obj;
   proto.helper = helper;
   proto.total_charge = charge;
-  return table_.CreateStandalone(
+  return table_.template CreateStandalone<Table>(
       proto, capacity_.load(std::memory_order_relaxed),
       strict_capacity_limit_.load(std::memory_order_relaxed), allow_uncharged);
 }
