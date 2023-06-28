@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cassert>
+#include <exception>
 #include <functional>
 #include <numeric>
 #include <thread>
@@ -1559,10 +1560,15 @@ FastClockTable::FastClockTable(size_t capacity, bool /*strict_capacity_limit*/,
   static_assert(sizeof(HandleImpl) == 64U,
                 "Expecting size / alignment with common cache line size");
 
-  // Mark home addresses as insertable
+  // Mark next pointers as "null" and home addresses as insertable
+  size_t min_home = GetMinHomeIndex(threshold_.load());
   size_t end = ThresholdToFrontier(threshold_.load());
-  for (size_t i = GetMinHomeIndex(threshold_.load()); i < end; ++i) {
-    array_[i].next = static_cast<uint32_t>(i) | HandleImpl::kNextInsertableFlag;
+  size_t i = 0;
+  for (; i < min_home; ++i) {
+    array_[i].next = HandleImpl::kNextNull;
+  }
+  for (; i < end; ++i) {
+    array_[i].next = HandleImpl::kNextNull | HandleImpl::kNextInsertableFlag;
   }
 }
 
@@ -1610,6 +1616,71 @@ void FastClockTable::StartInsert(InsertState& state) {
   state.saved_threshold = threshold_.load(std::memory_order_acquire);
 }
 
+inline bool MatchAndRef(const UniqueId64x2* hashed_key, ClockHandle& h,
+                        size_t home = 0, uint64_t threshold = 0,
+                        bool* full_match = nullptr) {
+  // Mostly branch-free version (similar performance)
+  /*
+  uint64_t old_meta = h->meta.fetch_add(ClockHandle::kAcquireIncrement,
+                                std::memory_order_acquire);
+  bool Shareable = (old_meta >> (ClockHandle::kStateShift + 1)) & 1U;
+  bool visible = (old_meta >> ClockHandle::kStateShift) & 1U;
+  bool match = (h->key == key) & visible;
+  h->meta.fetch_sub(static_cast<uint64_t>(Shareable & !match) <<
+  ClockHandle::kAcquireCounterShift, std::memory_order_release); return
+  match;
+  */
+  // Optimistic lookup should pay off when the table is relatively
+  // sparse.
+  assert(hashed_key || home > 0);
+  constexpr bool kOptimisticLookup = true;
+  uint64_t old_meta;
+  if (!kOptimisticLookup) {
+    old_meta = h.meta.load(std::memory_order_acquire);
+    if ((old_meta >> ClockHandle::kStateShift) != ClockHandle::kStateVisible) {
+      return false;
+    }
+  }
+  // (Optimistically) increment acquire counter
+  old_meta = h.meta.fetch_add(ClockHandle::kAcquireIncrement,
+                              std::memory_order_acquire);
+  // Check if it's an entry visible to lookups
+  if ((old_meta >> ClockHandle::kStateShift) == ClockHandle::kStateVisible) {
+    // Acquired a read reference
+    if (hashed_key && h.hashed_key == *hashed_key) {
+      // Match on full key
+      if (full_match) {
+        *full_match = true;
+      }
+      return true;
+    } else if (home > 0 && home == GetHomeIndex(threshold, h.hashed_key[0])) {
+      // Match on home address
+      if (full_match) {
+        *full_match = false;
+      }
+      return true;
+    } else {
+      // Mismatch. Pretend we never took the reference
+      old_meta = h.meta.fetch_sub(ClockHandle::kAcquireIncrement,
+                                  std::memory_order_release);
+    }
+  } else if (UNLIKELY((old_meta >> ClockHandle::kStateShift) ==
+                      ClockHandle::kStateInvisible)) {
+    // Pretend we never took the reference
+    // WART: there's a tiny chance we release last ref to invisible
+    // entry here. If that happens, we let eviction take care of it.
+    old_meta = h.meta.fetch_sub(ClockHandle::kAcquireIncrement,
+                                std::memory_order_release);
+  } else {
+    // For other states, incrementing the acquire counter has no effect
+    // so we don't need to undo it. Furthermore, we cannot safely undo
+    // it because we did not acquire a read reference to lock the
+    // entry in a Shareable state.
+  }
+  (void)old_meta;
+  return false;
+}
+
 bool FastClockTable::GrowIfNeeded(size_t new_occupancy, InsertState& state) {
   size_t old_min_home = GetMinHomeIndex(state.saved_threshold);
   if (new_occupancy <= old_min_home) {
@@ -1632,12 +1703,12 @@ bool FastClockTable::GrowIfNeeded(size_t new_occupancy, InsertState& state) {
     // Don't need to grow
     return true;
   }
+  // !!!!! FIXME !!!!!: Verify against null next etc.
+  // TODO: make sure max_length_bits doesn't let us overflow next refs
   if ((old_min_home >> max_length_bits_) > 0) {
     // Can't grow any more
     return false;
   }
-
-  // TODO: make sure max_length_bits doesn't let us overflow next refs
 
   // OK we are growing one old address into two new ones.
   HandleImpl& old_home = array_[old_min_home];
@@ -1646,7 +1717,147 @@ bool FastClockTable::GrowIfNeeded(size_t new_occupancy, InsertState& state) {
   HandleImpl* new_homes = array_ + old_frontier;
   uint64_t new_threshold = FrontierToThreshold(old_frontier + 2);
 
-  // We start by pinning the home entry, (a) so that other operations can
+  // We start by redirecting insertions to the new homes, by marking them
+  // insertable and then the old no longer insertable (which will cause both
+  // to be read until threshold_ is updated).
+
+  new_homes[0].next.fetch_or(HandleImpl::kNextInsertableFlag, std::memory_order_acquire);
+  new_homes[1].next.fetch_or(HandleImpl::kNextInsertableFlag, std::memory_order_release);
+
+  old_home.next.fetch_and(~HandleImpl::kNextInsertableFlag, std::memory_order_acq_rel);
+
+  // Next we need to move entries from old to appropriate new in tail to head
+  // order, so that we can safely, temporarily have the chains converge on
+  // entries shared between them. And we take read refs on each entry in the
+  // chain to ensure they are pinned (not removed). (Note: neither under
+  // construction nor empty entries are allowed in the chain.) For example,
+  // updating one atomic at a time, marked with *, in sequence:
+  //
+  // Old -> A1 -> B1 -> A2 -> B2 ->||
+  // NewA ->||
+  // NewB ->||
+  // ===>
+  // Old -> A1 -> B1 -> A2 -\
+  // NewA ->||               \
+  // NewB ---------*----------> B2 ->||
+  // ===>
+  // Old -> A1 -> B1 -> A2 *>||
+  // NewA ->||
+  // NewB -> B2 ->||
+  // ===>
+  // Old -> A1 -> B1 -\
+  // NewA ------*------> A2 ->||
+  // NewB -> B2 ->||
+  // ===>
+  // Old -> A1 -> B1 *>||
+  // NewA -> A2 ->||
+  // NewB -> B2 ->||
+  // ===>
+  // Old -> A1 -> B1 *>\
+  // NewA -> A2 ->||    \
+  // NewB ---------------> B2 ->||
+  // ===>
+  // Old -> A1 ----->\
+  // NewA -> A2 ->||  \
+  // NewB ------*------> B1 -> B2 ->||
+  // ===>
+  // Old -> A1 *>||
+  // NewA -> A2 ->||
+  // NewB -> B1 -> B2 ->||
+  // ===>
+  // Old -> A1 *\
+  // NewA -------> A2 ->||
+  // NewB -> B1 -> B2 ->||
+  // == Now suppose another thread adds A9 to NewA during this =>
+  // Old -> A1 -\
+  // NewA -> A9 -> A2 ->||
+  // NewB -> B1 -> B2 ->||
+  // == We get a CAS failure on NewA next and have to adjust =>
+  // Old -> A1 *\
+  // NewA -------> A9 -> A2 ->||
+  // NewB -> B1 -> B2 ->||
+  // ===>
+  // Old -\
+  // NewA *> A1 -> A9 -> A2 ->||
+  // NewB -> B1 -> B2 ->||
+  // ===>
+  // Old *>||
+  // NewA -> A1 -> A9 -> A2 ->||
+  // NewB -> B1 -> B2 ->||
+  //
+  // We will deal with any "at home" entries later (not depicted above) before
+  // updating threshold_.
+
+  autovector<uint32_t> pinned_refs_in_chain;
+
+  // Similar to island hopping in Lookup, with local retries, except we keep
+  // all the refs.
+  HandleImpl *h = &old_home;
+  for (size_t i = 0;;) {
+    uint32_t next = h->next.load(std::memory_order_acquire);
+    assert(next == (next & HandleImpl::kNextNoFlagsMask));
+    if (next == HandleImpl::kNextNull) {
+      // End of chain
+      break;
+    }
+
+    HandleImpl* h_next = array_ + next;
+    if (MatchAndRef(/*hashed_key=*/nullptr, *h_next, old_min_home, state.saved_threshold)) {
+      pinned_refs_in_chain.push_back(next);
+      h = h_next;
+      i = 0;
+    } else {
+      // Need to try again with same h
+      ++i;
+      assert(i < 100);
+    }
+  }
+
+  // Now carefully transfer each entry to its new chain, without
+  // interrupting read access nor other insertions into the new chains.
+  // This doesn't need to be highly optimized, just safe and correct.
+  // At the end of each step, we reset the tail of the old chain to null,
+  // to end sharing so that the new chain can take full ownership of the
+  // migrated entrty.
+  while (!pinned_refs_in_chain.empty()) {
+    uint32_t entry_idx = pinned_refs_in_chain.back();
+    h = array_ + entry_idx;
+    HandleImpl* new_home = array_ + GetHomeIndex(new_threshold, h->hashed_key[0]);
+    assert(new_home == new_homes + 0 || new_home == new_homes + 1);
+    uint32_t next = new_home->next.load(std::memory_order_acquire);
+    assert(h->next.load(std::memory_order_acquire) == HandleImpl::kNextNull);
+    h->next.store(next & HandleImpl::kNextNoFlagsMask, std::memory_order_release);
+    if (new_home->next.compare_exchange_weak(next, entry_idx | HandleImpl::kNextInsertableFlag, std::memory_order_acq_rel)) {
+      // Set old home chain tail to null so that we can safely un-ref the
+      // migrated entry
+      pinned_refs_in_chain.pop_back();
+      HandleImpl& last = pinned_refs_in_chain.empty() ? old_home : array_[pinned_refs_in_chain.back()];
+      last.next.store(HandleImpl::kNextNull, std::memory_order_release);
+      Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
+    } else {
+      // Reset tail back to null and try again
+      h->next.store(HandleImpl::kNextNull, std::memory_order_release);
+      // TODO: assert retry count
+    }
+  }
+
+  // Now dealing with any "at home" entry is a pain because it might be under
+  // construction and we don't know where it belongs. And without adding
+  // another metadata bit, we can't agree on whether this thread or the owning
+  // thread should migrate.
+  // Also, in case it's empty, we need to get a write lock to block any other
+  // writes to it. But first we try taking a read ref, and alternate until
+  // something works. Unfortunately, this might be a true spin+yield waiting
+  // on another thread.
+  for (size_t i = 0;; ++i) {
+    uint64_t old_meta = old_home.meta.fetch_add(ClockHandle::kAcquireIncrement,
+                              std::memory_order_acquire);
+    if ((old_meta >> ClockHandle::kStateShift) == ClockHandle::kStateVisible) {
+
+  }
+
+
+  // pinning the home entry, (a) so that other operations can
   // safely erase a home to empty slot without worrying that Grow will turn the
   // slot into a chained entry concurrently (which is not allowed to be empty
   // and part of a chain), and (b) so that we can determine whether it is
@@ -1827,8 +2038,8 @@ bool FastClockTable::GrowIfNeeded(size_t new_occupancy, InsertState& state) {
   return true;
 }
 
-inline bool BeginInsert(const ClockHandleBasicData& proto, ClockHandle& h,
-                        uint64_t initial_countdown, bool* already_matches) {
+inline bool BeginSlotInsert(const ClockHandleBasicData& proto, ClockHandle& h,
+                            uint64_t initial_countdown, bool* already_matches) {
   assert(*already_matches == false);
   // Optimistically transition the slot from "empty" to
   // "under construction" (no effect on other states)
@@ -1874,7 +2085,7 @@ inline bool BeginInsert(const ClockHandleBasicData& proto, ClockHandle& h,
   } else if (UNLIKELY((old_meta >> ClockHandle::kStateShift) ==
                       ClockHandle::kStateInvisible)) {
     // Pretend we never took the reference
-    // WART: there's a tiny chance we release last ref to invisible
+    // WART/FIXME?: there's a tiny chance we release last ref to invisible
     // entry here. If that happens, we let eviction take care of it.
     old_meta =
         h.meta.fetch_sub(ClockHandle::kAcquireIncrement * initial_countdown,
@@ -1888,8 +2099,8 @@ inline bool BeginInsert(const ClockHandleBasicData& proto, ClockHandle& h,
   return false;
 }
 
-inline void FinishInsert(const ClockHandleBasicData& proto, ClockHandle& h,
-                         uint64_t initial_countdown, bool keep_ref) {
+inline void FinishSlotInsert(const ClockHandleBasicData& proto, ClockHandle& h,
+                             uint64_t initial_countdown, bool keep_ref) {
   // Save data fields
   ClockHandleBasicData* h_alias = &h;
   *h_alias = proto;
@@ -1917,9 +2128,9 @@ inline void FinishInsert(const ClockHandleBasicData& proto, ClockHandle& h,
 bool TryInsert(const ClockHandleBasicData& proto, ClockHandle& h,
                uint64_t initial_countdown, bool keep_ref,
                bool* already_matches) {
-  bool b = BeginInsert(proto, h, initial_countdown, already_matches);
+  bool b = BeginSlotInsert(proto, h, initial_countdown, already_matches);
   if (b) {
-    FinishInsert(proto, h, initial_countdown, keep_ref);
+    FinishSlotInsert(proto, h, initial_countdown, keep_ref);
   }
   return b;
 }
@@ -1933,11 +2144,11 @@ FastClockTable::HandleImpl* FastClockTable::DoInsert(
   {
     bool already_matches = false;
     HandleImpl& h = array_[home];
-    if (BeginInsert(proto, h, initial_countdown, &already_matches)) {
+    if (BeginSlotInsert(proto, h, initial_countdown, &already_matches)) {
       // Verify this is still a home address
       if (LIKELY(h.next.load(std::memory_order_acquire) &
                  HandleImpl::kNextInsertableFlag)) {
-        FinishInsert(proto, h, initial_countdown, take_ref);
+        FinishSlotInsert(proto, h, initial_countdown, take_ref);
         return array_ + home;
         // debug_history.append("Insert @home " + std::to_string(home) +
         // "\n");
@@ -1949,6 +2160,10 @@ FastClockTable::HandleImpl* FastClockTable::DoInsert(
       }
     }
     if (already_matches) {
+      // Prefer to keep existing entry than to insert one further down the
+      // chain. (Can't return the existing entry, because that wouldn't take
+      // ownership of the cache object under a Handle. We need a standalone
+      // entry for that.)
       return nullptr;
     }
   }
@@ -1973,6 +2188,8 @@ FastClockTable::HandleImpl* FastClockTable::DoInsert(
     bool already_matches = false;
     if (TryInsert(proto, array_[idx], initial_countdown, take_ref,
                   &already_matches)) {
+      assert(array_[idx].next.load(std::memory_order_acquire) ==
+             HandleImpl::kNextNull);
       break;
     }
     // Else keep searching for empty slot
@@ -1992,118 +2209,190 @@ FastClockTable::HandleImpl* FastClockTable::DoInsert(
   }
 
   // Now insert into chain starting at home address, though
-  // might need to spin / retry
-  for (size_t i = 0;; ++i) {
+  // might need to retry. During Grow, threshold_ might not be up to date
+  // with where we should insert, but we should only need to check one
+  // level beyond the home given by threshold_. However, saved_threshold can
+  // be out of date with threshold_.
+  for (size_t home_changes = 0;;) {
     uint32_t next = array_[home].next.load(std::memory_order_acquire);
-    if (next & HandleImpl::kNextInsertableFlag) {
-      array_[idx].next.store(next & ~HandleImpl::kNextInsertableFlag,
-                             std::memory_order_acq_rel);
-      if (array_[home].next.compare_exchange_weak(
-              next,
-              static_cast<uint32_t>(idx) | HandleImpl::kNextInsertableFlag |
-                  HandleImpl::kNextFollowFlag,
-              std::memory_order_acq_rel)) {
-        // debug_history.append("Insert @ " + std::to_string(idx) + " for
-        // home " + std::to_string(home) + "\n");
-
-        // Successful insertion. All done.
-        return array_ + idx;
-      }
-    }
-    if (i >= 200) {
-      std::this_thread::yield();
-    }
     // Home might change with another thread executing Grow
-    state.saved_threshold = threshold_.load(std::memory_order_acquire);
-    home = GetHomeIndex(state.saved_threshold, proto.hashed_key[0]);
-  }
-}
+    if (UNLIKELY((next & HandleImpl::kNextInsertableFlag) == 0)) {
+      ++home_changes;
+      if (home_changes > 50) {
+        std::terminate();
+      }
+      // Try next level
+      size_t forward_home =
+          GetHomeIndex(state.saved_threshold - 1, proto.hashed_key[0]);
+      next = array_[forward_home].next.load(std::memory_order_acquire);
+      if (UNLIKELY((next & HandleImpl::kNextInsertableFlag) == 0)) {
+        // There should always be an insertable home for entries, so this
+        // should only happen if saved_threshold is way behind.
+        assert(GetHomeIndex(threshold_.load(std::memory_order_acquire),
+                            proto.hashed_key[0]) > home);
+        state.saved_threshold = threshold_.load(std::memory_order_acquire);
+        home = GetHomeIndex(state.saved_threshold, proto.hashed_key[0]);
+        continue;
+      }
+      home = forward_home;
+    }
+    array_[idx].next.store(next & ~HandleImpl::kNextInsertableFlag,
+                           std::memory_order_acq_rel);
+    assert(idx <= HandleImpl::kNextNoFlagsMask);
+    if (array_[home].next.compare_exchange_weak(
+            next, static_cast<uint32_t>(idx) | HandleImpl::kNextInsertableFlag,
+            std::memory_order_acq_rel)) {
+      // debug_history.append("Insert @ " + std::to_string(idx) + " for
+      // home " + std::to_string(home) + "\n");
 
-inline bool MatchAndRef(const UniqueId64x2& hashed_key, ClockHandle& h) {
-  // Mostly branch-free version (similar performance)
-  /*
-  uint64_t old_meta = h->meta.fetch_add(ClockHandle::kAcquireIncrement,
-                                std::memory_order_acquire);
-  bool Shareable = (old_meta >> (ClockHandle::kStateShift + 1)) & 1U;
-  bool visible = (old_meta >> ClockHandle::kStateShift) & 1U;
-  bool match = (h->key == key) & visible;
-  h->meta.fetch_sub(static_cast<uint64_t>(Shareable & !match) <<
-  ClockHandle::kAcquireCounterShift, std::memory_order_release); return
-  match;
-  */
-  // Optimistic lookup should pay off when the table is relatively
-  // sparse.
-  constexpr bool kOptimisticLookup = true;
-  uint64_t old_meta;
-  if (!kOptimisticLookup) {
-    old_meta = h.meta.load(std::memory_order_acquire);
-    if ((old_meta >> ClockHandle::kStateShift) != ClockHandle::kStateVisible) {
-      return false;
+      // Successful insertion. All done.
+      return array_ + idx;
     }
   }
-  // (Optimistically) increment acquire counter
-  old_meta = h.meta.fetch_add(ClockHandle::kAcquireIncrement,
-                              std::memory_order_acquire);
-  // Check if it's an entry visible to lookups
-  if ((old_meta >> ClockHandle::kStateShift) == ClockHandle::kStateVisible) {
-    // Acquired a read reference
-    if (h.hashed_key == hashed_key) {
-      // Match
-      return true;
-    } else {
-      // Mismatch. Pretend we never took the reference
-      old_meta = h.meta.fetch_sub(ClockHandle::kAcquireIncrement,
-                                  std::memory_order_release);
-    }
-  } else if (UNLIKELY((old_meta >> ClockHandle::kStateShift) ==
-                      ClockHandle::kStateInvisible)) {
-    // Pretend we never took the reference
-    // WART: there's a tiny chance we release last ref to invisible
-    // entry here. If that happens, we let eviction take care of it.
-    old_meta = h.meta.fetch_sub(ClockHandle::kAcquireIncrement,
-                                std::memory_order_release);
-  } else {
-    // For other states, incrementing the acquire counter has no effect
-    // so we don't need to undo it. Furthermore, we cannot safely undo
-    // it because we did not acquire a read reference to lock the
-    // entry in a Shareable state.
-  }
-  (void)old_meta;
-  return false;
 }
 
 FastClockTable::HandleImpl* FastClockTable::Lookup(
     const UniqueId64x2& hashed_key) {
-  // Might have to retry in rare cases
+  // Overall, Lookup works by "island hopping."" While holding a read reference
+  // to one entry in a chain, we follow the next link, retrying as needed,
+  // until we get a read reference to an entry that belongs in the chain (thus
+  // is the next entry, or in extremely rare cases, moves backward in the chain
+  // due to reusing a slot) and only then release the read reference on the
+  // previous entry. Note that we never skip over entries in the chain, as
+  // entries in the chain must be read-refable (thus, removed from the chain
+  // before being marked "under construction" or empty).
+  //
+  // Two tricky parts:
+  // * Bootstrapping the island hopping: ...
+  // * Fall foward: ...
+
+  uint64_t threshold = threshold_.load(std::memory_order_acquire);
+  size_t home = GetHomeIndex(threshold, hashed_key[0]);
+
+  // In rare cases, might have to check more than one home.
+  size_t home_changes = 0;
+// C++ still doesn't have labelled break/continue
+home_changed : {
+  // Probe home slot. Only need to keep a ref on full match, because
+  // we need special handling for initial jump from a home slot into the
+  // chain.
+  HandleImpl* h = array_ + home;
+  if (MatchAndRef(&hashed_key, *h)) {
+    return h;
+  }
+
+  // Now, what was our home slot could now be in one of three states:
+  // * Still exclusively the correct home slot (kNextInsertableFlag)
+  // * A Grow is in the process of migrating from this slot to a new home
+  // slot (this one no longer insertable).
+  // * In the background, a Grow has completed and the slot has been
+  // freed up and possibly re-used in another chain.
+
+  bool full_match = false;
+  bool grow_in_progress = false;
+
+  // Make the initial jump into the chain (if present)
   for (size_t i = 0;; ++i) {
-    uint64_t threshold = threshold_.load(std::memory_order_acquire);
-    size_t home = GetHomeIndex(threshold, hashed_key[0]);
-
-    HandleImpl* h = array_ + home;
-    if (MatchAndRef(hashed_key, *h)) {
-      return h;
-    }
-
     uint32_t next = h->next.load(std::memory_order_acquire);
-    while (next & HandleImpl::kNextFollowFlag) {
-      h = array_ + (next & HandleImpl::kNextNoFlagsMask);
-      if (MatchAndRef(hashed_key, *h)) {
-        return h;
+    if (UNLIKELY((next & HandleImpl::kNextInsertableFlag) == 0)) {
+      // Re-read threshold_ to decide whether a Grow is still
+      // in progress for this old home slot.
+      threshold = threshold_.load(std::memory_order_acquire);
+      size_t new_home = GetHomeIndex(threshold, hashed_key[0]);
+      if (new_home != home) {
+        // Reading this chain is no longer necessary. Start over at new
+        // home.
+        home = new_home;
+        ++home_changes;
+        if (home_changes > 50) {
+          std::terminate();
+        }
+        goto home_changed;
       }
-      next = h->next.load(std::memory_order_acquire);
+      // We will have to check the next home also
+      grow_in_progress = true;
+    }
+    // Correct home slot, or old one whose chain must be read
+    next &= HandleImpl::kNextNoFlagsMask;
+    if (next == HandleImpl::kNextNull) {
+      // No chain to search
+      h = nullptr;
+      break;
     }
 
-    if ((next & HandleImpl::kNextNoFlagsMask) == home) {
-      // Clean query, no match found
-      return nullptr;
+    HandleImpl* h_next = array_ + next;
+    if (MatchAndRef(&hashed_key, *h_next, home, threshold, &full_match)) {
+      if (full_match) {
+        return h_next;
+      } else {
+        // Correct home location, so we are on the right chain
+        h = h_next;
+        break;
+      }
     }
-    // Else, some other action prevented us from walking the list cleanly.
-    // Try again, though yield after a spin limit
-    if (i >= 200) {
-      std::this_thread::yield();
+    // Else, need to try again
+    assert(i < 100);
+  }
+
+  if (h) {
+    // Continue island hopping down the chain.
+    // Loop invariant: we have a read ref on h which ensures it is part of
+    // the home chain (though could be migrated to next home chain during
+    // this operation - ok).
+    for (size_t i = 0;;) {
+      uint32_t next = h->next.load(std::memory_order_acquire);
+      assert(next == (next & HandleImpl::kNextNoFlagsMask));
+      if (next == HandleImpl::kNextNull) {
+        // End of chain
+        Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
+        h = nullptr;
+        break;
+      }
+
+      HandleImpl* h_next = array_ + next;
+      if (MatchAndRef(&hashed_key, *h_next, home, threshold, &full_match)) {
+        // Release this island and hop to the next
+        Release(h, /*useful=*/false, /*erase_if_last_ref=*/false);
+        if (full_match) {
+          // Return full match.
+          return h_next;
+        } else {
+          // Correct home location, so we can continue down the correct
+          // chain.
+          h = h_next;
+          i = 0;
+        }
+      } else {
+        // Need to try again with same h
+        ++i;
+        assert(i < 100);
+      }
+    }
+    // Determine whether a relevant Grow initiated while walking the chain
+    if (!grow_in_progress) {
+      uint32_t next = array_[home].next.load(std::memory_order_acquire);
+      if (UNLIKELY((next & HandleImpl::kNextInsertableFlag) == 0)) {
+        grow_in_progress = true;
+      }
     }
   }
+
+  if (grow_in_progress) {
+    // Also search next new home (reduce the min shift by 1)
+    assert((threshold & 255) > 0);
+    home = GetHomeIndex(threshold - 1, hashed_key[0]);
+    ++home_changes;
+    if (home_changes > 50) {
+      std::terminate();
+    }
+    goto home_changed;
+  }
 }
+  // Not found
+  return nullptr;
+}
+
+// IAMHERE
 
 uint32_t FastClockTable::FinishErasure(HandleImpl* h,
                                        HandleImpl* possible_prev) {

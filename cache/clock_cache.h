@@ -611,10 +611,9 @@ class FastClockTable : public BaseClockTable {
     std::atomic<uint32_t> next{};
 
     // TODO: doc & can we eliminate?
-    static constexpr uint32_t kNextFollowFlag = uint32_t{1} << 31;
-    static constexpr uint32_t kNextInsertableFlag = uint32_t{1} << 30;
-    static constexpr uint32_t kNextNoFlagsMask =
-        ~(kNextFollowFlag | kNextInsertableFlag);
+    static constexpr uint32_t kNextInsertableFlag = uint32_t{1} << 31;
+    static constexpr uint32_t kNextNoFlagsMask = ~kNextInsertableFlag;
+    static constexpr uint32_t kNextNull = kNextNoFlagsMask;
   };  // struct HandleImpl
 
   struct Opts {
