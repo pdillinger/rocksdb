@@ -652,6 +652,55 @@ class FixedHyperClockTable : public BaseClockTable {
 // incrementally, using linear hashing, so uses an anonymous mmap so that
 // only the used portion of the memory region is mapped to physical memory
 // (part of RSS).
+//
+// This table implementation uses the same "low-level protocol" for managing
+// the contens of an entry slot as FixedHyperClockTable does, captured in the
+// ClockHandle struct. The provides most of the essential data safety, but
+// AutoHyperClockTable is another "high-level protocol" for organizing entries
+// into a hash table, with automatic resizing.
+//
+// This implementation is not fully wait-free but we can call it "essentially
+// wait-free," and here's why. First, like FixedHyperClockCache, there is no
+// locking nor other forms of waiting at the cache or shard level. Also like
+// FixedHCC there is essentially an entry-level read-write lock implemented
+// with atomics, but our relaxed atomicity/consistency guarantees (e.g.
+// duplicate inserts are possible) mean we do not need to wait for entry
+// locking. Lookups, non-erasing Releases, and non-evicting non-growing Inserts
+// are all fully wait-free. Of course, these waits are not dependent on any
+// external factors such as I/O.
+//
+// For operations that remove entries from a chain or grow the table by
+// splitting a chain, there is a chain-level locking mechanism that we call a
+// "rewrite" lock, and the only waits are for these locks. On average, each
+// chain lock is relevant to < 2 entries each. (The average would be less than
+// one entry each, but we do not lock when there's no entry to remove or
+// migrate.) And a given thread can only hold two such chain locks at a time,
+// more typically just one. So in that sense alone, the waiting that does exist
+// is very localized.
+//
+// If we look closer at the operations utilizing that locking mechanism, we
+// can see why it's "essentially wait-free."
+// * Grow operations to increase the size of the table: each operation splits
+// an existing chain into two, and chains for splitting are chosen in table
+// order. Grow operations are fully parallel except for the chain locking, but
+// for one Grow operation to wait on another, it has to be feeding into the
+// other, which means the table has doubled in size already from other Grow
+// operations without the original one finishing. So Grow operations are very
+// low latency (unlike LRUCache doubling the table size in one operation) and
+// very parallelizeable. (We use some tricks to break up dependencies in
+// updating metadata on the usable size of the table.) And obviously Grow
+// operations are very rare after the initial population of the table.
+// * Evict operations (part of many Inserts): clock updates and evictions
+// sweep through the structure in table order, so like Grow operations,
+// parallel Evict can only wait on each other if an Evict has lingered (slept)
+// long enough that the clock pointer has wrapped around the entire structure.
+// * Random erasures (Erase, Release with erase_if_last_ref, etc.): these
+// operations are rare and not really considered performance critical.
+// Currently they're mostly used for removing placeholder cache entries, e.g.
+// for memory tracking, though that could use standalone entries instead to
+// avoid potential contention in table operations. It's possible that future
+// enhancements could pro-actively remove cache entries from obsolete files,
+// but that's not yet implemented.
 class AutoHyperClockTable : public BaseClockTable {
  public:
   // Target size to be exactly a common cache line size (see static_assert in
@@ -863,7 +912,7 @@ class AutoHyperClockTable : public BaseClockTable {
   // Helper function for PurgeImpl while holding a ChainRewriteLock. See
   // implementation.
   template <class OpData>
-  void PurgeImplLocked(OpData* op_data, ChainRewriteLock& rewrite_lock);
+  void PurgeImplLocked(OpData* op_data, ChainRewriteLock& rewrite_lock, size_t home);
 
   // Update length_info_ as much as possible without waiting, given a known
   // usable (ready for inserts and lookups) grow_home. (Previous grow_homes

@@ -98,21 +98,22 @@ inline bool ClockUpdate(ClockHandle& h, bool* purgeable = nullptr) {
   if (purgeable) {
     assert(*purgeable == false);
   }
-  uint64_t meta = h.meta.load(std::memory_order_relaxed);
+  uint64_t meta = h.meta.load(std::memory_order_acquire);
 
+  if (((meta >> ClockHandle::kStateShift) & ClockHandle::kStateShareableBit) == 0) {
+    // Only clock update Shareable entries
+    if (purgeable) {
+      *purgeable = true;
+    }
+    assert((meta >> ClockHandle::kStateShift) & ClockHandle::kStateOccupiedBit);
+    return false;
+  }
   uint64_t acquire_count =
       (meta >> ClockHandle::kAcquireCounterShift) & ClockHandle::kCounterMask;
   uint64_t release_count =
       (meta >> ClockHandle::kReleaseCounterShift) & ClockHandle::kCounterMask;
   if (acquire_count != release_count) {
     // Only clock update entries with no outstanding refs
-    return false;
-  }
-  if (!((meta >> ClockHandle::kStateShift) & ClockHandle::kStateShareableBit)) {
-    // Only clock update Shareable entries
-    if (purgeable) {
-      *purgeable = true;
-    }
     return false;
   }
   if ((meta >> ClockHandle::kStateShift == ClockHandle::kStateVisible) &&
@@ -136,7 +137,7 @@ inline bool ClockUpdate(ClockHandle& h, bool* purgeable = nullptr) {
                                      (uint64_t{ClockHandle::kStateConstruction}
                                       << ClockHandle::kStateShift) |
                                          (meta & ClockHandle::kHitBitMask),
-                                     std::memory_order_acquire)) {
+                                     std::memory_order_acq_rel)) {
     // Took ownership.
     return true;
   } else {
@@ -1865,6 +1866,7 @@ class AutoHyperClockTable::ChainRewriteLock {
 
   uint64_t GetNewHead() const { return new_head_; }
 
+  // Only safe if we know that the value hasn't changed from other threads
   void SimpleUpdate(uint64_t next_with_shift) {
     assert(head_ptr_->load(std::memory_order_acquire) == new_head_);
     new_head_ = next_with_shift | HandleImpl::kHeadLocked;
@@ -1907,7 +1909,7 @@ class AutoHyperClockTable::ChainRewriteLock {
     for (;;) {
       // Acquire removal lock on the chain
       uint64_t old_head = head_ptr_->fetch_or(HandleImpl::kHeadLocked,
-                                              std::memory_order_acquire);
+                                              std::memory_order_acq_rel);
       if ((old_head & HandleImpl::kNextEndFlags) != HandleImpl::kHeadLocked) {
         // Either acquired the lock or lock not needed (end)
         assert((old_head & HandleImpl::kNextEndFlags) == 0 ||
@@ -2546,6 +2548,10 @@ void AutoHyperClockTable::SplitForGrow(size_t grow_home, size_t old_home,
             ? MakeNextWithShift(one_chain_frontier, new_shift)
             : MakeNextWithShiftEnd(grow_home, new_shift));
 
+    // Make sure length_info_ hasn't been updated too early, as we're about
+    // to make the change that makes it safe to update (e.g. in DoInsert())
+    assert(LengthInfoToUsedLength(length_info_.load(std::memory_order_acquire)) <= grow_home);
+
     // Try to set zero's head.
     if (zero_head_lock.CasUpdate(
             zero_chain_frontier != SIZE_MAX
@@ -2555,6 +2561,7 @@ void AutoHyperClockTable::SplitForGrow(size_t grow_home, size_t old_home,
       // Both heads successfully updated to new shift
       break;
     } else {
+      // fprintf(stderr, "[%d] Grow retry\n", (int)Env::Default()->GetThreadID());
       // Concurrent insertion. This should not happen too many times.
       CHECK_TOO_MANY_ITERATIONS(i);
       // The easiest solution is to restart.
@@ -2589,10 +2596,12 @@ void AutoHyperClockTable::SplitForGrow(size_t grow_home, size_t old_home,
   }
 
   if (zero_chain_frontier == SIZE_MAX) {
+    // fprintf(stderr, "[%d] Grow simple case: %d\n", (int)Env::Default()->GetThreadID(), chain_frontier_first);
     // Already finished migrating
     assert(one_chain_frontier == SIZE_MAX);
     assert(cur == SIZE_MAX);
   } else {
+    // fprintf(stderr, "[%d] Grow complex case: %d\n", (int)Env::Default()->GetThreadID(), chain_frontier_first);
     // Still need to migrate between two target chains
     for (int i = 0;; ++i) {
       CHECK_TOO_MANY_ITERATIONS(i);
@@ -2662,28 +2671,31 @@ void AutoHyperClockTable::SplitForGrow(size_t grow_home, size_t old_home,
   }
 }
 
-using PurgeUntilOpData = AutoHyperClockTable::HandleImpl;
 using PurgeAllOpData = void;
 using EvictOpData = autovector<AutoHyperClockTable::HandleImpl*>;
 
 template <class OpData>
 void AutoHyperClockTable::PurgeImplLocked(OpData* op_data,
-                                          ChainRewriteLock& rewrite_lock) {
-  constexpr bool kIsPurgeUntil = std::is_same_v<OpData, PurgeUntilOpData>;
+                                          ChainRewriteLock& rewrite_lock,
+                                          size_t home) {
   constexpr bool kIsPurgeAll = std::is_same_v<OpData, PurgeAllOpData>;
   constexpr bool kIsEvict = std::is_same_v<OpData, EvictOpData>;
 
   // Exactly one op specified
-  static_assert(kIsPurgeUntil + kIsPurgeAll + kIsEvict == 1);
+  static_assert(kIsPurgeAll + kIsEvict == 1);
 
   HandleImpl* const arr = array_.Get();
 
   uint64_t next_with_shift = rewrite_lock.GetNewHead();
   assert(!HandleImpl::IsEnd(next_with_shift));
   int home_shift = GetShiftFromNextWithShift(next_with_shift);
+  (void)home;
   (void)home_shift;
   HandleImpl* h = &arr[GetNextFromNextWithShift(next_with_shift)];
   HandleImpl* prev_to_keep = nullptr;
+#ifndef NDEBUG
+  uint64_t prev_to_keep_next_with_shift = 0;
+#endif
   // Whether there are entries between h and prev_to_keep that should be
   // purged from the chain.
   bool pending_purge = false;
@@ -2693,63 +2705,68 @@ void AutoHyperClockTable::PurgeImplLocked(OpData* op_data,
 
     bool purgeable = false;
     if (h) {
+      assert(home == BottomNBits(h->hashed_key[1], home_shift));
       if constexpr (kIsEvict) {
         // Clock update and/or check for purgeable (under (de)construction)
         if (ClockUpdate(*h, &purgeable)) {
           // Remember for finishing eviction
           op_data->push_back(h);
+        // fprintf(stderr, "[%d] Evicting %d from home %d, prev_to_keep %d\n", (int)Env::Default()->GetThreadID(), (int)(h - arr), (int)home, prev_to_keep ? (int)(prev_to_keep - arr) : -1);
           // Entries for eviction become purgeable
           purgeable = true;
-        }
-      } else if constexpr (kIsPurgeUntil) {
-        // In rare cases, the purge-until entry might have become eligible
-        // for purge, but for simplicity we leave it on the chain.
-        if (h == op_data) {
-          purgeable = false;
+          assert((h->meta.load(std::memory_order_acquire) >> ClockHandle::kStateShift) & ClockHandle::kStateOccupiedBit);
+
         } else {
-          purgeable = ((h->meta.load(std::memory_order_relaxed) >>
-                        ClockHandle::kStateShift) &
-                       ClockHandle::kStateShareableBit) == 0;
+        // fprintf(stderr, "[%d] Purgeable=%d %d from home %d, prev_to_keep %d\n", (int)Env::Default()->GetThreadID(), (int)purgeable, (int)(h - arr), (int)home, prev_to_keep ? (int)(prev_to_keep - arr) : -1);
         }
       } else {
         (void)op_data;
-        purgeable = ((h->meta.load(std::memory_order_relaxed) >>
+        purgeable = ((h->meta.load(std::memory_order_acquire) >>
                       ClockHandle::kStateShift) &
                      ClockHandle::kStateShareableBit) == 0;
       }
     }
 
     if (purgeable) {
-      assert((h->meta.load(std::memory_order_relaxed) >>
+      assert((h->meta.load(std::memory_order_acquire) >>
               ClockHandle::kStateShift) &
              ClockHandle::kStateOccupiedBit);
       pending_purge = true;
     } else if (pending_purge) {
       if (prev_to_keep) {
         // Update chain next to skip purgeable entries
+        assert(prev_to_keep->chain_next_with_shift.load(std::memory_order_acquire) == prev_to_keep_next_with_shift);
         prev_to_keep->chain_next_with_shift.store(next_with_shift,
                                                   std::memory_order_release);
+        // fprintf(stderr, "[%d] Updated %d -> %d(%d)\n", (int)Env::Default()->GetThreadID(), (int)(prev_to_keep - arr), (int)(next_with_shift >> 8), (int)(next_with_shift & 255));
       } else if (rewrite_lock.CasUpdate(next_with_shift, yield_count_)) {
         // Managed to update head without any parallel insertions
+        // fprintf(stderr, "[%d] Updated head %d -> %d(%d)\n", (int)Env::Default()->GetThreadID(), (int)(home), (int)(next_with_shift >> 8), (int)(next_with_shift & 255));
       } else {
         // Parallel insertion must have interfered. Need to do a purge
-        // from updated head to here.
+        // from updated head to here. Since we have no prev_to_keep, there's
+        // no risk of duplicate clock updates to entries. Any entries already
+        // updated must have been evicted (purgeable) and it's OK to pick up
+        // new entries inserted to clock update.
+        // Can simply restart (GetNewHead() updated from CAS failure)
+        next_with_shift = rewrite_lock.GetNewHead();
+        assert(!HandleImpl::IsEnd(next_with_shift));
+        h = &arr[GetNextFromNextWithShift(next_with_shift)];
+        pending_purge = false;
+        assert(prev_to_keep == nullptr);
         if constexpr (kIsEvict) {
-          // Avoid duplicate clock updates to our work so far
-          PurgeUntilOpData* until = h;
-          PurgeImplLocked(until, rewrite_lock);
+          // fprintf(stderr, "[%d] Evict retry -> %d\n", (int)Env::Default()->GetThreadID(), (int)(h - arr));
         } else {
-          // Can simply restart
-          next_with_shift = rewrite_lock.GetNewHead();
-          assert(!HandleImpl::IsEnd(next_with_shift));
-          h = &arr[GetNextFromNextWithShift(next_with_shift)];
-          pending_purge = false;
-          continue;
+          // fprintf(stderr, "[%d] Purge retry\n", (int)Env::Default()->GetThreadID());
         }
+        continue;
       }
       pending_purge = false;
       prev_to_keep = h;
     } else {
+      if (h) {
+      // fprintf(stderr, "[%d] Keeping %d\n", (int)Env::Default()->GetThreadID(), (int)(h - arr));
+      }
       prev_to_keep = h;
     }
 
@@ -2757,15 +2774,14 @@ void AutoHyperClockTable::PurgeImplLocked(OpData* op_data,
       // Reached end of the chain
       return;
     }
-    if constexpr (kIsPurgeUntil) {
-      if (h == op_data) {
-        // Reached the purge-until entry
-        return;
-      }
-    }
 
     // Read chain pointer
-    next_with_shift = h->chain_next_with_shift;
+    next_with_shift = h->chain_next_with_shift.load(std::memory_order_acquire);
+#ifndef NDEBUG
+    if (prev_to_keep == h) {
+      prev_to_keep_next_with_shift = next_with_shift;
+    }
+#endif
 
     assert(GetShiftFromNextWithShift(next_with_shift) == home_shift);
 
@@ -2795,6 +2811,11 @@ using PurgeOpData = const UniqueId64x2;
 // lock while doing potentially expensive callback and allocator free.)
 template <class OpData>
 void AutoHyperClockTable::PurgeImpl(OpData* op_data, size_t home) {
+  //static std::mutex m[64];
+  //std::lock_guard<std::mutex> guard(m[home]);
+  //static std::mutex m;
+  //std::lock_guard<std::mutex> guard(m);
+
   // FIXME: doc
   // These ops are wait-free with low occurrence of retries, back-tracking,
   // and fallback based on these strategies:
@@ -2846,8 +2867,7 @@ void AutoHyperClockTable::PurgeImpl(OpData* op_data, size_t home) {
 
     if constexpr (kIsPurge) {
       if (shift > home_shift) {
-        // At head or coming from an entry on our chain where we're holding
-        // a read reference. Thus, we know the newer shift applies to us.
+        // At head. Thus, we know the newer shift applies to us.
         // Newer shift might not yet be reflected in length_info_ (an atomicity
         // gap in Grow), so operate as if it is. Note that other insertions
         // could happen using this shift before length_info_ is updated, and
@@ -2873,9 +2893,9 @@ void AutoHyperClockTable::PurgeImpl(OpData* op_data, size_t home) {
 
   if (!rewrite_lock.IsEnd()) {
     if constexpr (kIsPurge) {
-      PurgeImplLocked((PurgeAllOpData*)0, rewrite_lock);
+      PurgeImplLocked((PurgeAllOpData*)0, rewrite_lock, home);
     } else {
-      PurgeImplLocked(op_data, rewrite_lock);
+      PurgeImplLocked(op_data, rewrite_lock, home);
     }
   }
 }
@@ -2906,6 +2926,7 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
   if (!TryInsert(proto, arr[idx], initial_countdown, take_ref,
                  &already_matches)) {
     if (already_matches) {
+        // fprintf(stderr, "[%d] AlreadyMatch %d at home %d\n", (int)Env::Default()->GetThreadID(), (int)idx, (int)home);
       return nullptr;
     }
 
@@ -2951,6 +2972,7 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
         break;
       }
       if (already_matches) {
+        // fprintf(stderr, "[%d] AlreadyMatchB %d at home %d\n", (int)Env::Default()->GetThreadID(), (int)idx, (int)home);
         return nullptr;
       }
       ++idx;
@@ -2973,6 +2995,7 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
         if (cycles > 2) {
           // Fall back on standalone insert in case something goes awry to
           // cause this
+        // fprintf(stderr, "[%d] Give up insert at home %d\n", (int)Env::Default()->GetThreadID(), (int)home);
           return nullptr;
         }
       }
@@ -3026,14 +3049,15 @@ AutoHyperClockTable::HandleImpl* AutoHyperClockTable::DoInsert(
       chain_next_with_shift &= ~HandleImpl::kHeadLocked;
     }
 
-    // NOTE: could filter out the locked state but don't need to
     arr[idx].chain_next_with_shift.store(chain_next_with_shift,
                                          std::memory_order_release);
     if (arr[home].head_next_with_shift.compare_exchange_weak(
             next_with_shift, head_next_with_shift, std::memory_order_acq_rel)) {
+      // fprintf(stderr, "[%d] Inserted %d at home %d\n", (int)Env::Default()->GetThreadID(), (int)idx, (int)home);
       // Success
       return arr + idx;
     }
+    // fprintf(stderr, "[%d] Insert retry\n", (int)Env::Default()->GetThreadID());
   }
 }
 
@@ -3434,6 +3458,7 @@ void AutoHyperClockTable::Evict(size_t requested_charge, InsertState& state,
 
     for (HandleImpl* h : to_finish_eviction) {
       TrackAndReleaseEvictedEntry(h, data);
+      // fprintf(stderr, "[%d] Finished evicting %d\n", (int)Env::Default()->GetThreadID(), (int)(h - &array_[0]));
     }
     to_finish_eviction.clear();
 
