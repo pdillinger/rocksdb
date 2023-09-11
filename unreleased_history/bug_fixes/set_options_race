@@ -1,0 +1,1 @@
+Fixed a rare and probably not dangerous race condition in SetOptions for block_based_table_factory options.

@@ -188,6 +188,12 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   UpdateColumnFamilyOptions(mutable_cf_options, &cf_opts);
   // TODO(yhchiang): find some way to handle the following derived options
   // * max_file_size
+  if (cf_opts.table_factory->IsInstanceOf(
+          TableFactory::kBlockBasedTableName())) {
+    // Deep copy the factory and its options, because they are mutable
+    cf_opts.table_factory.reset(NewBlockBasedTableFactory(
+        *cf_opts.table_factory->GetOptions<BlockBasedTableOptions>()));
+  }
   return cf_opts;
 }
 
