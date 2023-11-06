@@ -19,6 +19,7 @@
 #include "port/stack_trace.h"
 #include "rocksdb/advanced_options.h"
 #include "rocksdb/convenience.h"
+#include "rocksdb/experimental.h"
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/perf_context.h"
 #include "rocksdb/statistics.h"
@@ -3562,6 +3563,210 @@ TEST_F(DBBloomFilterTest, WeirdPrefixExtractorWithFilter3) {
   }
 }
 
+TEST_F(DBBloomFilterTest, SstQueryFilter) {
+  using experimental::KeySegmentsExtractor;
+  using experimental::SstQueryFilterConfigs;
+  using KeyCategorySet = KeySegmentsExtractor::KeyCategorySet;
+
+  struct MySegmentExtractor : public KeySegmentsExtractor {
+    const char* const name;
+    uint32_t min_ver;
+    uint32_t max_ver;
+    MySegmentExtractor(const char* _name, uint32_t _min_ver, uint32_t _max_ver)
+        : name(_name), min_ver(_min_ver), max_ver(_max_ver) {}
+
+    const char* Name() const override { return name; }
+
+    Status Extract(const Slice& key_or_bound, KeyKind /*kind*/,
+                   uint32_t version, Result* result) const override {
+      if (version < min_ver || version > max_ver) {
+        return Status::InvalidArgument("unsupported version");
+      }
+      size_t len = key_or_bound.size();
+      if (len == 0) {
+        result->category = KeySegmentsExtractor::kReservedLowCategory;
+        return Status::OK();
+      }
+      if (static_cast<unsigned char>(key_or_bound[0]) <
+          static_cast<unsigned char>('0')) {
+        result->category = KeySegmentsExtractor::kReservedLowCategory;
+      }
+      if (static_cast<unsigned char>(key_or_bound[0]) >
+          static_cast<unsigned char>('z')) {
+        result->category = KeySegmentsExtractor::kReservedHighCategory;
+      }
+      for (uint32_t i = 0; i < len; ++i) {
+        if (key_or_bound[i] == '_' || i + 1 == key_or_bound.size()) {
+          result->segment_ends.push_back(i + 1);
+        }
+      }
+      return Status::OK();
+    }
+
+    std::pair<uint32_t, uint32_t> GetSupportedVersionRange() const override {
+      return {min_ver, max_ver};
+    }
+  };
+
+  auto configs = SstQueryFilterConfigs::MakeShared();
+  auto extractor1old = std::make_shared<MySegmentExtractor>("Ex1", 1, 2);
+  auto extractor1new = std::make_shared<MySegmentExtractor>("Ex1", 2, 3);
+  auto extractor2 = std::make_shared<MySegmentExtractor>("Ex2", 1, 3);
+  configs->SetExtractorAndVersion(extractor1old, 1);
+  // Filter on 2nd field with '_' as delimiter, only for default category
+  configs->AddMinMax(1, KeyCategorySet{KeySegmentsExtractor::kDefaultCategory});
+  // Also filter on 3rd field regardless of category
+  configs->AddMinMax(2);
+
+  Options options = CurrentOptions();
+  options.statistics = CreateDBStatistics();
+  options.table_properties_collector_factories.emplace_back(
+      configs->GetTblPropCollFactory());
+
+  DestroyAndReopen(options);
+
+  // For lower level file
+  ASSERT_OK(Put("   ", "val0"));
+  ASSERT_OK(Put("   _345_678", "val0"));
+  ASSERT_OK(Put("aaa", "val0"));
+  ASSERT_OK(Put("abc_123", "val1"));
+  ASSERT_OK(Put("abc_13", "val2"));
+  ASSERT_OK(Put("abc_156_987", "val3"));
+  ASSERT_OK(Put("xyz_145", "val4"));
+  ASSERT_OK(Put("xyz_167", "val5"));
+  ASSERT_OK(Put("xyz_178", "val6"));
+  ASSERT_OK(Put("zzz", "val0"));
+  ASSERT_OK(Put("~~~", "val0"));
+  ASSERT_OK(Put("~~~_456_789", "val0"));
+
+  ASSERT_OK(Flush());
+  MoveFilesToLevel(1);
+
+  configs->SetExtractorAndVersion(extractor1old, 2);
+
+  // For higher level file
+  ASSERT_OK(Put("   ", "val0"));
+  ASSERT_OK(Put("   _345_680", "val0"));
+  ASSERT_OK(Put("aaa", "val9"));
+  ASSERT_OK(Put("abc_234", "val1"));
+  ASSERT_OK(Put("abc_245_567", "val2"));
+  ASSERT_OK(Put("abc_25", "val3"));
+  ASSERT_OK(Put("xyz_180", "val4"));
+  ASSERT_OK(Put("xyz_191", "val4"));
+  ASSERT_OK(Put("xyz_260", "val4"));
+  ASSERT_OK(Put("zzz", "val9"));
+  ASSERT_OK(Put("~~~", "val0"));
+  ASSERT_OK(Put("~~~_456_790", "val0"));
+
+  ASSERT_OK(Flush());
+
+  using Keys = std::vector<std::string>;
+  auto RangeQueryKeys = [configs, db = db_](std::string lb, std::string ub) {
+    Slice lb_slice = lb;
+    Slice ub_slice = ub;
+
+    ReadOptions ro;
+    ro.iterate_lower_bound = &lb_slice;
+    ro.iterate_upper_bound = &ub_slice;
+    ro.table_filter = configs->GetTableFilterForRangeQuery(lb_slice, ub_slice);
+    auto it = db->NewIterator(ro);
+    Keys ret;
+    for (it->Seek(lb_slice); it->Valid(); it->Next()) {
+      ret.push_back(it->key().ToString());
+    }
+    EXPECT_OK(it->status());
+    delete it;
+    return ret;
+  };
+
+  // Control 1: range is not filterable, common prefix
+  EXPECT_EQ(RangeQueryKeys("abc_150", "abc_249"),
+            Keys({"abc_156_987", "abc_234", "abc_245_567"}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 2);
+
+  // Test 1: range is filterable to just lowest level, fully containing the
+  // segments in that category
+  EXPECT_EQ(RangeQueryKeys("abc_100", "abc_179"),
+            Keys({"abc_123", "abc_13", "abc_156_987"}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 1);
+
+  // Test 2: range is filterable to just lowest level, partial overlap
+  EXPECT_EQ(RangeQueryKeys("abc_1500_x_y", "abc_16QQ"), Keys({"abc_156_987"}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 1);
+
+  // Test 3: range is filterable to just highest level, fully containing the
+  // segments in that category but would be overlapping the range for the other
+  // file if the filter included all categories
+  EXPECT_EQ(RangeQueryKeys("abc_200", "abc_300"),
+            Keys({"abc_234", "abc_245_567", "abc_25"}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 1);
+
+  // Test 4: range is filterable to just highest level, partial overlap (etc.)
+  EXPECT_EQ(RangeQueryKeys("abc_200", "abc_249"),
+            Keys({"abc_234", "abc_245_567"}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 1);
+
+  // Test 5: range is filtered from both levels, because of category scope
+  EXPECT_EQ(RangeQueryKeys("abc_300", "abc_400"), Keys({}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 0);
+
+  // Control 2: range is not filtered because association between 1st and
+  // 2nd segment is not represented
+  EXPECT_EQ(RangeQueryKeys("abc_170", "abc_190"), Keys({}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 2);
+
+  // Control 3: range is not filtered because prefixes not represented
+  EXPECT_EQ(RangeQueryKeys("bcd_170", "bcd_190"), Keys({}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 2);
+
+  // Control 4: range is not filtered because different prefix, prefixes not
+  // represented
+  EXPECT_EQ(RangeQueryKeys("abc_500", "abd_501"), Keys({}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 2);
+
+  // TODO: exclusive upper bound tests
+
+  // ======= Testing 3rd segment (cross-category filter) =======
+  // Control 5: not filtered because of segment range overlap
+  EXPECT_EQ(RangeQueryKeys(" z__700", " z__750"), Keys({}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 2);
+
+  // Test 6: filtered on both levels
+  EXPECT_EQ(RangeQueryKeys(" z__100", " z__300"), Keys({}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 0);
+
+  // Control 6: finding something, with 2nd segment filter helping
+  EXPECT_EQ(RangeQueryKeys("abc_156_9", "abc_156_99"), Keys({"abc_156_987"}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 1);
+
+  EXPECT_EQ(RangeQueryKeys("abc_245_56", "abc_245_57"), Keys({"abc_245_567"}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 1);
+
+  // Test 6: filtered on both levels, for different segments
+  EXPECT_EQ(RangeQueryKeys("abc_245_900", "abc_245_999"), Keys({}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 0);
+
+  // ======= Testing extractor name and version matching =======
+  EXPECT_EQ(RangeQueryKeys("abc_23", "abc_24"), Keys({"abc_234"}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 1);
+
+  // This extractor does not support version 1 in the lower level file, so
+  // we can no longer filter there. But we can filter in higher level file.
+  configs->SetExtractorAndVersion(extractor1new, 2);
+
+  EXPECT_EQ(RangeQueryKeys("abc_23", "abc_24"), Keys({"abc_234"}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 2);
+
+  EXPECT_EQ(RangeQueryKeys("abc_120", "abc_125"), Keys({"abc_123"}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 1);
+
+  // But this extractor is completely incompatible, and the code can't
+  // reconstruct the old one to use. Not able to filter on either level.
+  configs->SetExtractorAndVersion(extractor2, 2);
+
+  EXPECT_EQ(RangeQueryKeys("abc_300", "abc_400"), Keys({}));
+  EXPECT_EQ(TestGetAndResetTickerCount(options, NON_LAST_LEVEL_SEEK_DATA), 2);
+}
 
 }  // namespace ROCKSDB_NAMESPACE
 
