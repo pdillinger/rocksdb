@@ -7,12 +7,15 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "db/db_impl/db_impl.h"
 #include "db/version_util.h"
 #include "logging/logging.h"
+#include "util/atomic.h"
 
 namespace ROCKSDB_NAMESPACE {
 namespace experimental {
@@ -151,17 +154,193 @@ Status UpdateManifestForFilesState(
 // EXPERIMENTAL new filtering features
 
 namespace {
-Slice GetSegmentsFromKey(size_t from_idx, size_t to_idx, const Slice& key,
-                         const KeySegmentsExtractor::Result& extracted) {
-  assert(from_idx <= to_idx);
-  size_t count = extracted.segment_ends.size();
-  if (count <= from_idx) {
-    return Slice();
+void GetFilterInput(FilterInput select, const Slice& key,
+                    const KeySegmentsExtractor::Result& extracted,
+                    Slice* out_input, Slice* out_leadup) {
+  struct FilterInputGetter {
+    explicit FilterInputGetter(const Slice& _key,
+                               const KeySegmentsExtractor::Result& _extracted)
+        : key(_key), extracted(_extracted) {}
+    const Slice& key;
+    const KeySegmentsExtractor::Result& extracted;
+
+    Slice operator()(SelectKeySegment select) {
+      size_t count = extracted.segment_ends.size();
+      if (count <= select.segment_index) {
+        return Slice();
+      }
+      assert(count > 0);
+      size_t start = select.segment_index > 0
+                         ? extracted.segment_ends[select.segment_index - 1]
+                         : 0;
+      size_t end =
+          extracted
+              .segment_ends[std::min(size_t{select.segment_index}, count - 1)];
+      return Slice(key.data() + start, end - start);
+    }
+
+    Slice operator()(SelectKeySegmentRange select) {
+      assert(select.from_segment_index <= select.to_segment_index);
+      size_t count = extracted.segment_ends.size();
+      if (count <= select.from_segment_index) {
+        return Slice();
+      }
+      assert(count > 0);
+      size_t start = select.from_segment_index > 0
+                         ? extracted.segment_ends[select.from_segment_index - 1]
+                         : 0;
+      size_t end = extracted.segment_ends[std::min(
+          size_t{select.to_segment_index}, count - 1)];
+      return Slice(key.data() + start, end - start);
+    }
+
+    Slice operator()(SelectWholeKey select) { return key; }
+
+    Slice operator()(SelectLegacyKeyPrefix select) {
+      // TODO
+      assert(false);
+      return Slice();
+    }
+
+    Slice operator()(SelectUserTimestamp select) {
+      // TODO
+      assert(false);
+      return Slice();
+    }
+
+    Slice operator()(SelectColumnName select) {
+      // TODO
+      assert(false);
+      return Slice();
+    }
+
+    Slice operator()(SelectValue select) {
+      // TODO
+      assert(false);
+      return Slice();
+    }
+  };
+
+  Slice input = std::visit(FilterInputGetter(key, extracted), select);
+  *out_input = input;
+  if (input.empty() || input.data() < key.data() ||
+      input.data() > key.data() + key.size()) {
+    *out_leadup = key;
+  } else {
+    *out_leadup = Slice(key.data(), input.data() - key.data());
   }
-  assert(count > 0);
-  size_t start = from_idx > 0 ? extracted.segment_ends[from_idx - 1] : 0;
-  size_t end = extracted.segment_ends[std::min(to_idx, count - 1)];
-  return Slice(key.data() + start, end - start);
+}
+
+const char* DeserializeFilterInput(const char* p, const char* limit,
+                                   FilterInput* out) {
+  if (p >= limit) {
+    return nullptr;
+  }
+  uint8_t b = static_cast<uint8_t>(*p++);
+  if (b & 0x80) {
+    // Reserved for future use to read more bytes
+    return nullptr;
+  }
+
+  switch (b >> 4) {
+    case 0:
+      // Various cases that don't have an argument
+      switch (b) {
+        case 0:
+          *out = SelectWholeKey{};
+          return p;
+        case 1:
+          *out = SelectLegacyKeyPrefix{};
+          return p;
+        case 2:
+          *out = SelectUserTimestamp{};
+          return p;
+        case 3:
+          *out = SelectColumnName{};
+          return p;
+        case 4:
+          *out = SelectValue{};
+          return p;
+        default:
+          // Reserved for future use
+          return nullptr;
+      }
+    case 1:
+      // First 16 cases of SelectKeySegment
+      *out = SelectKeySegment{BitwiseAnd(b, 0xf)};
+      return p;
+    case 2:
+      // First 16 cases of SelectKeySegmentRange
+      // that are not a single key segment
+      // 0: 0-1
+      // 1: 0-2
+      // 2: 1-2
+      // 3: 0-3
+      // 4: 1-3
+      // 5: 2-3
+      // 6: 0-4
+      // 7: 1-4
+      // 8: 2-4
+      // 9: 3-4
+      // 10: 0-5
+      // 11: 1-5
+      // 12: 2-5
+      // 13: 3-5
+      // 14: 4-5
+      // 15: 0-6
+      if (b < 6) {
+        if (b >= 3) {
+          *out = SelectKeySegmentRange{static_cast<uint8_t>(b - 3), 3};
+        } else if (b >= 1) {
+          *out = SelectKeySegmentRange{static_cast<uint8_t>(b - 1), 2};
+        } else {
+          *out = SelectKeySegmentRange{0, 1};
+        }
+      } else if (b < 10) {
+        *out = SelectKeySegmentRange{static_cast<uint8_t>(b - 6), 4};
+      } else if (b < 15) {
+        *out = SelectKeySegmentRange{static_cast<uint8_t>(b - 10), 5};
+      } else {
+        *out = SelectKeySegmentRange{0, 6};
+      }
+      return p;
+    default:
+      // Reserved for future use
+      return nullptr;
+  }
+}
+
+void SerializeFilterInput(std::string* out, const FilterInput& select) {
+  struct FilterInputSerializer {
+    std::string* out;
+    void operator()(SelectWholeKey) { out->push_back(0); }
+    void operator()(SelectLegacyKeyPrefix) { out->push_back(1); }
+    void operator()(SelectUserTimestamp) { out->push_back(2); }
+    void operator()(SelectColumnName) { out->push_back(3); }
+    void operator()(SelectValue) { out->push_back(4); }
+    void operator()(SelectKeySegment select) {
+      // TODO: expand supported cases
+      assert(select.segment_index < 16);
+      out->push_back(static_cast<char>((1 << 4) | select.segment_index));
+    }
+    void operator()(SelectKeySegmentRange select) {
+      auto from = select.from_segment_index;
+      auto to = select.to_segment_index;
+      // TODO: expand supported cases
+      assert(from < 6);
+      assert(to < 6 || (to == 6 && from == 0));
+      assert(from < to);
+      int start = (to - 1) * to / 2;
+      assert(start + from < 16);
+      out->push_back(static_cast<char>((2 << 4) | (start + from)));
+    }
+  };
+  std::visit(FilterInputSerializer{out}, select);
+}
+
+size_t GetFilterInputSerializedLength(const FilterInput& select) {
+  // TODO: expand supported cases
+  return 1;
 }
 
 uint64_t CategorySetToUint(const KeySegmentsExtractor::KeyCategorySet& s) {
@@ -206,12 +385,21 @@ class SstQueryFilterBuilder {
   virtual void Finish(std::string& append_to) = 0;
 };
 
-class SstQueryFilterConfigImpl {
+class SstQueryFilterConfigImpl : public SstQueryFilterConfig {
  public:
+  explicit SstQueryFilterConfigImpl(
+      const FilterInput& input,
+      const KeySegmentsExtractor::KeyCategorySet& categories)
+      : input_(input), categories_(categories) {}
+
   virtual ~SstQueryFilterConfigImpl() {}
 
   virtual std::unique_ptr<SstQueryFilterBuilder> NewBuilder(
       bool sanity_checks) const = 0;
+
+ protected:
+  FilterInput input_;
+  KeySegmentsExtractor::KeyCategorySet categories_;
 };
 
 class CategoryScopeFilterWrapperBuilder : public SstQueryFilterBuilder {
@@ -270,12 +458,7 @@ class CategoryScopeFilterWrapperBuilder : public SstQueryFilterBuilder {
 
 class BytewiseMinMaxSstQueryFilterConfig : public SstQueryFilterConfigImpl {
  public:
-  explicit BytewiseMinMaxSstQueryFilterConfig(
-      uint32_t segment_index_from, uint32_t segment_index_to,
-      KeySegmentsExtractor::KeyCategorySet categories)
-      : segment_index_from_(segment_index_from),
-        segment_index_to_(segment_index_to),
-        categories_(categories) {}
+  using SstQueryFilterConfigImpl::SstQueryFilterConfigImpl;
 
   std::unique_ptr<SstQueryFilterBuilder> NewBuilder(
       bool sanity_checks) const override {
@@ -299,10 +482,15 @@ class BytewiseMinMaxSstQueryFilterConfig : public SstQueryFilterConfigImpl {
       return true;
     }
     bool empty_included = (filter[1] & kEmptySeenFlag) != 0;
-    uint32_t segment_index_from = static_cast<uint32_t>(filter[2]);
-    uint32_t segment_index_to = static_cast<uint32_t>(filter[3]);
-    const char* p = filter.data() + 4;
+    const char* p = filter.data() + 2;
     const char* limit = filter.data() + filter.size();
+
+    FilterInput in;
+    p = DeserializeFilterInput(p, limit, &in);
+    if (p == nullptr) {
+      // Corrupt or unsupported
+      return true;
+    }
 
     uint32_t smallest_size;
     p = GetVarint32Ptr(p, limit, &smallest_size);
@@ -316,33 +504,29 @@ class BytewiseMinMaxSstQueryFilterConfig : public SstQueryFilterConfigImpl {
     size_t largest_size = static_cast<size_t>(limit - p);
     Slice largest = Slice(p, largest_size);
 
-    if (segment_index_from > 0) {
-      Slice lower_bound_prefix = GetSegmentsFromKey(
-          0, segment_index_from - 1, lower_bound_incl, lower_bound_extracted);
-      Slice upper_bound_prefix = GetSegmentsFromKey(
-          0, segment_index_from - 1, upper_bound_excl, upper_bound_extracted);
-      if (lower_bound_prefix.compare(upper_bound_prefix) != 0) {
-        // Unable to filter when bounds cross prefix leading up to segment
-        return true;
-      }
+    Slice lower_bound_input, lower_bound_leadup;
+    Slice upper_bound_input, upper_bound_leadup;
+    GetFilterInput(in, lower_bound_incl, lower_bound_extracted,
+                   &lower_bound_input, &lower_bound_leadup);
+    GetFilterInput(in, upper_bound_excl, upper_bound_extracted,
+                   &upper_bound_input, &upper_bound_leadup);
+
+    if (lower_bound_leadup.compare(upper_bound_leadup) != 0) {
+      // Unable to filter range when bounds have different lead-up to key
+      // segment
+      return true;
     }
-    Slice lower_bound_segment =
-        GetSegmentsFromKey(segment_index_from, segment_index_to,
-                           lower_bound_incl, lower_bound_extracted);
-    if (empty_included && lower_bound_segment.empty()) {
+
+    if (empty_included && lower_bound_input.empty()) {
       // May match on 0-length segment
       return true;
     }
-    Slice upper_bound_segment =
-        GetSegmentsFromKey(segment_index_from, segment_index_to,
-                           upper_bound_excl, upper_bound_extracted);
-
     // TODO: potentially fix upper bound to actually be exclusive
 
     // May match if both the upper bound and lower bound indicate there could
     // be overlap
-    return upper_bound_segment.compare(smallest) >= 0 &&
-           lower_bound_segment.compare(largest) <= 0;
+    return upper_bound_input.compare(smallest) >= 0 &&
+           lower_bound_input.compare(largest) <= 0;
   }
 
  protected:
@@ -354,58 +538,51 @@ class BytewiseMinMaxSstQueryFilterConfig : public SstQueryFilterConfigImpl {
     void Add(const Slice& key, const KeySegmentsExtractor::Result& extracted,
              const Slice* prev_key,
              const KeySegmentsExtractor::Result* prev_extracted) override {
-      Slice segment = GetSegmentsFromKey(
-          parent.segment_index_from_, parent.segment_index_to_, key, extracted);
+      Slice input, leadup;
+      GetFilterInput(parent.input_, key, extracted, &input, &leadup);
 
       if (sanity_checks && prev_key && prev_extracted) {
         // Opportunistic checking of segment ordering invariant
-        int compare = 0;
-        if (parent.segment_index_from_ > 0) {
-          Slice prev_prefix = GetSegmentsFromKey(
-              0, parent.segment_index_from_ - 1, *prev_key, *prev_extracted);
-          Slice prefix = GetSegmentsFromKey(0, parent.segment_index_from_ - 1,
-                                            key, extracted);
-          compare = prev_prefix.compare(prefix);
-          if (compare > 0) {
-            status = Status::Corruption(
-                "Ordering invariant violated from 0x" +
-                prev_key->ToString(/*hex=*/true) + " with prefix 0x" +
-                prev_prefix.ToString(/*hex=*/true) + " to 0x" +
-                key.ToString(/*hex=*/true) + " with prefix 0x" +
-                prefix.ToString(/*hex=*/true));
-            return;
-          }
-        }
-        if (compare == 0) {
+        Slice prev_input, prev_leadup;
+        GetFilterInput(parent.input_, *prev_key, *prev_extracted, &prev_input,
+                       &prev_leadup);
+
+        int compare = prev_leadup.compare(leadup);
+        if (compare > 0) {
+          status = Status::Corruption(
+              "Ordering invariant violated from 0x" +
+              prev_key->ToString(/*hex=*/true) + " with prefix 0x" +
+              prev_leadup.ToString(/*hex=*/true) + " to 0x" +
+              key.ToString(/*hex=*/true) + " with prefix 0x" +
+              leadup.ToString(/*hex=*/true));
+          return;
+        } else if (compare == 0) {
           // On the same prefix leading up to the segment, the segments must
           // not be out of order.
-          Slice prev_segment = GetSegmentsFromKey(parent.segment_index_from_,
-                                                  parent.segment_index_to_,
-                                                  *prev_key, *prev_extracted);
-          compare = prev_segment.compare(segment);
+          compare = prev_input.compare(input);
           if (compare > 0) {
             status = Status::Corruption(
                 "Ordering invariant violated from 0x" +
                 prev_key->ToString(/*hex=*/true) + " with segment 0x" +
-                prev_segment.ToString(/*hex=*/true) + " to 0x" +
+                prev_input.ToString(/*hex=*/true) + " to 0x" +
                 key.ToString(/*hex=*/true) + " with segment 0x" +
-                segment.ToString(/*hex=*/true));
+                input.ToString(/*hex=*/true));
             return;
           }
         }
       }
 
-      // Now actually update state for the key segments
+      // Now actually update state for the filter inputs
       // TODO: shorten largest and smallest if appropriate
-      if (segment.empty()) {
+      if (input.empty()) {
         empty_seen = true;
       } else if (largest.empty()) {
-        // First step for non-empty segment
-        smallest = largest = segment.ToString();
-      } else if (segment.compare(largest) > 0) {
-        largest = segment.ToString();
-      } else if (segment.compare(smallest) < 0) {
-        smallest = segment.ToString();
+        // Step for first non-empty input
+        smallest = largest = input.ToString();
+      } else if (input.compare(largest) > 0) {
+        largest = input.ToString();
+      } else if (input.compare(smallest) < 0) {
+        smallest = input.ToString();
       }
     }
 
@@ -417,8 +594,8 @@ class BytewiseMinMaxSstQueryFilterConfig : public SstQueryFilterConfigImpl {
         // FIXME: needs unit test
         return 0;
       }
-      return 4 + VarintLength(smallest.size()) + smallest.size() +
-             largest.size();
+      return 2 + GetFilterInputSerializedLength(parent.input_) +
+             VarintLength(smallest.size()) + smallest.size() + largest.size();
     }
 
     void Finish(std::string& append_to) override {
@@ -434,9 +611,7 @@ class BytewiseMinMaxSstQueryFilterConfig : public SstQueryFilterConfigImpl {
 
       append_to.push_back(empty_seen ? kEmptySeenFlag : 0);
 
-      // FIXME: check bounds
-      append_to.push_back(static_cast<char>(parent.segment_index_from_));
-      append_to.push_back(static_cast<char>(parent.segment_index_to_));
+      SerializeFilterInput(&append_to, parent.input_);
 
       PutVarint32(&append_to, static_cast<uint32_t>(smallest.size()));
       append_to.append(smallest);
@@ -458,51 +633,71 @@ class BytewiseMinMaxSstQueryFilterConfig : public SstQueryFilterConfigImpl {
   };
 
  private:
-  uint32_t segment_index_from_;
-  uint32_t segment_index_to_;
-  KeySegmentsExtractor::KeyCategorySet categories_;
-
   static constexpr char kEmptySeenFlag = 0x1;
 };
 
-class SstQueryFilterConfigsImpl
-    : public SstQueryFilterConfigs,
-      public std::enable_shared_from_this<SstQueryFilterConfigsImpl> {
+const SstQueryFilterConfigs kEmptySstQueryFilterConfigs{};
+
+class SstQueryFilterConfigsManagerImpl : public SstQueryFilterConfigsManager {
  public:
-  Self& SetExtractorAndVersion(std::shared_ptr<KeySegmentsExtractor> extractor,
-                               uint32_t version) override {
-    extractor_ = std::move(extractor);
-    version_ = version;
-    return *this;
-  }
+  using ConfigVersionMap = std::map<FilteringVersion, SstQueryFilterConfigs>;
 
-  Self& SetSanityChecks(bool enabled) override {
-    sanity_checks_ = enabled;
-    return *this;
-  }
+  Status Populate(const Data& data) {
+    if (data.empty()) {
+      return Status::OK();
+    }
+    // Populate only once
+    assert(min_ver_ == 0 && max_ver_ == 0);
+    min_ver_ = max_ver_ = data.begin()->first;
 
-  Self& AddMinMax(uint32_t from_segment_index, uint32_t to_segment_index,
-                  KeySegmentsExtractor::KeyCategorySet categories) override {
-    configs_.push_back(std::make_shared<BytewiseMinMaxSstQueryFilterConfig>(
-        from_segment_index, to_segment_index, categories));
-    return *this;
-  }
-  Self& AddApproximateSet(
-      uint32_t from_segment_index, uint32_t to_segment_index,
-      KeySegmentsExtractor::KeyCategorySet categories) override {
-    // TODO
-    (void)from_segment_index;
-    (void)to_segment_index;
-    (void)categories;
-    return *this;
+    FilteringVersion prev_ver = 0;
+    for (const auto& ver_info : data) {
+      if (ver_info.first == 0) {
+        return Status::InvalidArgument(
+            "Filtering version 0 is reserved for empty configuration and may "
+            "not be overridden");
+      }
+      if (ver_info.first <= prev_ver) {
+        return Status::InvalidArgument(
+            "Filtering versions must increase without repeating: " +
+            std::to_string(prev_ver) + " -> " + std::to_string(ver_info.first));
+      }
+      min_ver_ = std::min(min_ver_, ver_info.first);
+      max_ver_ = std::max(max_ver_, ver_info.first);
+      UnorderedSet<std::string> names_seen_this_ver;
+      for (const auto& config : ver_info.second) {
+        if (!names_seen_this_ver.insert(config.first).second) {
+          return Status::InvalidArgument(
+              "Duplicate name in filtering version " +
+              std::to_string(ver_info.first) + ": " + config.first);
+        }
+        auto& ver_map = name_map_[config.first];
+        ver_map[ver_info.first] = config.second;
+        if (config.second.extractor) {
+          extractor_map_[config.second.extractor->Name()] =
+              config.second.extractor;
+        }
+      }
+      prev_ver = ver_info.first;
+    }
+    return Status::OK();
   }
 
   struct MyCollector : public TablePropertiesCollector {
-    explicit MyCollector(
-        std::shared_ptr<const SstQueryFilterConfigsImpl> _parent)
-        : parent(std::move(_parent)) {
-      for (const auto& c : parent->configs_) {
-        builders.push_back(c->NewBuilder(parent->sanity_checks_));
+    // Keeps a reference to `configs` which should be kept alive by
+    // SstQueryFilterConfigsManagerImpl, which should be kept alive by
+    // any factories
+    // TODO: sanity_checks option
+    explicit MyCollector(const SstQueryFilterConfigs& configs,
+                         const SstQueryFilterConfigsManagerImpl& _parent)
+        : parent(_parent),
+          extractor(configs.extractor.get()),
+          extractor_version(configs.extractor_version),
+          sanity_checks(true) {
+      for (const auto& c : configs.filters) {
+        builders.push_back(
+            static_cast<SstQueryFilterConfigImpl&>(*c).NewBuilder(
+                sanity_checks));
       }
     }
 
@@ -510,15 +705,14 @@ class SstQueryFilterConfigsImpl
                       EntryType /*type*/, SequenceNumber /*seq*/,
                       uint64_t /*file_size*/) override {
       KeySegmentsExtractor::Result extracted;
-      if (parent->extractor_) {
-        Status s =
-            parent->extractor_->Extract(key, KeySegmentsExtractor::kFullUserKey,
-                                        parent->version_, &extracted);
+      if (extractor) {
+        Status s = extractor->Extract(key, KeySegmentsExtractor::kFullUserKey,
+                                      extractor_version, &extracted);
         if (!s.ok()) {
           return s;
         }
         bool new_category = categories_seen.Add(extracted.category);
-        if (parent->sanity_checks_) {
+        if (sanity_checks) {
           // Opportunistic checking of category ordering invariant
           if (!first_key) {
             if (prev_extracted.category != extracted.category &&
@@ -576,13 +770,13 @@ class SstQueryFilterConfigsImpl
       // Need to determine size of
       // kExtrAndVerAndCatFilterWrapper if used
       size_t name_len = 0;
-      if (parent->extractor_) {
-        name_len = strlen(parent->extractor_->Name());
+      if (extractor) {
+        name_len = strlen(extractor->Name());
         // identifier byte
         total_size += 1;
         // fields of the wrapper
         total_size += VarintLength(name_len) + name_len +
-                      VarintLength(parent->version_) +
+                      VarintLength(extractor_version) +
                       VarintLength(CategorySetToUint(categories_seen));
         // outer layer will have just 1 filter in its count (added here)
         // and this filter wrapper will have filters_to_finish.size()
@@ -595,7 +789,7 @@ class SstQueryFilterConfigsImpl
 
       filters.push_back(kSchemaVersion);
 
-      if (parent->extractor_) {
+      if (extractor) {
         // Wrap everything in a kExtrAndVerAndCatFilterWrapper
         // TODO in future: put whole key filters outside of this wrapper.
         // Also TODO in future: order the filters starting with broadest
@@ -607,8 +801,8 @@ class SstQueryFilterConfigsImpl
         // The filter(s) wrapper itself
         filters.push_back(kExtrAndVerAndCatFilterWrapper);
         PutVarint64(&filters, name_len);
-        filters.append(parent->extractor_->Name(), name_len);
-        PutVarint64(&filters, parent->version_);
+        filters.append(extractor->Name(), name_len);
+        PutVarint64(&filters, extractor_version);
         PutVarint64(&filters, CategorySetToUint(categories_seen));
       }
 
@@ -628,8 +822,7 @@ class SstQueryFilterConfigsImpl
             "Internal inconsistency building SST query filters");
       }
 
-      (*properties)[SstQueryFilterConfigsImpl::kTablePropertyName] =
-          std::move(filters);
+      (*properties)[kTablePropertyName] = std::move(filters);
       return Status::OK();
     }
     UserCollectedProperties GetReadableProperties() const override {
@@ -641,7 +834,10 @@ class SstQueryFilterConfigsImpl
       return "SstQueryFilterConfigsImpl::MyCollector";
     }
 
-    std::shared_ptr<const SstQueryFilterConfigsImpl> parent;
+    const SstQueryFilterConfigsManagerImpl& parent;
+    const KeySegmentsExtractor* const extractor;
+    const uint32_t extractor_version;
+    const bool sanity_checks;
     std::vector<std::shared_ptr<SstQueryFilterBuilder>> builders;
     bool first_key = true;
     std::string prev_key;
@@ -652,7 +848,10 @@ class SstQueryFilterConfigsImpl
   struct RangeQueryFilterReader {
     Slice lower_bound_incl;
     Slice upper_bound_excl;
-    std::shared_ptr<KeySegmentsExtractor> extractor;
+    const KeySegmentsExtractor* extractor;
+    const UnorderedMap<std::string,
+                       std::shared_ptr<const KeySegmentsExtractor>>&
+        extractor_map;
 
     struct State {
       KeySegmentsExtractor::Result lb_extracted;
@@ -711,11 +910,20 @@ class SstQueryFilterConfigsImpl
       }
       Slice name(p, name_len);
       p += name_len;
-      if (!extractor || name != Slice(extractor->Name())) {
-        // Extractor mismatch
-        // TODO future: try to get the extractor from the ObjectRegistry
-        return true;
+      const KeySegmentsExtractor* ex = nullptr;
+      if (extractor && name == Slice(extractor->Name())) {
+        ex = extractor;
+      } else {
+        auto it = extractor_map.find(name.ToString());
+        if (it != extractor_map.end()) {
+          ex = it->second.get();
+        } else {
+          // Extractor mismatch / not found
+          // TODO future: try to get the extractor from the ObjectRegistry
+          return true;
+        }
       }
+
       // TODO future: cache extraction with default version
       uint32_t version;
       p = GetVarint32Ptr(p, limit, &version);
@@ -725,19 +933,19 @@ class SstQueryFilterConfigsImpl
       }
 
       // Ready to run extractor
-      assert(extractor);
+      assert(ex);
       State state;
-      Status s = extractor->Extract(lower_bound_incl,
-                                    KeySegmentsExtractor::kInclusiveLowerBound,
-                                    version, &state.lb_extracted);
+      Status s = ex->Extract(lower_bound_incl,
+                             KeySegmentsExtractor::kInclusiveLowerBound,
+                             version, &state.lb_extracted);
       if (!s.ok()) {
         // TODO? Report problem
         // No filtering
         return true;
       }
-      s = extractor->Extract(upper_bound_excl,
-                             KeySegmentsExtractor::kExclusiveUpperBound,
-                             version, &state.ub_extracted);
+      s = ex->Extract(upper_bound_excl,
+                      KeySegmentsExtractor::kExclusiveUpperBound, version,
+                      &state.ub_extracted);
       if (!s.ok()) {
         // TODO? Report problem
         // No filtering
@@ -833,45 +1041,95 @@ class SstQueryFilterConfigsImpl
     }
   };
 
-  struct MyFactory : public TablePropertiesCollectorFactory {
-    explicit MyFactory(std::shared_ptr<const SstQueryFilterConfigsImpl> _parent)
-        : parent(std::move(_parent)) {}
+  struct MyFactory : public TblPropCollFactory {
+    explicit MyFactory(
+        std::shared_ptr<const SstQueryFilterConfigsManagerImpl> _parent,
+        const std::string& _configs_name)
+        : parent(std::move(_parent)),
+          ver_map(parent->GetVerMap(_configs_name)),
+          configs_name(std::move(_configs_name)) {}
+
     TablePropertiesCollector* CreateTablePropertiesCollector(
         TablePropertiesCollectorFactory::Context /*context*/) override {
-      return new MyCollector(parent);
+      return new MyCollector(GetConfigs(), *parent);
     }
     const char* Name() const override {
       // placeholder
-      return "SstQueryFilterConfigsImpl::MyFactory";
+      return "SstQueryFilterConfigsManagerImpl::MyFactory";
     }
-    std::shared_ptr<const SstQueryFilterConfigsImpl> parent;
+
+    Status SetFilteringVersion(FilteringVersion ver) override {
+      // FIXME: check version
+      version.StoreRelaxed(ver);
+      return Status::OK();
+    }
+    FilteringVersion GetFilteringVersion() const override {
+      return version.LoadRelaxed();
+    }
+    const std::string& GetConfigsName() const override { return configs_name; }
+    const SstQueryFilterConfigs& GetConfigs() const override {
+      FilteringVersion ver = version.LoadRelaxed();
+      if (ver == 0) {
+        // Special case
+        return kEmptySstQueryFilterConfigs;
+      }
+      auto it = ver_map.lower_bound(ver);
+      if (it == ver_map.end()) {
+        return kEmptySstQueryFilterConfigs;
+      }
+      return it->second;
+    }
+
+    // The buffers pointed to by the Slices must live as long as any read
+    // operations using this table filter function.
+    std::function<bool(const TableProperties&)> GetTableFilterForRangeQuery(
+        Slice lower_bound_incl, Slice upper_bound_excl) const override {
+      // TODO: cache extractor results between SST files, assuming most will
+      // use the same version
+      return
+          [rqf = RangeQueryFilterReader{
+               lower_bound_incl, upper_bound_excl, GetConfigs().extractor.get(),
+               parent->extractor_map_}](const TableProperties& props) -> bool {
+            auto it = props.user_collected_properties.find(kTablePropertyName);
+            if (it == props.user_collected_properties.end()) {
+              // No filtering
+              return true;
+            }
+            auto& filters = it->second;
+            // Parse the serialized filters string
+            if (filters.size() < 2 || filters[0] != kSchemaVersion) {
+              // TODO? Report problem
+              // No filtering
+              return true;
+            }
+            return rqf.MayMatch(Slice(filters.data() + 1, filters.size() - 1));
+          };
+    }
+
+    const std::shared_ptr<const SstQueryFilterConfigsManagerImpl> parent;
+    const ConfigVersionMap& ver_map;
+    const std::string configs_name;
+    RelaxedAtomic<FilteringVersion> version;
   };
 
-  std::shared_ptr<TablePropertiesCollectorFactory> GetTblPropCollFactory()
-      const override {
-    return std::make_shared<MyFactory>(this->shared_from_this());
+  Status MakeSharedTblPropCollFactory(std::shared_ptr<TblPropCollFactory>* out,
+                                      const std::string& configs_name,
+                                      FilteringVersion ver) const override {
+    auto obj = std::make_shared<MyFactory>(*this, configs_name);
+    Status s = obj->SetFilteringVersion(ver);
+    if (s.ok()) {
+      *out = std::move(obj);
+    }
+    return s;
   }
-  std::function<bool(const TableProperties&)> GetTableFilterForRangeQuery(
-      Slice lower_bound_incl, Slice upper_bound_excl) const override {
-    // TODO: cache extractor results between SST files, assuming most will
-    // use the same version
-    return [rqf = RangeQueryFilterReader{lower_bound_incl, upper_bound_excl,
-                                         extractor_}](
-               const TableProperties& props) -> bool {
-      auto it = props.user_collected_properties.find(kTablePropertyName);
-      if (it == props.user_collected_properties.end()) {
-        // No filtering
-        return true;
-      }
-      auto& filters = it->second;
-      // Parse the serialized filters string
-      if (filters.size() < 2 || filters[0] != kSchemaVersion) {
-        // TODO? Report problem
-        // No filtering
-        return true;
-      }
-      return rqf.MayMatch(Slice(filters.data() + 1, filters.size() - 1));
-    };
+
+  const ConfigVersionMap& GetVerMap(const std::string& configs_name) const {
+    static const ConfigVersionMap kEmptyMap;
+    auto it = name_map_.find(configs_name);
+    if (it == name_map_.end()) {
+      return kEmptyMap;
+    }
+    return it->second;
   }
 
  private:
@@ -879,20 +1137,32 @@ class SstQueryFilterConfigsImpl
   static constexpr char kSchemaVersion = 1;
 
  private:
-  std::shared_ptr<KeySegmentsExtractor> extractor_;
-  uint32_t version_ = 0;
-  std::vector<std::shared_ptr<SstQueryFilterConfigImpl>> configs_;
-  bool sanity_checks_ = false;
+  UnorderedMap<std::string, ConfigVersionMap> name_map_;
+  UnorderedMap<std::string, std::shared_ptr<const KeySegmentsExtractor>>
+      extractor_map_;
+  FilteringVersion min_ver_ = 0;
+  FilteringVersion max_ver_ = 0;
 };
 
 // SstQueryFilterConfigs
-const std::string SstQueryFilterConfigsImpl::kTablePropertyName =
+const std::string SstQueryFilterConfigsManagerImpl::kTablePropertyName =
     "rocksdb.sqfc";
-
 }  // namespace
 
-std::shared_ptr<SstQueryFilterConfigs> SstQueryFilterConfigs::MakeShared() {
-  return std::make_shared<SstQueryFilterConfigsImpl>();
+std::shared_ptr<SstQueryFilterConfig> MakeSharedBytewiseMinMaxSQFC(
+    FilterInput input, KeySegmentsExtractor::KeyCategorySet categories) {
+  return std::make_shared<BytewiseMinMaxSstQueryFilterConfig>(input,
+                                                              categories);
+}
+
+Status SstQueryFilterConfigsManager::MakeShared(
+    std::shared_ptr<SstQueryFilterConfigsManager>* out, const Data& data) {
+  auto obj = std::make_shared<SstQueryFilterConfigsManagerImpl>();
+  Status s = obj->Populate(data);
+  if (s.ok()) {
+    *out = std::move(obj);
+  }
+  return s;
 }
 
 }  // namespace experimental

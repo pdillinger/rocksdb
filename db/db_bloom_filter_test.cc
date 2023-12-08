@@ -3565,7 +3565,10 @@ TEST_F(DBBloomFilterTest, WeirdPrefixExtractorWithFilter3) {
 
 TEST_F(DBBloomFilterTest, SstQueryFilter) {
   using experimental::KeySegmentsExtractor;
+  using experimental::MakeSharedBytewiseMinMaxSQFC;
+  using experimental::SelectKeySegment;
   using experimental::SstQueryFilterConfigs;
+  using experimental::SstQueryFilterConfigsManager;
   using KeyCategorySet = KeySegmentsExtractor::KeyCategorySet;
 
   struct MySegmentExtractor : public KeySegmentsExtractor {
@@ -3608,10 +3611,20 @@ TEST_F(DBBloomFilterTest, SstQueryFilter) {
     }
   };
 
-  auto configs = SstQueryFilterConfigs::MakeShared();
   auto extractor1old = std::make_shared<MySegmentExtractor>("Ex1", 1, 2);
   auto extractor1new = std::make_shared<MySegmentExtractor>("Ex1", 2, 3);
   auto extractor2 = std::make_shared<MySegmentExtractor>("Ex2", 1, 3);
+
+  auto filter1d = MakeSharedBytewiseMinMaxSQFC(
+      experimental::SelectKeySegment(1),
+      KeyCategorySet{KeySegmentsExtractor::kDefaultCategory});
+  auto filter2 =
+      MakeSharedBytewiseMinMaxSQFC(experimental::SelectKeySegment(2));
+
+  std::shared_ptr<SstQueryFilterConfigsManager> configs_manager;
+  ASSERT_OK(SstQueryFilterConfigsManager::MakeShared(&configs_manager,
+                                                     {{42U, {}}, {43U, {}}}));
+
   configs->SetExtractorAndVersion(extractor1old, 1);
   // Filter on 2nd field with '_' as delimiter, only for default category
   configs->AddMinMax(1, KeyCategorySet{KeySegmentsExtractor::kDefaultCategory});
