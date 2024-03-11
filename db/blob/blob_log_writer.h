@@ -16,6 +16,10 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+namespace blob_db {
+class BlobFile;
+}  // namespace blob_db
+
 class WritableFileWriter;
 class SystemClock;
 /**
@@ -68,9 +72,11 @@ class BlobLogWriter {
 
   uint64_t get_log_number() const { return log_number_; }
 
-  Status Sync(const WriteOptions& write_options);
+  friend class blob_db::BlobFile;
 
  private:
+  Status Sync(const WriteOptions& write_options);
+
   std::unique_ptr<WritableFileWriter> dest_;
   SystemClock* clock_;
   Statistics* statistics_;

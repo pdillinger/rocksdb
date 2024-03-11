@@ -133,6 +133,7 @@ Status BlobDBImpl::CloseImpl() {
   }
 
   // TODO: plumb Env::IOActivity, Env::IOPriority
+  // NB: only call to SyncBlobFiles() (in CloseImpl())
   s = SyncBlobFiles(WriteOptions());
   return s;
 }
@@ -1985,6 +1986,7 @@ Status BlobDBImpl::SyncBlobFiles(const WriteOptions& write_options) {
 
   Status s;
   for (auto& blob_file : process_files) {
+    // NB: only call to BlobFile::Fsync()
     s = blob_file->Fsync(write_options);
     if (!s.ok()) {
       ROCKS_LOG_ERROR(db_options_.info_log,

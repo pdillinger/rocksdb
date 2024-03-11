@@ -96,6 +96,7 @@ Status BlobLogWriter::AppendFooter(const WriteOptions& write_options,
     }
     if (s.ok()) {
       block_offset_ += str.size();
+      // NB: Only call anywhere to BlobLogWriter::Sync()
       s = Sync(write_options);
 
       if (s.ok()) {

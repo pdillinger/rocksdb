@@ -180,8 +180,6 @@ class BlobFile {
     return obsolete_sequence_;
   }
 
-  Status Fsync(const WriteOptions& write_options);
-
   uint64_t GetFileSize() const {
     return file_size_.load(std::memory_order_acquire);
   }
@@ -216,6 +214,8 @@ class BlobFile {
                    bool* fresh_open);
 
  private:
+  Status Fsync(const WriteOptions& write_options);
+
   Status ReadFooter(BlobLogFooter* footer);
 
   Status WriteFooterAndCloseLocked(const WriteOptions& write_options,
