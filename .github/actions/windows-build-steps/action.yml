@@ -15,9 +15,8 @@ runs:
       SNAPPY_INCLUDE: ${{ github.workspace }}/thirdparty/snappy-1.1.8;${{ github.workspace }}/thirdparty/snappy-1.1.8/build
       SNAPPY_LIB_DEBUG: ${{ github.workspace }}/thirdparty/snappy-1.1.8/build/Debug/snappy.lib
     run: |-
-      # Work around GHA bug: https://github.com/actions/runner-images/issues/6668
       $ErrorActionPreference = 'Stop'
-      echo ===================== Install Dependencies =====================
+      echo ===================== Install Dependencies ===================== $ErrorActionPreference
       choco install liberica8jdk -y
       mkdir $Env:THIRDPARTY_HOME
       cd $Env:THIRDPARTY_HOME
@@ -29,7 +28,7 @@ runs:
       cd build
       & cmake -G "$Env:CMAKE_GENERATOR" ..
       msbuild Snappy.sln -maxCpuCount -property:Configuration=Debug -property:Platform=x64
-      echo ======================== Build RocksDB =========================
+      echo ======================== Build RocksDB ========================= $ErrorActionPreference
       cd ${{ github.workspace }}
       $env:Path = $env:JAVA_HOME + ";" + $env:Path
       mkdir build
@@ -38,7 +37,7 @@ runs:
       cd ..
       echo "Building with VS version: $Env:CMAKE_GENERATOR"
       msbuild build/rocksdb.sln -maxCpuCount -property:Configuration=Debug -property:Platform=x64
-      echo ========================= Test RocksDB =========================
+      echo ========================= Test RocksDB ========================= $ErrorActionPreference
       build_tools\run_ci_db_test.ps1 -SuiteRun arena_test,db_basic_test,db_test,db_test2,db_merge_operand_test,bloom_test,c_test,coding_test,crc32c_test,dynamic_bloom_test,env_basic_test,env_test,hash_test,random_test -Concurrency 16
       echo ======================== Test RocksJava ========================
       cd build\java
