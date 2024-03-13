@@ -30,4 +30,4 @@ runs:
       & msbuild Not_a_solution.sln -maxCpuCount -property:Configuration=Debug -property:Platform=x64
       echo LASTEXITCODE = $LASTEXITCODE
       msbuild -help
-    shell: pwsh
+    shell: powershell
