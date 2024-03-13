@@ -15,7 +15,7 @@ runs:
       SNAPPY_INCLUDE: ${{ github.workspace }}/thirdparty/snappy-1.1.8;${{ github.workspace }}/thirdparty/snappy-1.1.8/build
       SNAPPY_LIB_DEBUG: ${{ github.workspace }}/thirdparty/snappy-1.1.8/build/Debug/snappy.lib
     run: |-
-# Work around GHA bug: https://github.com/actions/runner-images/issues/6668
+      # Work around GHA bug: https://github.com/actions/runner-images/issues/6668
       $ErrorActionPreference = 'Stop'
       echo ===================== Install Dependencies =====================
       choco install liberica8jdk -y
