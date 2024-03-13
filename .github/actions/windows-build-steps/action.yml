@@ -15,8 +15,15 @@ runs:
       SNAPPY_INCLUDE: ${{ github.workspace }}/thirdparty/snappy-1.1.8;${{ github.workspace }}/thirdparty/snappy-1.1.8/build
       SNAPPY_LIB_DEBUG: ${{ github.workspace }}/thirdparty/snappy-1.1.8/build/Debug/snappy.lib
     run: |-
-      $ErrorActionPreference = 'Stop'
-      $PSNativeCommandErrorActionPreference = $true
+      # Recipe to report errors, from https://stackoverflow.com/a/44810914
+      $ErrorActionPreference = "Stop"
+      $PSDefaultParameterValues['*:ErrorAction']='Stop'
+      function ThrowOnNativeFailure {
+        if (-not $?)
+        {
+          throw 'Native Failure'
+        }
+      }
       echo ===================== Install Dependencies ===================== $ErrorActionPreference
       choco install liberica8jdk -y
       mkdir $Env:THIRDPARTY_HOME
