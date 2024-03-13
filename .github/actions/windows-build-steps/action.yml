@@ -16,6 +16,7 @@ runs:
       SNAPPY_LIB_DEBUG: ${{ github.workspace }}/thirdparty/snappy-1.1.8/build/Debug/snappy.lib
     run: |-
       $ErrorActionPreference = 'Stop'
+      $PSNativeCommandErrorActionPreference = $true
       echo ===================== Install Dependencies ===================== $ErrorActionPreference
       choco install liberica8jdk -y
       mkdir $Env:THIRDPARTY_HOME
@@ -27,7 +28,7 @@ runs:
       mkdir build
       cd build
       & cmake -G "$Env:CMAKE_GENERATOR" ..
-      & msbuild Not_a_solution.sln -maxCpuCount -property:Configuration=Debug -property:Platform=x64
+      msbuild Not_a_solution.sln -maxCpuCount -property:Configuration=Debug -property:Platform=x64
       echo LASTEXITCODE = $LASTEXITCODE
       msbuild -help
-    shell: powershell
+    shell: pwsh
