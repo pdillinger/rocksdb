@@ -15,7 +15,7 @@
 #include "env/mock_env.h"
 #include "port/stack_trace.h"
 #include "util/atomic.h"
-
+injected compilation failure
 namespace ROCKSDB_NAMESPACE {
 
 class DBTestXactLogIterator : public DBTestBase {
