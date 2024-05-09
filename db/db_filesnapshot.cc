@@ -152,11 +152,11 @@ Status DBImpl::GetSortedWalFiles(VectorLogPtr& files) {
   }
 
   if (s.ok()) {
-    size_t wal_size = files.size();
+    size_t wal_count = files.size();
     ROCKS_LOG_INFO(immutable_db_options_.info_log,
                    "Number of log files %" ROCKSDB_PRIszt " (%" ROCKSDB_PRIszt
                    " required by manifest)",
-                   wal_size, required_by_manifest.size());
+                   wal_count, required_by_manifest.size());
 #ifndef NDEBUG
     std::ostringstream wal_names;
     for (const auto& wal : files) {
@@ -392,12 +392,21 @@ Status DBImpl::GetLiveFilesStorageInfo(
   if (!s.ok()) {
     return s;
   }
+  // TODO: doc
+  std::map<uint64_t, uint64_t> wal_number_to_size;
+  bool recycling_log_files = immutable_db_options_.recycle_log_file_num > 0;
+  if (!recycling_log_files) {
+    s = GetOpenWalSizes(wal_number_to_size);
+    if (!s.ok()) {
+      return s;
+    }
+  }
 
-  size_t wal_size = live_wal_files.size();
+  size_t wal_count = live_wal_files.size();
   // Link WAL files. Copy exact size of last one because it is the only one
   // that has changes after the last flush.
   auto wal_dir = immutable_db_options_.GetWalDir();
-  for (size_t i = 0; s.ok() && i < wal_size; ++i) {
+  for (size_t i = 0; s.ok() && i < wal_count; ++i) {
     if ((live_wal_files[i]->Type() == kAliveLogFile) &&
         (!flush_memtable || live_wal_files[i]->LogNumber() >= min_log_num)) {
       results.emplace_back();
@@ -408,12 +417,22 @@ Status DBImpl::GetLiveFilesStorageInfo(
       info.directory = wal_dir;
       info.file_number = live_wal_files[i]->LogNumber();
       info.file_type = kWalFile;
-      info.size = live_wal_files[i]->SizeFileBytes();
-      // Trim the log either if its the last one, or log file recycling is
-      // enabled. In the latter case, a hard link doesn't prevent the file
-      // from being renamed and recycled. So we need to copy it instead.
-      info.trim_to_size = (i + 1 == wal_size) ||
-                          (immutable_db_options_.recycle_log_file_num > 0);
+      if (recycling_log_files) {
+        info.size = live_wal_files[i]->SizeFileBytes();
+        // Recyclable WAL files must be copied instead of hard linked
+        info.trim_to_size = true;
+      } else {
+        auto it = wal_number_to_size.find(info.file_number);
+        if (it == wal_number_to_size.end()) {
+          // Closed WAL file
+          info.size = live_wal_files[i]->SizeFileBytes();
+          assert(!info.trim_to_size);
+        } else {
+          // Possibly still open -> copy instead of hard link
+          info.size = it->second;
+          info.trim_to_size = true;
+        }
+      }
       if (opts.include_checksum_info) {
         info.file_checksum_func_name = kUnknownFileChecksumFuncName;
         info.file_checksum = kUnknownFileChecksum;

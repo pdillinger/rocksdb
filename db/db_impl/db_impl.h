@@ -502,6 +502,7 @@ class DBImpl : public DB {
   Status GetLiveFiles(std::vector<std::string>&, uint64_t* manifest_file_size,
                       bool flush_memtable = true) override;
   Status GetSortedWalFiles(VectorLogPtr& files) override;
+  Status GetOpenWalSizes(std::map<uint64_t, uint64_t>& number_to_size);
   Status GetCurrentWalFile(std::unique_ptr<LogFile>* current_log_file) override;
   Status GetCreationTimeOfOldestFile(uint64_t* creation_time) override;
 

@@ -31,6 +31,31 @@
 #include "utilities/fault_injection_fs.h"
 
 namespace ROCKSDB_NAMESPACE {
+
+class TrackedWritableFile : public FSWritableFileOwnerWrapper {
+ public:
+  explicit TrackedWritableFile(std::unique_ptr<FSWritableFile>&& file)
+      : FSWritableFileOwnerWrapper(std::move(file)) {}
+};
+
+class HygieneCheckFS : public FileSystemWrapper {
+ public:
+  explicit HygieneCheckFS(std::shared_ptr<FileSystem> base)
+      : FileSystemWrapper(std::move(base)) {}
+  static const char* kClassName() { return "HygieneCheckFS"; }
+  const char* Name() const override { return kClassName(); }
+
+  IOStatus NewWritableFile(const std::string& fname,
+                           const FileOptions& file_opts,
+                           std::unique_ptr<FSWritableFile>* result,
+                           IODebugContext* dbg) override {
+    IOStatus s = target()->NewWritableFile(fname, file_opts, result, dbg);
+    EXPECT_OK(s);
+    result->reset(new TrackedWritableFile(std::move(*result)));
+    return s;
+  }
+};
+
 class CheckpointTest : public testing::Test {
  protected:
   // Sequence of option configurations to try
