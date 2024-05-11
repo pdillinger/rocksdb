@@ -709,21 +709,45 @@ TEST_P(DBWriteTest, LockWALInEffect) {
 }
 
 TEST_P(DBWriteTest, LockWALConcurrentRecursive) {
+  // This is a micro-stress test of LockWAL and concurrency handling.
+  // It is considered the most convenient way to balance functional
+  // coverage and reproducibility (vs. the two extremes of (a) unit tests
+  // tailored to specific interleavings and (b) db_stress)
   Options options = GetOptions();
   Reopen(options);
-  ASSERT_OK(Put("k1", "val"));
+  ASSERT_OK(Put("k1", "k1_orig"));
   ASSERT_OK(db_->LockWAL());  // 0 -> 1
   auto frozen_seqno = db_->GetLatestSequenceNumber();
-  std::atomic<bool> t1_completed{false};
-  port::Thread t1{[&]() {
+
+  std::string ingest_file = dbname_ + "/external.sst";
+  {
+    SstFileWriter sst_file_writer(EnvOptions(), options);
+    ASSERT_OK(sst_file_writer.Open(ingest_file));
+    ASSERT_OK(sst_file_writer.Put("k2", "k2_val"));
+    ExternalSstFileInfo external_info;
+    ASSERT_OK(sst_file_writer.Finish(&external_info));
+  }
+  AcqRelAtomic<bool> parallel_ingest_completed{false};
+  port::Thread parallel_ingest{[&]() {
+    // FIXME: Shouldn't finish until WAL unlocked?
+    IngestExternalFileOptions ingest_opts;
+    ingest_opts.move_files = true;
+    ASSERT_OK(db_->IngestExternalFile({ingest_file}, ingest_opts));
+    parallel_ingest_completed.Store(true);
+  }};
+
+  AcqRelAtomic<bool> parallel_put_completed{false};
+  port::Thread parallel_put{[&]() {
+    // This can make certain failure scenarios more likely:
+    //   sleep(1);
     // Won't finish until WAL unlocked
-    ASSERT_OK(Put("k1", "val2"));
-    t1_completed = true;
+    ASSERT_OK(Put("k1", "k1_mod"));
+    parallel_put_completed.Store(true);
   }};
 
   ASSERT_OK(db_->LockWAL());  // 1 -> 2
   // Read-only ops are OK
-  ASSERT_EQ(Get("k1"), "val");
+  ASSERT_EQ(Get("k1"), "k1_orig");
   {
     std::vector<LiveFileStorageInfo> files;
     LiveFilesStorageInfoOptions lf_opts;
@@ -732,29 +756,32 @@ TEST_P(DBWriteTest, LockWALConcurrentRecursive) {
     ASSERT_OK(db_->GetLiveFilesStorageInfo({lf_opts}, &files));
   }
 
-  port::Thread t2{[&]() {
+  port::Thread parallel_lock_wal{[&]() {
     ASSERT_OK(db_->LockWAL());  // 2 -> 3 or 1 -> 2
   }};
 
   ASSERT_OK(db_->UnlockWAL());  // 2 -> 1 or 3 -> 2
-  // Give t1 an extra chance to jump in case of bug
+  // Give parallel_put an extra chance to jump in case of bug
   std::this_thread::yield();
-  t2.join();
-  ASSERT_FALSE(t1_completed.load());
+  parallel_lock_wal.join();
+  ASSERT_FALSE(parallel_put_completed.Load());
+  ASSERT_FALSE(parallel_ingest_completed.Load());
 
   // Should now have 2 outstanding LockWAL
-  ASSERT_EQ(Get("k1"), "val");
+  ASSERT_EQ(Get("k1"), "k1_orig");
 
   ASSERT_OK(db_->UnlockWAL());  // 2 -> 1
 
-  ASSERT_FALSE(t1_completed.load());
-  ASSERT_EQ(Get("k1"), "val");
+  ASSERT_FALSE(parallel_put_completed.Load());
+  ASSERT_FALSE(parallel_ingest_completed.Load());
+  ASSERT_EQ(Get("k1"), "k1_orig");
+  ASSERT_EQ(Get("k2"), "NOT_FOUND");
   ASSERT_EQ(frozen_seqno, db_->GetLatestSequenceNumber());
 
   // Ensure final Unlock is concurrency safe and extra Unlock is safe but
   // non-OK
   std::atomic<int> unlock_ok{0};
-  port::Thread t3{[&]() {
+  port::Thread parallel_stuff{[&]() {
     if (db_->UnlockWAL().ok()) {
       unlock_ok++;
     }
@@ -767,18 +794,21 @@ TEST_P(DBWriteTest, LockWALConcurrentRecursive) {
   if (db_->UnlockWAL().ok()) {
     unlock_ok++;
   }
-  t3.join();
+  parallel_stuff.join();
 
   // There was one extra unlock, so just one non-ok
   ASSERT_EQ(unlock_ok.load(), 2);
 
   // Write can proceed
-  t1.join();
-  ASSERT_TRUE(t1_completed.load());
-  ASSERT_EQ(Get("k1"), "val2");
+  parallel_put.join();
+  ASSERT_TRUE(parallel_put_completed.Load());
+  ASSERT_EQ(Get("k1"), "k1_mod");
+  parallel_ingest.join();
+  ASSERT_TRUE(parallel_ingest_completed.Load());
+  ASSERT_EQ(Get("k2"), "k2_val");
   // And new writes
-  ASSERT_OK(Put("k2", "val"));
-  ASSERT_EQ(Get("k2"), "val");
+  ASSERT_OK(Put("k3", "val"));
+  ASSERT_EQ(Get("k3"), "val");
 }
 
 TEST_P(DBWriteTest, ConcurrentlyDisabledWAL) {
