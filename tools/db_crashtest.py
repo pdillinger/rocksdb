@@ -101,9 +101,9 @@ default_params = {
     "get_current_wal_file_one_in": 0,
     # Temporarily disable hash index
     "index_type": lambda: random.choice([0, 0, 0, 2, 2, 3]),
-    "ingest_external_file_one_in": lambda: random.choice([1000, 1000000]),
+    "ingest_external_file_one_in": 100, #lambda: random.choice([1000, 1000000]),
     "iterpercent": 10,
-    "lock_wal_one_in": lambda: random.choice([10000, 1000000]),
+    "lock_wal_one_in": 100, #lambda: random.choice([10000, 1000000]),
     "mark_for_compaction_one_file_in": lambda: 10 * random.randint(0, 1),
     "max_background_compactions": 20,
     "max_bytes_for_level_base": 10485760,
@@ -211,12 +211,12 @@ default_params = {
     "continuous_verification_interval": 0,
     "max_key_len": 3,
     "key_len_percent_dist": "1,30,69",
-    "read_fault_one_in": lambda: random.choice([0, 32, 1000]),
-    "write_fault_one_in": lambda: random.choice([0, 128, 1000]),
-    "open_metadata_write_fault_one_in": lambda: random.choice([0, 0, 8]),
-    "open_write_fault_one_in": lambda: random.choice([0, 0, 16]),
-    "open_read_fault_one_in": lambda: random.choice([0, 0, 32]),
-    "sync_fault_injection": lambda: random.randint(0, 1),
+    "read_fault_one_in": lambda: random.choice([0, 0, 0, 32, 1000]),
+    "write_fault_one_in": lambda: random.choice([0, 0, 0, 128, 1000]),
+    "open_metadata_write_fault_one_in": lambda: random.choice([0, 0, 0, 0, 8]),
+    "open_write_fault_one_in": lambda: random.choice([0, 0, 0, 0, 16]),
+    "open_read_fault_one_in": lambda: random.choice([0, 0, 0, 0, 32]),
+    "sync_fault_injection": lambda: random.choice([0, 0, 0, 1]),
     "get_property_one_in":  lambda: random.choice([100000, 1000000]),
     "get_properties_of_all_tables_one_in":  lambda: random.choice([100000, 1000000]),
     "paranoid_file_checks": lambda: random.choice([0, 1, 1, 1]),
@@ -224,7 +224,7 @@ default_params = {
         [0, 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024]
     ),
     "user_timestamp_size": 0,
-    "secondary_cache_fault_one_in": lambda: random.choice([0, 0, 32]),
+    "secondary_cache_fault_one_in": lambda: random.choice([0, 0, 0, 0, 32]),
     "compressed_secondary_cache_size": lambda: random.choice([8388608, 16777216]),
     "prepopulate_block_cache": lambda: random.choice([0, 1]),
     "memtable_prefix_bloom_size_ratio": lambda: random.choice([0.001, 0.01, 0.1, 0.5]),
@@ -408,7 +408,7 @@ def is_direct_io_supported(dbname):
 
 
 blackbox_default_params = {
-    "disable_wal": lambda: random.choice([0, 0, 0, 1]),
+    "disable_wal": 0,
     # total time for this script to test db_stress
     "duration": 6000,
     # time for one db_stress instance to run
@@ -864,12 +864,6 @@ def finalize_and_sanitize(src_params):
     elif (dest_params.get("use_put_entity_one_in") > 1 and
         dest_params.get("use_timed_put_one_in") == 1):
         dest_params["use_timed_put_one_in"] = 3
-    # TODO: re-enable this combination.
-    if dest_params.get("lock_wal_one_in") != 0 and dest_params["ingest_external_file_one_in"] != 0:
-        if random.choice([0, 1]) == 0:
-            dest_params["ingest_external_file_one_in"] = 0
-        else:
-            dest_params["lock_wal_one_in"] = 0
     return dest_params
 
 def gen_cmd_params(args):

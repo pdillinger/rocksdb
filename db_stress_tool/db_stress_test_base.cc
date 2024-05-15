@@ -956,22 +956,92 @@ void StressTest::OperateDb(ThreadState* thread) {
         if (!s.ok()) {
           fprintf(stderr, "LockWAL() failed: %s\n", s.ToString().c_str());
         } else {
-          auto old_seqno = db_->GetLatestSequenceNumber();
-          // Yield for a while
-          do {
-            std::this_thread::yield();
-          } while (thread->rand.OneIn(2));
-          // Latest seqno should not have changed
-          auto new_seqno = db_->GetLatestSequenceNumber();
-          if (old_seqno != new_seqno) {
-            fprintf(
-                stderr,
-                "Failure: latest seqno changed from %u to %u with WAL locked\n",
-                (unsigned)old_seqno, (unsigned)new_seqno);
+          VectorLogPtr old_wals;
+          //s = db_->GetSortedWalFiles(old_wals);
+          //while (!old_wals.empty() && old_wals[0]->Type() != WalFileType::kAliveLogFile) {
+          //  old_wals.erase(old_wals.begin());
+          //}
+          //while (old_wals.size() > 1) {
+          //  old_wals.erase(old_wals.begin());
+          //}
+          old_wals.push_back({});
+          s = db_->GetCurrentWalFile(&old_wals[0]);
+          if (!s.ok()) {
+            fprintf(stderr, "GetSortedWalFiles() failed: %s\n",
+                    s.ToString().c_str());
+          } else {
+            // Yield for a while
+            do {
+              std::this_thread::yield();
+            } while (thread->rand.OneIn(2));
+            // Set of WALs and sizes should not have changed
+            VectorLogPtr new_wals;
+            //s = db_->GetSortedWalFiles(new_wals);
+            //if (new_wals.size() > 1) {
+            //for (size_t j = 1; j < new_wals.size(); ++j) {
+            //  if (old_wals[0]->LogNumber() == new_wals[j]->LogNumber()) {
+            //    std::swap(new_wals[0], new_wals[j]);
+            //  }
+            //}
+            //new_wals.resize(1);
+            //assert(old_wals[0]->LogNumber() == new_wals[0]->LogNumber());
+            //}
+            //
+            // while (!new_wals.empty() && new_wals[0]->Type() != WalFileType::kAliveLogFile) {
+            //   new_wals.erase(new_wals.begin());
+            // }
+            // while (new_wals.size() > 1) {
+            //   new_wals.erase(new_wals.begin());
+            // }
+            new_wals.push_back({});
+            s = db_->GetCurrentWalFile(&new_wals[0]);
+            if (!s.ok()) {
+              fprintf(stderr, "GetSortedWalFiles() failed: %s\n",
+                      s.ToString().c_str());
+            } else if (old_wals.size() != new_wals.size()) {
+              fprintf(
+                  stderr,
+                  "Failed: WAL count changed during LockWAL(): %zu to %zu\n",
+                  old_wals.size(), new_wals.size());
+            } else if (!fault_fs_guard) {
+                // FIXME: FaultInjectionTestFS does not report file sizes that
+                // reflect what has been flushed. Alternatively, GetSortedWals
+                // could stop relying on asking the FS for sizes. etc.etc..
+              for (size_t j = 0; j < old_wals.size(); ++j) {
+                if (old_wals[j]->LogNumber() != new_wals[j]->LogNumber()) {
+                  fprintf(
+                      stderr,
+                      "Failed: WAL number changed during LockWAL(): %" PRIu64
+                      " to %" PRIu64 "\n",
+                      old_wals[j]->LogNumber(), new_wals[j]->LogNumber());
+                  break;
+                }
+                if (old_wals[j]->SizeFileBytes() !=
+                    new_wals[j]->SizeFileBytes()) {
+                  fprintf(stderr,
+                          "Failed: WAL %" PRIu64
+                          " size changed during LockWAL(): %" PRIu64
+                          " to %" PRIu64 "\n",
+                          old_wals[j]->LogNumber(),
+                          old_wals[j]->SizeFileBytes(),
+                          new_wals[j]->SizeFileBytes());
+                  break;
+                }
+              }
+            }
           }
+          // Unlock WAL
           s = db_->UnlockWAL();
           if (!s.ok()) {
             fprintf(stderr, "UnlockWAL() failed: %s\n", s.ToString().c_str());
+          } else {
+            // Yield for a while
+            do {
+              std::this_thread::yield();
+            } while (thread->rand.OneIn(2));
+            {
+              // Do nothing
+            }
           }
         }
       }
