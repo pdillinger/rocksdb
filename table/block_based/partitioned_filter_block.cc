@@ -88,7 +88,7 @@ void PartitionedFilterBlockBuilder::MaybeCutAFilterBlock(
   // Add the prefix of the next key before finishing the partition without
   // updating last_prefix_str_. This hack, fixes a bug with format_verison=3
   // where seeking for the prefix would lead us to the previous partition.
-  const bool maybe_add_prefix =
+  const bool maybe_add_prefix = false &&
       next_key && prefix_extractor() && prefix_extractor()->InDomain(*next_key);
   if (maybe_add_prefix) {
     const Slice next_key_prefix = prefix_extractor()->Transform(*next_key);
