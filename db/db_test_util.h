@@ -831,6 +831,15 @@ class FileTemperatureTestFS : public FileSystemWrapper {
     return count;
   }
 
+  std::map<Temperature, size_t> CountCurrentSstFilesByTemp() {
+    MutexLock lock(&mu_);
+    std::map<Temperature, size_t> ret;
+    for (const auto& e : current_sst_file_temperatures_) {
+      ret[e.second]++;
+    }
+    return ret;
+  }
+
   void OverrideSstFileTemperature(uint64_t number, Temperature temp) {
     MutexLock lock(&mu_);
     current_sst_file_temperatures_[number] = temp;

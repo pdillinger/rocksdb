@@ -26,6 +26,7 @@
 #include "rocksdb/utilities/replayer.h"
 #include "rocksdb/wal_filter.h"
 #include "test_util/testutil.h"
+#include "util/defer.h"
 #include "util/random.h"
 #include "utilities/fault_injection_env.h"
 
@@ -6542,6 +6543,28 @@ TEST_P(RenameCurrentTest, Compaction) {
   Reopen(options);
   ASSERT_EQ("NOT_FOUND", Get("foo"));
   ASSERT_EQ("d_value", Get("d"));
+}
+
+TEST_F(DBTest2, VariousFileTemperatures) {
+  auto test_fs = std::make_shared<FileTemperatureTestFS>(env_->GetFileSystem());
+  std::unique_ptr<Env> env(new CompositeEnvWrapper(env_, test_fs));
+  Options options = CurrentOptions();
+  options.env = env.get();
+  options.last_level_temperature = Temperature::kWarm;
+  options.default_write_temperature = Temperature::kHot;
+  Reopen(options);
+  Defer closer([&]{ Close();});
+
+  // Temperature count map
+  using TCM = std::map<Temperature, size_t>;
+  ASSERT_EQ(test_fs->CountCurrentSstFilesByTemp(), TCM{});
+
+  ASSERT_OK(Put("foo", "1"));
+  ASSERT_OK(Put("bar", "1"));
+  ASSERT_OK(Flush());
+  // This subtle compilation error upsets clangd:
+  ASSERT_EQ(test_fs->CountCurrentSstFilesByTemp(),
+            TCM{{Temperature::kHot, 1}});
 }
 
 TEST_F(DBTest2, LastLevelTemperature) {
