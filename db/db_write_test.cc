@@ -1000,6 +1000,69 @@ TEST_P(DBWriteTest, RecycleLogToggleTest) {
   ASSERT_EQ(Get(Key(1)), "val2");
 }
 
+TEST_P(DBWriteTest, RedundantWrite) {
+  for (bool flush : {false, true}) {
+    DestroyAndReopen(CurrentOptions());
+    ASSERT_OK(Put(Key(1), "val1"));
+    ASSERT_OK(Put(Key(2), "val2"));
+    ASSERT_OK(Put(Key(3), "val3"));
+    ASSERT_OK(Delete(Key(1)));
+    ASSERT_OK(Delete(Key(2)));
+    ASSERT_OK(Put(Key(4), "val4"));
+    ASSERT_OK(Delete(Key(3)));
+
+    // At this point suppose we read and find a sequence of tombstones
+    // for [1, 3] and want to cover them with a range tombstone
+    auto seq = db_->GetLatestSequenceNumber();
+
+    // After reading that an intervening write comes in that makes it
+    // out of date
+    ASSERT_OK(Put(Key(1), "reval1"));
+
+    // A flush may or may not interfere with our ability to patch the
+    // representation of history.
+    if (flush) {
+      ASSERT_OK(Flush());
+    }
+
+    // Sanity check
+    ASSERT_EQ(Get(Key(1)), "reval1");
+    ASSERT_EQ(Get(Key(2)), "NOT_FOUND");
+    ASSERT_EQ(Get(Key(3)), "NOT_FOUND");
+    ASSERT_EQ(Get(Key(4)), "val4");
+
+    // Attempt to patch the representation of history with a range tombstone
+    WriteBatch b;
+    ASSERT_OK(b.DeleteRange(Key(1), Key(4) /* exclusive */));
+    // If just a DeleteRange in batch, seems to need a noop to make itself
+    // happy with seqno counting.
+    ASSERT_OK(WriteBatchInternal::InsertNoop(&b));
+
+    if (flush) {
+      ASSERT_TRUE(dbfull()->RedundantWrite({}, &b, seq).IsAborted());
+    } else {
+      ASSERT_OK(dbfull()->RedundantWrite({}, &b, seq));
+    }
+
+    // Sanity re-check
+    ASSERT_EQ(Get(Key(1)), "reval1");
+    ASSERT_EQ(Get(Key(2)), "NOT_FOUND");
+    ASSERT_EQ(Get(Key(3)), "NOT_FOUND");
+    ASSERT_EQ(Get(Key(4)), "val4");
+
+    if (!flush) {
+      // Make sure that flushing after is also OK
+      ASSERT_OK(Flush());
+    }
+
+    // Sanity re-check
+    ASSERT_EQ(Get(Key(1)), "reval1");
+    ASSERT_EQ(Get(Key(2)), "NOT_FOUND");
+    ASSERT_EQ(Get(Key(3)), "NOT_FOUND");
+    ASSERT_EQ(Get(Key(4)), "val4");
+  }
+}
+
 INSTANTIATE_TEST_CASE_P(DBWriteTestInstance, DBWriteTest,
                         testing::Values(DBTestBase::kDefault,
                                         DBTestBase::kConcurrentWALWrites,

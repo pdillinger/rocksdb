@@ -1216,6 +1216,33 @@ void DBImpl::MemTableInsertStatusCheck(const Status& status) {
   }
 }
 
+Status DBImpl::RedundantWrite(const WriteOptions& write_options,
+                              WriteBatch* batch, SequenceNumber seq) {
+  WriteThread::Writer w(write_options, batch, nullptr /*callback*/,
+                        nullptr /*user_write_cb*/, 0 /*log_ref*/,
+                        false /* disable_memtable */, 1 /*batch_cnt*/);
+  w.sequence = seq;
+
+  // FIXME (currently hacky)
+  WriteThread::Writer dummy_w;
+  InstrumentedMutexLock l(&options_mutex_);
+  write_thread_.EnterUnbatched(&dummy_w, &options_mutex_);
+
+  // TODO: timers & stats
+
+  ColumnFamilyMemTablesImpl column_family_memtables(
+      versions_->GetColumnFamilySet());
+  w.status = WriteBatchInternal::InsertInto(
+      &w, w.sequence, &column_family_memtables, &flush_scheduler_,
+      &trim_history_scheduler_, write_options.ignore_missing_column_families,
+      0 /*log_number*/, this, true /*concurrent_memtable_writes*/,
+      true /*seq_per_batch*/, 1 /*batch_cnt*/, true /*batch_per_txn*/,
+      write_options.memtable_insert_hint_per_batch);
+
+  write_thread_.ExitUnbatched(&dummy_w);
+  return w.status;
+}
+
 Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
                                LogContext* log_context,
                                WriteContext* write_context) {

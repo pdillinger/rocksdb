@@ -3223,8 +3223,9 @@ Status WriteBatchInternal::InsertInto(
   inserter.set_log_number_ref(writer->log_ref);
   inserter.set_prot_info(writer->batch->prot_info_.get());
   Status s = writer->batch->Iterate(&inserter);
-  assert(!seq_per_batch || batch_cnt != 0);
-  assert(!seq_per_batch || inserter.sequence() - sequence == batch_cnt);
+  assert(!s.ok() || !seq_per_batch || batch_cnt != 0);
+  assert(!s.ok() || !seq_per_batch ||
+         inserter.sequence() - sequence == batch_cnt);
   if (concurrent_memtable_writes) {
     inserter.PostProcess();
   }

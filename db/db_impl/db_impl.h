@@ -1335,6 +1335,9 @@ class DBImpl : public DB {
 
   bool seq_per_batch() const { return seq_per_batch_; }
 
+  Status RedundantWrite(const WriteOptions& options, WriteBatch* batch,
+                        SequenceNumber seq);
+
  protected:
   const std::string dbname_;
   // TODO(peterd): unify with VersionSet::db_id_

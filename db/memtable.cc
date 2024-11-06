@@ -941,6 +941,10 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
   assert((unsigned)(p + val_size - buf + moptions_.protection_bytes_per_key) ==
          (unsigned)encoded_len);
 
+  if (UNLIKELY(s < creation_seq_)) {
+    return Status::Aborted();
+  }
+
   UpdateEntryChecksum(kv_prot_info, key, value, type, s,
                       buf + encoded_len - moptions_.protection_bytes_per_key);
   Slice encoded(buf, encoded_len - moptions_.protection_bytes_per_key);
