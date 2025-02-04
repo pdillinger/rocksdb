@@ -116,6 +116,9 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+// XXX: debug only
+thread_local bool gAllowFalseAllowRefresh = false;
+
 const std::string kDefaultColumnFamilyName("default");
 const std::string kPersistentStatsColumnFamilyName(
     "___rocksdb_stats_history___");

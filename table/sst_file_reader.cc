@@ -16,6 +16,7 @@
 #include "table/table_builder.h"
 #include "table/table_iterator.h"
 #include "table/table_reader.h"
+#include "util/defer.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -86,6 +87,7 @@ Iterator* SstFileReader::NewIterator(const ReadOptions& roptions) {
   auto sequence = roptions.snapshot != nullptr
                       ? roptions.snapshot->GetSequenceNumber()
                       : kMaxSequenceNumber;
+  SaveAndRestore<bool> ovr(&gAllowFalseAllowRefresh, true);
   ArenaWrappedDBIter* res = new ArenaWrappedDBIter();
   res->Init(
       r->options.env, roptions, r->ioptions, r->moptions, nullptr /* version */,

@@ -8,6 +8,7 @@
 #include "db/arena_wrapped_db_iter.h"
 #include "rocksdb/utilities/transaction_db.h"
 #include "util/cast_util.h"
+#include "util/defer.h"
 
 namespace ROCKSDB_NAMESPACE {
 
@@ -403,6 +404,7 @@ Iterator* WriteUnpreparedTxnDB::NewIterator(const ReadOptions& _read_options,
   }
   // TODO(lth): Refactor so that this logic is shared with WritePrepared.
   constexpr bool expose_blob_index = false;
+  SaveAndRestore<bool> ovr(&gAllowFalseAllowRefresh, true);
   constexpr bool allow_refresh = false;
   std::shared_ptr<ManagedSnapshot> own_snapshot = nullptr;
   SequenceNumber snapshot_seq = kMaxSequenceNumber;

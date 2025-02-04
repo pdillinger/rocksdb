@@ -72,6 +72,8 @@
 
 namespace ROCKSDB_NAMESPACE {
 
+extern thread_local bool gAllowFalseAllowRefresh;
+
 class Arena;
 class ArenaWrappedDBIter;
 class InMemoryStatsHistoryIterator;

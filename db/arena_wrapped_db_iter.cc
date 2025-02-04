@@ -60,6 +60,7 @@ void ArenaWrappedDBIter::Init(
                               cfh, expose_blob_index);
 
   sv_number_ = version_number;
+  assert(allow_refresh || gAllowFalseAllowRefresh);
   allow_refresh_ = allow_refresh;
   memtable_range_tombstone_iter_ = nullptr;
 }

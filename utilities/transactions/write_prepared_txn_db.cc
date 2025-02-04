@@ -19,6 +19,7 @@
 #include "rocksdb/utilities/transaction_db.h"
 #include "test_util/sync_point.h"
 #include "util/cast_util.h"
+#include "util/defer.h"
 #include "util/mutexlock.h"
 #include "util/string_util.h"
 #include "utilities/transactions/pessimistic_transaction.h"
@@ -401,6 +402,7 @@ Iterator* WritePreparedTxnDB::NewIterator(const ReadOptions& _read_options,
     read_options.io_activity = Env::IOActivity::kDBIterator;
   }
   constexpr bool expose_blob_index = false;
+  SaveAndRestore<bool> ovr(&gAllowFalseAllowRefresh, true);
   constexpr bool allow_refresh = false;
   std::shared_ptr<ManagedSnapshot> own_snapshot = nullptr;
   SequenceNumber snapshot_seq = kMaxSequenceNumber;
@@ -448,6 +450,7 @@ Status WritePreparedTxnDB::NewIterators(
     read_options.io_activity = Env::IOActivity::kDBIterator;
   }
   constexpr bool expose_blob_index = false;
+  SaveAndRestore<bool> ovr(&gAllowFalseAllowRefresh, true);
   constexpr bool allow_refresh = false;
   std::shared_ptr<ManagedSnapshot> own_snapshot = nullptr;
   SequenceNumber snapshot_seq = kMaxSequenceNumber;
