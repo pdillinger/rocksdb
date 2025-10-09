@@ -18,7 +18,7 @@ baseurl: ""
 # This was also be set to the right thing automatically for local development
 # https://github.com/blog/2277-what-s-new-in-github-pages-with-jekyll-3-3
 # http://jekyllrb.com/news/2016/10/06/jekyll-3-3-is-here/
-url: "http://rocksdb.org"
+url: "https://pdillinger.github.io/rocksdb/"
 
 # Note: There are new filters in Jekyll 3.3 to help with absolute and relative urls
 # absolute_url
@@ -29,7 +29,7 @@ url: "http://rocksdb.org"
 #https://github.com/blog/2277-what-s-new-in-github-pages-with-jekyll-3-3
 
 # The GitHub repo for your project
-ghrepo: "facebook/rocksdb"
+ghrepo: "pdillinger/rocksdb"
 
 # Use these color settings to determine your colour scheme for the site.
 color:

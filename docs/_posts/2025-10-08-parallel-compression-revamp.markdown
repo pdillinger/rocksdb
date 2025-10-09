@@ -18,7 +18,7 @@ The parallel compression framework has been completely rewritten from the ground
 ### Ring Buffer Architecture
 Instead of separate compression and write queues with complex thread coordination, the new implementation uses a ring buffer of blocks-in-progress that enables efficient work distribution across threads. This bounds working memory while enabling high throughput with minimal cross-thread synchronization.
 
-![Ring Buffer Architecture](/static/images/parallel-compression/ring-buffer-architecture.svg)
+![Ring Buffer Architecture](/rocksdb/static/images/parallel-compression/ring-buffer-architecture.svg)
 
 ### Work-Stealing Design
 Previously, the calling thread could only generate uncompressed blocks, dedicated compression threads could only compress, and a writer thread could only write the SST file to storage. Now, all threads can participate in compression work in a quasi-work-stealing manner, dramatically reducing the need for threads to block waiting for work. While only one thread (the calling thread or "emit thread") can generate uncompressed SST blocks in the new implementation, feeding compression work to other threads and itself, all other threads are compatible with writing compressed blocks to storage.
