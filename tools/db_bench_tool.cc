@@ -2040,9 +2040,44 @@ class RandomGenerator {
     // large enough to serve all typical value sizes we want to write.
     std::string piece;
     while (data_.size() < (unsigned)std::max(1048576, max_value_size)) {
-      // Add a short fragment that is as compressible as specified
-      // by FLAGS_compression_ratio.
-      test::CompressibleString(&rnd, FLAGS_compression_ratio, 100, &piece);
+      piece.clear();
+      piece.resize(FLAGS_value_size, '\0');
+
+      for (int i = 0; i < FLAGS_value_size; i += 8) {
+        uint64_t v = rnd.Uniform(12345);
+        EncodeFixed64(&piece[i], v);
+        i += 8;
+        if (i >= FLAGS_value_size) {
+          break;
+        }
+        v = rnd.Uniform(3) * 0x08d8e1db5393e229U;
+        EncodeFixed64(&piece[i], v);
+        i += 8;
+        if (i >= FLAGS_value_size) {
+          break;
+        }
+        v = rnd.Uniform(1234567) + 0xa211e3cfbef49b85U;
+        EncodeFixed64(&piece[i], v);
+        i += 8;
+        if (i >= FLAGS_value_size) {
+          break;
+        }
+        v = rnd.Uniform(123) + 0xa4537a7be9b521b9U;
+        EncodeFixed64(&piece[i], v);
+        i += 8;
+        if (i >= FLAGS_value_size) {
+          break;
+        }
+        v = rnd.Uniform(12345) + 0xa4537a7be9b521b9U;
+        EncodeFixed64(&piece[i], v);
+        i += 8;
+        if (i >= FLAGS_value_size) {
+          break;
+        }
+        v = 0x6803fe6b9a256d68U;
+        EncodeFixed64(&piece[i], v);
+      }
+
       data_.append(piece);
     }
     pos_ = 0;
