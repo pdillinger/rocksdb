@@ -361,6 +361,15 @@ Status DBImpl::FlushMemTableToOutputFile(
 
   if (s.ok()) {
     InstallSuperVersionAndScheduleWork(cfd, superversion_context);
+    if ((switched_to_mempurge || flush_job.MemPurgeBarrierUsed()) &&
+        cfd->imm()->IsFlushPending()) {
+      FlushRequest req{flush_reason,
+                       false /* atomic_flush */,
+                       {{cfd, cfd->imm()->GetLatestMemTableID(
+                                  false /* for_atomic_flush */)}}};
+      EnqueuePendingFlush(req);
+      MaybeScheduleFlushOrCompaction();
+    }
     if (made_progress) {
       *made_progress = true;
     }
@@ -3248,6 +3257,16 @@ void DBImpl::MaybeScheduleFlushOrCompaction() {
   auto bg_job_limits = GetBGJobLimits();
   bool is_flush_pool_empty =
       env_->GetBackgroundThreads(Env::Priority::HIGH) == 0;
+  while (!is_flush_pool_empty && unscheduled_memtable_gcs_ > 0 &&
+         bg_flush_scheduled_ < bg_job_limits.max_flushes) {
+    bg_flush_scheduled_++;
+    FlushThreadArg* fta = new FlushThreadArg;
+    fta->db_ = this;
+    fta->thread_pri_ = Env::Priority::HIGH;
+    env_->Schedule(&DBImpl::BGWorkMemTableGC, fta, Env::Priority::HIGH, this,
+                   &DBImpl::UnscheduleFlushCallback);
+    --unscheduled_memtable_gcs_;
+  }
   while (!is_flush_pool_empty && unscheduled_flushes_ > 0 &&
          bg_flush_scheduled_ < bg_job_limits.max_flushes) {
     TEST_SYNC_POINT_CALLBACK(
@@ -3268,6 +3287,17 @@ void DBImpl::MaybeScheduleFlushOrCompaction() {
   // special case -- if high-pri (flush) thread pool is empty, then schedule
   // flushes in low-pri (compaction) thread pool.
   if (is_flush_pool_empty) {
+    while (unscheduled_memtable_gcs_ > 0 &&
+           bg_flush_scheduled_ + bg_compaction_scheduled_ <
+               bg_job_limits.max_flushes) {
+      bg_flush_scheduled_++;
+      FlushThreadArg* fta = new FlushThreadArg;
+      fta->db_ = this;
+      fta->thread_pri_ = Env::Priority::LOW;
+      env_->Schedule(&DBImpl::BGWorkMemTableGC, fta, Env::Priority::LOW, this,
+                     &DBImpl::UnscheduleFlushCallback);
+      --unscheduled_memtable_gcs_;
+    }
     while (unscheduled_flushes_ > 0 &&
            bg_flush_scheduled_ + bg_compaction_scheduled_ <
                bg_job_limits.max_flushes) {
@@ -3536,6 +3566,20 @@ bool DBImpl::EnqueuePendingFlush(const FlushRequest& flush_req) {
   return enqueued;
 }
 
+bool DBImpl::EnqueuePendingMemTableGC(ColumnFamilyData* cfd, MemTable* mem) {
+  mutex_.AssertHeld();
+  if (reject_new_background_jobs_ || cfd == nullptr || mem == nullptr) {
+    return false;
+  }
+
+  cfd->Ref();
+  mem->Ref();
+  mem->SetMemTableGCInProgress(true);
+  memtable_gc_queue_.push_back({cfd, mem});
+  ++unscheduled_memtable_gcs_;
+  return true;
+}
+
 void DBImpl::EnqueuePendingCompaction(ColumnFamilyData* cfd) {
   mutex_.AssertHeld();
   if (reject_new_background_jobs_) {
@@ -3566,6 +3610,17 @@ void DBImpl::BGWorkFlush(void* arg) {
   TEST_SYNC_POINT("DBImpl::BGWorkFlush");
   static_cast_with_check<DBImpl>(fta.db_)->BackgroundCallFlush(fta.thread_pri_);
   TEST_SYNC_POINT("DBImpl::BGWorkFlush:done");
+}
+
+void DBImpl::BGWorkMemTableGC(void* arg) {
+  FlushThreadArg fta = *(static_cast<FlushThreadArg*>(arg));
+  delete static_cast<FlushThreadArg*>(arg);
+
+  IOSTATS_SET_THREAD_POOL_ID(fta.thread_pri_);
+  TEST_SYNC_POINT("DBImpl::BGWorkMemTableGC");
+  static_cast_with_check<DBImpl>(fta.db_)->BackgroundCallMemTableGC(
+      fta.thread_pri_);
+  TEST_SYNC_POINT("DBImpl::BGWorkMemTableGC:done");
 }
 
 void DBImpl::BGWorkCompaction(void* arg) {
@@ -3638,6 +3693,121 @@ void DBImpl::UnscheduleFlushCallback(void* arg) {
   }
   delete static_cast<FlushThreadArg*>(arg);
   TEST_SYNC_POINT("DBImpl::UnscheduleFlushCallback");
+}
+
+Status DBImpl::BackgroundMemTableGC(bool* made_progress,
+                                    JobContext* job_context,
+                                    LogBuffer* log_buffer) {
+  mutex_.AssertHeld();
+  assert(made_progress != nullptr);
+  assert(job_context != nullptr);
+
+  if (shutting_down_.load(std::memory_order_acquire)) {
+    return Status::ShutdownInProgress();
+  }
+  if (error_handler_.IsBGWorkStopped() &&
+      !error_handler_.IsRecoveryInProgress()) {
+    return error_handler_.GetBGError();
+  }
+  if (memtable_gc_queue_.empty()) {
+    return Status::OK();
+  }
+
+  MemTableGCRequest req = memtable_gc_queue_.front();
+  memtable_gc_queue_.pop_front();
+  ColumnFamilyData* cfd = req.cfd;
+  MemTable* mem = req.mem;
+
+  Status s;
+  if (cfd == nullptr || mem == nullptr || cfd->IsDropped() ||
+      !mem->IsMemTableGCInProgress()) {
+    s = Status::Aborted("memtable GC request is no longer applicable");
+  } else {
+    InitSnapshotContext(job_context);
+    const SequenceNumber published_seq = GetLastPublishedSequence();
+    if (job_context->snapshot_seqs.empty() ||
+        job_context->snapshot_seqs.back() < published_seq) {
+      job_context->snapshot_seqs.push_back(published_seq);
+    }
+
+    ROCKS_LOG_BUFFER(log_buffer, "[%s] [JOB %d] Running memtable GC",
+                     cfd->GetName().c_str(), job_context->job_id);
+    mutex_.Unlock();
+    s = mem->GarbageCollect(
+        job_context->snapshot_seqs,
+        cfd->GetLatestMutableCFOptions().experimental_mempurge_threshold);
+    mutex_.Lock();
+    if (s.ok()) {
+      *made_progress = true;
+      TEST_SYNC_POINT("DBImpl::MemTableGC:Successful");
+      TEST_SYNC_POINT("DBImpl::FlushJob:MemPurgeSuccessful");
+      ROCKS_LOG_BUFFER(log_buffer, "[%s] [JOB %d] Memtable GC finished",
+                       cfd->GetName().c_str(), job_context->job_id);
+    } else {
+      TEST_SYNC_POINT("DBImpl::MemTableGC:Skipped");
+      ROCKS_LOG_BUFFER(log_buffer, "[%s] [JOB %d] Memtable GC skipped: %s",
+                       cfd->GetName().c_str(), job_context->job_id,
+                       s.ToString().c_str());
+    }
+  }
+
+  if (mem != nullptr) {
+    mem->SetMemTableGCInProgress(false);
+    mem->MarkMemTableGCDone();
+    if (cfd != nullptr && !cfd->IsDropped() && mem->ShouldScheduleFlush() &&
+        mem->MarkFlushScheduled()) {
+      flush_scheduler_.ScheduleWork(cfd);
+    }
+    ReadOnlyMemTable* mem_to_free = mem->Unref();
+    if (mem_to_free != nullptr) {
+      job_context->memtables_to_free.push_back(mem_to_free);
+    }
+  }
+  if (cfd != nullptr) {
+    cfd->UnrefAndTryDelete();
+  }
+
+  // GC is opportunistic. A failed/skipped GC should not poison the DB; the
+  // regular flush path remains responsible for durability and space release.
+  if (!s.ok()) {
+    s.PermitUncheckedError();
+    return Status::OK();
+  }
+  return s;
+}
+
+void DBImpl::BackgroundCallMemTableGC(Env::Priority thread_pri) {
+  bool made_progress = false;
+  JobContext job_context(next_job_id_.fetch_add(1), false);
+  LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL,
+                       immutable_db_options_.info_log.get());
+
+  {
+    InstrumentedMutexLock l(&mutex_);
+    assert(bg_flush_scheduled_);
+    num_running_flushes_++;
+
+    Status s = BackgroundMemTableGC(&made_progress, &job_context, &log_buffer);
+    s.PermitUncheckedError();
+
+    if (job_context.HaveSomethingToClean() || !log_buffer.IsEmpty()) {
+      mutex_.Unlock();
+      log_buffer.FlushBufferToLog();
+      job_context.Clean();
+      mutex_.Lock();
+    }
+
+    assert(num_running_flushes_ > 0);
+    num_running_flushes_--;
+    bg_flush_scheduled_--;
+    MaybeScheduleFlushOrCompaction();
+
+    NotifyOnBackgroundJobPressureChanged();
+
+    bg_cv_.SignalAll();
+  }
+  (void)thread_pri;
+  (void)made_progress;
 }
 
 Status DBImpl::BackgroundFlush(bool* made_progress, JobContext* job_context,

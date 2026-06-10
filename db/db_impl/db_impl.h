@@ -2408,6 +2408,9 @@ class DBImpl : public DB {
                                       WriteBatch* my_batch);
 
   // REQUIRES: mutex locked and in write thread.
+  Status ScheduleMemTableGC(WriteContext* context);
+
+  // REQUIRES: mutex locked and in write thread.
   Status ScheduleFlushes(WriteContext* context);
 
   void MaybeFlushStatsCF(autovector<ColumnFamilyData*>* cfds);
@@ -2630,6 +2633,11 @@ class DBImpl : public DB {
 #endif /* !NDEBUG */
   };
 
+  struct MemTableGCRequest {
+    ColumnFamilyData* cfd = nullptr;
+    MemTable* mem = nullptr;
+  };
+
   // In case of atomic flush, generates a `FlushRequest` for the latest atomic
   // cuts for these `cfds`. Atomic cuts are recorded in
   // `AssignAtomicFlushSeq()`. For each entry in `cfds`, all CFDs sharing the
@@ -2658,6 +2666,7 @@ class DBImpl : public DB {
 
   // Returns true if `req` is successfully enqueued.
   bool EnqueuePendingFlush(const FlushRequest& req);
+  bool EnqueuePendingMemTableGC(ColumnFamilyData* cfd, MemTable* mem);
 
   void EnqueuePendingCompaction(ColumnFamilyData* cfd);
   void SchedulePendingPurge(std::string fname, std::string dir_to_sync,
@@ -2666,12 +2675,14 @@ class DBImpl : public DB {
   // Runs a pre-chosen universal compaction involving bottom level in a
   // separate, bottom-pri thread pool.
   static void BGWorkBottomCompaction(void* arg);
+  static void BGWorkMemTableGC(void* arg);
   static void BGWorkFlush(void* arg);
   static void BGWorkPurge(void* arg);
   static void UnscheduleCompactionCallback(void* arg);
   static void UnscheduleFlushCallback(void* arg);
   void BackgroundCallCompaction(PrepickedCompaction* prepicked_compaction,
                                 Env::Priority thread_pri);
+  void BackgroundCallMemTableGC(Env::Priority thread_pri);
   void BackgroundCallFlush(Env::Priority thread_pri);
   void BackgroundCallPurge();
   Status BackgroundCompaction(bool* madeProgress, JobContext* job_context,
@@ -2682,6 +2693,8 @@ class DBImpl : public DB {
                          LogBuffer* log_buffer, FlushReason* reason,
                          bool* flush_rescheduled_to_retain_udt,
                          Env::Priority thread_pri);
+  Status BackgroundMemTableGC(bool* madeProgress, JobContext* job_context,
+                              LogBuffer* log_buffer);
 
   Compaction* CreateIntendedCompactionForwardedToBottomPriorityPool(
       Compaction* c);
@@ -3293,6 +3306,8 @@ class DBImpl : public DB {
 
   FlushScheduler flush_scheduler_;
 
+  FlushScheduler memtable_gc_scheduler_;
+
   TrimHistoryScheduler trim_history_scheduler_;
 
   SnapshotList snapshots_;
@@ -3336,6 +3351,7 @@ class DBImpl : public DB {
   // invariant(column family present in flush_queue_ <==>
   // ColumnFamilyData::pending_flush_ == true)
   std::deque<FlushRequest> flush_queue_;
+  std::deque<MemTableGCRequest> memtable_gc_queue_;
   // invariant(column family present in compaction_queue_ <==>
   // ColumnFamilyData::pending_compaction_ == true)
   std::deque<ColumnFamilyData*> compaction_queue_;
@@ -3353,6 +3369,8 @@ class DBImpl : public DB {
   std::deque<SuperVersion*> superversions_to_free_queue_;
 
   int unscheduled_flushes_ = 0;
+
+  int unscheduled_memtable_gcs_ = 0;
 
   int unscheduled_compactions_ = 0;
 

@@ -645,8 +645,9 @@ whitebox_default_params = {
 simple_default_params = {
     "allow_concurrent_memtable_write": lambda: random.randint(0, 1),
     "column_families": 1,
-    # TODO: re-enable once internal task T124324915 is fixed.
-    # "experimental_mempurge_threshold": lambda: 10.0*random.random(),
+    "experimental_mempurge_threshold": lambda: (
+        random.uniform(0.25, 0.95) if random.random() < 2.0 / 3.0 else 0.0
+    ),
     "max_background_compactions": 1,
     "max_bytes_for_level_base": 67108864,
     "memtablerep": "skip_list",
@@ -682,7 +683,7 @@ cf_consistency_params = {
     "ingest_external_file_one_in": 0,
     # `CfConsistencyStressTest::TestIterateAgainstExpected()` is not implemented.
     "verify_iterator_with_expected_state_one_in": 0,
-    "memtablerep": random.choice(["skip_list"] * 9 + ["vector"]),
+    "memtablerep": random.choice(["skip_list"] * 9 + ["vector", "vectorgc"]),
 }
 
 # For pessimistic transaction db
@@ -1060,7 +1061,16 @@ def finalize_and_sanitize(src_params):
         dest_params["ingest_external_file_one_in"] = 0
         dest_params["ingest_wbwi_one_in"] = 0
 
-    if dest_params.get("memtablerep") == "vector":
+    if dest_params.get("experimental_mempurge_threshold", 0.0) > 0.0:
+        dest_params["memtablerep"] = "vectorgc"
+        # vectorgc runs GC inside the mutable memtable before flush. Keep atomic
+        # flush out of the initial crash-test envelope while this path is still
+        # experimental.
+        dest_params["atomic_flush"] = 0
+        dest_params["checkpoint_atomic_flush"] = 0
+        dest_params["disable_wal"] = 0
+
+    if dest_params.get("memtablerep") in ("vector", "vectorgc"):
         dest_params["inplace_update_support"] = 0
 
     # only skip list memtable representation supports paranoid memory checks

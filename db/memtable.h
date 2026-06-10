@@ -415,6 +415,28 @@ class ReadOnlyMemTable {
     flush_in_progress_ = in_progress;
   }
 
+  // Marks this memtable as being processed by an in-memory GC job.
+  // While this bit is set, younger immutable memtables in the same column
+  // family must not be picked for flush.
+  void SetMemTableGCInProgress(bool in_progress) {
+    mem_purge_in_progress_ = in_progress;
+  }
+
+  bool IsMemTableGCInProgress() const { return mem_purge_in_progress_; }
+
+  // Compatibility wrappers for the old MemPurge prototype.
+  void SetMemPurgeInProgress(bool in_progress) {
+    SetMemTableGCInProgress(in_progress);
+  }
+
+  bool IsMemPurgeInProgress() const { return mem_purge_in_progress_; }
+
+  void SetMemPurgeOutput(bool mem_purge_output) {
+    mem_purge_output_ = mem_purge_output;
+  }
+
+  bool IsMemPurgeOutput() const { return mem_purge_output_; }
+
   void SetFlushJobInfo(std::unique_ptr<FlushJobInfo>&& info) {
     flush_job_info_ = std::move(info);
   }
@@ -547,6 +569,8 @@ class ReadOnlyMemTable {
   bool flush_in_progress_{false};  // started the flush
   bool flush_completed_{false};    // finished the flush
   uint64_t file_number_{0};
+  bool mem_purge_in_progress_{false};
+  bool mem_purge_output_{false};
 
   // The updates to be applied to the transaction log when this
   // memtable is flushed to storage.
@@ -646,6 +670,39 @@ class MemTable final : public ReadOnlyMemTable {
   bool HasFlushScheduled() const {
     return flush_state_.load(std::memory_order_relaxed) == FLUSH_SCHEDULED;
   }
+
+  bool ShouldScheduleMemTableGC(double experimental_mempurge_threshold);
+
+  bool MarkMemTableGCScheduled() {
+    auto before = memtable_gc_state_.load(std::memory_order_relaxed);
+    while (before == MEMTABLE_GC_NOT_REQUESTED || before == MEMTABLE_GC_DONE) {
+      if (memtable_gc_state_.compare_exchange_weak(
+              before, MEMTABLE_GC_SCHEDULED, std::memory_order_relaxed,
+              std::memory_order_relaxed)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool MarkMemTableGCInProgress() {
+    auto before = MEMTABLE_GC_SCHEDULED;
+    return memtable_gc_state_.compare_exchange_strong(
+        before, MEMTABLE_GC_IN_PROGRESS, std::memory_order_relaxed,
+        std::memory_order_relaxed);
+  }
+
+  bool HasMemTableGCScheduledOrInProgress() const {
+    auto state = memtable_gc_state_.load(std::memory_order_relaxed);
+    return state == MEMTABLE_GC_SCHEDULED || state == MEMTABLE_GC_IN_PROGRESS;
+  }
+
+  void MarkMemTableGCDone() {
+    memtable_gc_state_.store(MEMTABLE_GC_DONE, std::memory_order_relaxed);
+  }
+
+  Status GarbageCollect(const std::vector<SequenceNumber>& snapshot_seqs,
+                        double experimental_mempurge_threshold);
 
   InternalIterator* NewIterator(
       const ReadOptions& read_options,
@@ -898,6 +955,12 @@ class MemTable final : public ReadOnlyMemTable {
 
  private:
   enum FlushStateEnum { FLUSH_NOT_REQUESTED, FLUSH_REQUESTED, FLUSH_SCHEDULED };
+  enum MemTableGCStateEnum {
+    MEMTABLE_GC_NOT_REQUESTED,
+    MEMTABLE_GC_SCHEDULED,
+    MEMTABLE_GC_IN_PROGRESS,
+    MEMTABLE_GC_DONE
+  };
 
   friend class MemTableIterator;
   friend class MemTableBackwardIterator;
@@ -956,6 +1019,11 @@ class MemTable final : public ReadOnlyMemTable {
   std::unique_ptr<DynamicBloom> bloom_filter_;
 
   std::atomic<FlushStateEnum> flush_state_;
+  std::atomic<MemTableGCStateEnum> memtable_gc_state_;
+  // Retry watermark after a GC pass finds too little garbage. This keeps
+  // subsequent writes from relaunching scans until enough new data has arrived
+  // for the threshold to be achievable.
+  std::atomic<uint64_t> memtable_gc_next_retry_data_size_;
 
   SystemClock* clock_;
 
@@ -987,6 +1055,7 @@ class MemTable final : public ReadOnlyMemTable {
 
   // Updates flush_state_ using ShouldFlushNow()
   void UpdateFlushState();
+  void RefreshFlushStateAfterMemTableGC();
 
   void UpdateOldestKeyTime();
 

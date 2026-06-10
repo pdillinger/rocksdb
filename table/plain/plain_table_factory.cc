@@ -166,6 +166,20 @@ static int RegisterBuiltinMemTableRepFactory(ObjectLibrary& library,
         return guard->get();
       });
   library.AddFactory<MemTableRepFactory>(
+      AsPattern(VectorGCRepFactory::kClassName(),
+                VectorGCRepFactory::kNickName()),
+      [](const std::string& uri, std::unique_ptr<MemTableRepFactory>* guard,
+         std::string* /*errmsg*/) {
+        auto colon = uri.find(':');
+        if (colon != std::string::npos) {
+          size_t count = ParseSizeT(uri.substr(colon + 1));
+          guard->reset(new VectorGCRepFactory(count));
+        } else {
+          guard->reset(new VectorGCRepFactory());
+        }
+        return guard->get();
+      });
+  library.AddFactory<MemTableRepFactory>(
       AsPattern(SkipListFactory::kClassName(), SkipListFactory::kNickName()),
       [](const std::string& uri, std::unique_ptr<MemTableRepFactory>* guard,
          std::string* /*errmsg*/) {

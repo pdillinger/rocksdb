@@ -316,6 +316,39 @@ void MemTableListVersion::Add(ReadOnlyMemTable* m,
   TrimHistory(to_delete, 0);
 }
 
+void MemTableListVersion::Replace(const autovector<ReadOnlyMemTable*>& old_mems,
+                                  ReadOnlyMemTable* new_mem,
+                                  autovector<ReadOnlyMemTable*>* to_delete) {
+  assert(refs_ == 1);  // only when refs_ == 1 is MemTableListVersion mutable
+  assert(!old_mems.empty());
+  ReadOnlyMemTable* newest_old_mem = old_mems.back();
+  assert(new_mem->GetID() == newest_old_mem->GetID());
+  auto is_old_mem = [&old_mems](ReadOnlyMemTable* mem) {
+    return std::find(old_mems.begin(), old_mems.end(), mem) != old_mems.end();
+  };
+
+  new_mem->Ref();
+  *parent_memtable_list_memory_usage_ += new_mem->ApproximateMemoryUsage();
+  size_t replaced = 0;
+  for (auto it = memlist_.begin(); it != memlist_.end();) {
+    ReadOnlyMemTable* mem = *it;
+    if (mem == newest_old_mem) {
+      *it = new_mem;
+      ++it;
+      UnrefMemTable(to_delete, mem);
+      ++replaced;
+    } else if (is_old_mem(mem)) {
+      it = memlist_.erase(it);
+      UnrefMemTable(to_delete, mem);
+      ++replaced;
+    } else {
+      ++it;
+    }
+  }
+  assert(replaced == old_mems.size());
+  (void)replaced;
+}
+
 // Removes m from list of memtables not flushed.  Caller should NOT Unref m.
 void MemTableListVersion::Remove(ReadOnlyMemTable* m,
                                  autovector<ReadOnlyMemTable*>* to_delete) {
@@ -393,8 +426,9 @@ Slice MemTableListVersion::GetNewestUDT() const {
 // Returns true if there is at least one memtable on which flush has
 // not yet started.
 bool MemTableList::IsFlushPending() const {
-  if ((flush_requested_ && num_flush_not_started_ > 0) ||
-      (num_flush_not_started_ >= min_write_buffer_number_to_merge_)) {
+  const int num_flushable_not_started = NumFlushableNotStarted();
+  if ((flush_requested_ && num_flushable_not_started > 0) ||
+      (num_flushable_not_started >= min_write_buffer_number_to_merge_)) {
     assert(imm_flush_needed.load(std::memory_order_relaxed));
     return true;
   }
@@ -407,6 +441,24 @@ bool MemTableList::IsFlushPendingOrRunning() const {
     return true;
   }
   return IsFlushPending();
+}
+
+int MemTableList::NumFlushableNotStarted() const {
+  int count = 0;
+  const auto& memlist = current_->memlist_;
+  for (auto it = memlist.rbegin(); it != memlist.rend(); ++it) {
+    ReadOnlyMemTable* m = *it;
+    if (m->IsMemPurgeInProgress()) {
+      break;
+    }
+    if (!m->flush_in_progress_) {
+      assert(!m->flush_completed_);
+      ++count;
+    } else if (count > 0) {
+      break;
+    }
+  }
+  return count;
 }
 
 // Returns the memtables that need to be flushed.
@@ -425,12 +477,17 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
   // However, when the mempurge feature is activated, new memtables with older
   // IDs will be added to the memlist.
   auto it = memlist.rbegin();
+  bool stopped_by_mempurge = false;
   for (; it != memlist.rend(); ++it) {
     ReadOnlyMemTable* m = *it;
     if (!atomic_flush && m->atomic_flush_seqno_ != kMaxSequenceNumber) {
       atomic_flush = true;
     }
     if (m->GetID() > max_memtable_id) {
+      break;
+    }
+    if (m->IsMemPurgeInProgress()) {
+      stopped_by_mempurge = true;
       break;
     }
     if (!m->flush_in_progress_) {
@@ -460,7 +517,7 @@ void MemTableList::PickMemtablesToFlush(uint64_t max_memtable_id,
     // since they map to the same WAL and have the same NextLogNumber().
     assert(strcmp((*it)->Name(), "WBWIMemTable") != 0);
   }
-  if (!atomic_flush || num_flush_not_started_ == 0) {
+  if ((!atomic_flush || num_flush_not_started_ == 0) && !stopped_by_mempurge) {
     flush_requested_ = false;  // start-flush request is complete
   }
 }
@@ -682,6 +739,50 @@ void MemTableList::Add(ReadOnlyMemTable* m,
   }
   UpdateCachedValuesFromMemTableListVersion();
   ResetTrimHistoryNeeded();
+}
+
+Status MemTableList::ReplaceForMemPurge(
+    const autovector<ReadOnlyMemTable*>& old_mems, ReadOnlyMemTable* new_mem,
+    autovector<ReadOnlyMemTable*>* to_delete) {
+  assert(!old_mems.empty());
+  ReadOnlyMemTable* newest_old_mem = old_mems.back();
+  assert(static_cast<int>(current_->memlist_.size()) >= num_flush_not_started_);
+  for (ReadOnlyMemTable* old_mem : old_mems) {
+    assert(old_mem->flush_in_progress_);
+    assert(old_mem->IsMemPurgeInProgress());
+    assert(!old_mem->flush_completed_);
+    assert(old_mem->file_number_ == 0);
+  }
+  assert(!new_mem->flush_in_progress_);
+  assert(!new_mem->flush_completed_);
+  assert(new_mem->file_number_ == 0);
+
+  for (auto it = current_->memlist_.begin(); it != current_->memlist_.end();
+       ++it) {
+    if (*it == newest_old_mem) {
+      break;
+    }
+    if ((*it)->flush_in_progress_ || (*it)->flush_completed_) {
+      return Status::Aborted(
+          "Mempurge output would be older than an already running flush.");
+    }
+  }
+
+  InstallNewVersion();
+  current_->Replace(old_mems, new_mem, to_delete);
+  for (ReadOnlyMemTable* old_mem : old_mems) {
+    old_mem->flush_in_progress_ = false;
+    old_mem->flush_completed_ = false;
+    old_mem->edit_.Clear();
+    old_mem->file_number_ = 0;
+  }
+  num_flush_not_started_++;
+  if (num_flush_not_started_ > 0) {
+    imm_flush_needed.store(true, std::memory_order_release);
+  }
+  UpdateCachedValuesFromMemTableListVersion();
+  ResetTrimHistoryNeeded();
+  return Status::OK();
 }
 
 bool MemTableList::TrimHistory(autovector<ReadOnlyMemTable*>* to_delete,

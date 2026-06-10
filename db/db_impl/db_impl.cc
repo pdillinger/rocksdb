@@ -836,6 +836,7 @@ Status DBImpl::CloseHelper() {
                            &files_grabbed_for_purge_);
   EraseThreadStatusDbInfo();
   flush_scheduler_.Clear();
+  memtable_gc_scheduler_.Clear();
   trim_history_scheduler_.Clear();
 
   while (!flush_queue_.empty()) {
@@ -844,6 +845,21 @@ Status DBImpl::CloseHelper() {
       iter.first->UnrefAndTryDelete();
     }
   }
+
+  while (!memtable_gc_queue_.empty()) {
+    MemTableGCRequest req = memtable_gc_queue_.front();
+    memtable_gc_queue_.pop_front();
+    if (req.mem != nullptr) {
+      req.mem->SetMemTableGCInProgress(false);
+      req.mem->MarkMemTableGCDone();
+      ReadOnlyMemTable* mem_to_free = req.mem->Unref();
+      delete mem_to_free;
+    }
+    if (req.cfd != nullptr) {
+      req.cfd->UnrefAndTryDelete();
+    }
+  }
+  unscheduled_memtable_gcs_ = 0;
 
   while (!compaction_queue_.empty()) {
     auto cfd = PopFirstFromCompactionQueue();

@@ -3905,6 +3905,9 @@ void StressTest::PrintEnv() const {
     case kVectorRep:
       memtablerep = "vector";
       break;
+    case kVectorGCRep:
+      memtablerep = "vectorgc";
+      break;
   }
 
   fprintf(stdout, "Memtablerep               : %s\n", memtablerep);
@@ -5219,6 +5222,9 @@ void InitializeOptionsFromFlags(
       break;
     case kVectorRep:
       options.memtable_factory.reset(new VectorRepFactory());
+      break;
+    case kVectorGCRep:
+      options.memtable_factory.reset(new VectorGCRepFactory());
       break;
   }
 

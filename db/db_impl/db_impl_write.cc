@@ -1114,7 +1114,8 @@ Status DBImpl::WriteImpl(
           &trim_history_scheduler_,
           write_options.ignore_missing_column_families, 0 /*log_number*/, this,
           true /*concurrent_memtable_writes*/, seq_per_batch_, w.batch_cnt,
-          batch_per_txn_, write_options.memtable_insert_hint_per_batch);
+          batch_per_txn_, write_options.memtable_insert_hint_per_batch,
+          &memtable_gc_scheduler_);
 
       PERF_TIMER_START(write_pre_and_post_process_time);
     }
@@ -1456,7 +1457,8 @@ Status DBImpl::WriteImpl(
             write_group, current_sequence, column_family_memtables_.get(),
             &flush_scheduler_, &trim_history_scheduler_,
             write_options.ignore_missing_column_families,
-            0 /*recovery_log_number*/, this, seq_per_batch_, batch_per_txn_);
+            0 /*recovery_log_number*/, this, seq_per_batch_, batch_per_txn_,
+            &memtable_gc_scheduler_);
       } else {
         write_group.last_sequence = last_sequence;
         write_thread_.LaunchParallelMemTableWriters(&write_group);
@@ -1474,7 +1476,8 @@ Status DBImpl::WriteImpl(
               write_options.ignore_missing_column_families, 0 /*log_number*/,
               this, true /*concurrent_memtable_writes*/, seq_per_batch_,
               w.batch_cnt, batch_per_txn_,
-              write_options.memtable_insert_hint_per_batch);
+              write_options.memtable_insert_hint_per_batch,
+              &memtable_gc_scheduler_);
         }
       }
       if (seq_used != nullptr) {
@@ -1721,7 +1724,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
           memtable_write_group, w.sequence, column_family_memtables_.get(),
           &flush_scheduler_, &trim_history_scheduler_,
           write_options.ignore_missing_column_families, 0 /*log_number*/, this,
-          seq_per_batch_, batch_per_txn_);
+          seq_per_batch_, batch_per_txn_, &memtable_gc_scheduler_);
       if (memtable_write_group.status
               .ok()) {  // Don't publish a partial batch write
         versions_->SetLastSequence(memtable_write_group.last_sequence);
@@ -1750,7 +1753,7 @@ Status DBImpl::PipelinedWriteImpl(const WriteOptions& write_options,
         &trim_history_scheduler_, write_options.ignore_missing_column_families,
         0 /*log_number*/, this, true /*concurrent_memtable_writes*/,
         false /*seq_per_batch*/, 0 /*batch_cnt*/, true /*batch_per_txn*/,
-        write_options.memtable_insert_hint_per_batch);
+        write_options.memtable_insert_hint_per_batch, &memtable_gc_scheduler_);
 
     PERF_TIMER_STOP(write_memtable_time);
     PERF_TIMER_START(write_pre_and_post_process_time);
@@ -1801,7 +1804,7 @@ Status DBImpl::UnorderedWriteMemtable(const WriteOptions& write_options,
         &trim_history_scheduler_, write_options.ignore_missing_column_families,
         0 /*log_number*/, this, true /*concurrent_memtable_writes*/,
         seq_per_batch_, sub_batch_cnt, true /*batch_per_txn*/,
-        write_options.memtable_insert_hint_per_batch);
+        write_options.memtable_insert_hint_per_batch, &memtable_gc_scheduler_);
     if (write_options.disableWAL) {
       has_unpersisted_data_.store(true, std::memory_order_relaxed);
     }
@@ -2140,6 +2143,11 @@ Status DBImpl::PreprocessWrite(const WriteOptions& write_options,
   if (UNLIKELY(status.ok() && !trim_history_scheduler_.Empty())) {
     InstrumentedMutexLock l(&mutex_);
     status = TrimMemtableHistory(write_context);
+  }
+
+  if (UNLIKELY(status.ok() && !memtable_gc_scheduler_.Empty())) {
+    InstrumentedMutexLock l(&mutex_);
+    status = ScheduleMemTableGC(write_context);
   }
 
   if (UNLIKELY(status.ok() && !flush_scheduler_.Empty())) {
@@ -2513,7 +2521,8 @@ Status DBImpl::WriteRecoverableState() {
         &cached_recoverable_state_, column_family_memtables_.get(),
         &flush_scheduler_, &trim_history_scheduler_, true,
         0 /*recovery_log_number*/, this, false /* concurrent_memtable_writes */,
-        &next_seq, &dont_care_bool, seq_per_batch_);
+        &next_seq, &dont_care_bool, seq_per_batch_, true /* batch_per_txn */,
+        &memtable_gc_scheduler_);
     auto last_seq = next_seq - 1;
     if (status.ok()) {  // Don't publish a partial batch write
       if (two_write_queues_) {
@@ -3024,6 +3033,22 @@ Status DBImpl::TrimMemtableHistory(WriteContext* context) {
       cfd = nullptr;
     }
   }
+  return Status::OK();
+}
+
+Status DBImpl::ScheduleMemTableGC(WriteContext* /*context*/) {
+  mutex_.AssertHeld();
+  ColumnFamilyData* tmp_cfd;
+  while ((tmp_cfd = memtable_gc_scheduler_.TakeNextColumnFamily()) != nullptr) {
+    MemTable* mem = tmp_cfd->mem();
+    if (mem != nullptr && mem->MarkMemTableGCInProgress()) {
+      if (!EnqueuePendingMemTableGC(tmp_cfd, mem)) {
+        mem->MarkMemTableGCDone();
+      }
+    }
+    tmp_cfd->UnrefAndTryDelete();
+  }
+  MaybeScheduleFlushOrCompaction();
   return Status::OK();
 }
 

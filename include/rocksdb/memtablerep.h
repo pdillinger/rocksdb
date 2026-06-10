@@ -41,7 +41,9 @@
 #include <functional>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "rocksdb/customizable.h"
 #include "rocksdb/slice.h"
@@ -338,6 +340,33 @@ class MemTableRep {
     return GetIterator(arena);
   }
 
+  struct GarbageCollectionStats {
+    uint64_t entries = 0;
+    uint64_t deletes = 0;
+    uint64_t data_size = 0;
+  };
+
+  class GarbageCollectionContext {
+   public:
+    virtual ~GarbageCollectionContext() {}
+
+    virtual Iterator* NewIterator(Arena* arena = nullptr) = 0;
+    virtual KeyHandle Allocate(const size_t len, char** buf) = 0;
+    virtual void Insert(KeyHandle handle) = 0;
+    virtual const GarbageCollectionStats& InputStats() const = 0;
+    virtual Status Finish() = 0;
+    virtual void Abort() = 0;
+  };
+
+  virtual bool SupportsGarbageCollection() const { return false; }
+
+  // Starts a best-effort in-memory garbage collection pass. Implementations
+  // that support it must make later writes land outside the returned input
+  // snapshot so the caller can compact the snapshot concurrently.
+  virtual std::unique_ptr<GarbageCollectionContext> StartGarbageCollection() {
+    return nullptr;
+  }
+
   // Return true if the current MemTableRep supports merge operator.
   // Default: true
   virtual bool IsMergeOperatorSupported() const { return true; }
@@ -445,6 +474,31 @@ class VectorRepFactory : public MemTableRepFactory {
   // Methods for Configurable/Customizable class overrides
   static const char* kClassName() { return "VectorRepFactory"; }
   static const char* kNickName() { return "vector"; }
+  const char* Name() const override { return kClassName(); }
+  const char* NickName() const override { return kNickName(); }
+
+  // Methods for MemTableRepFactory class overrides
+  using MemTableRepFactory::CreateMemTableRep;
+  MemTableRep* CreateMemTableRep(const MemTableRep::KeyComparator&, Allocator*,
+                                 const SliceTransform*,
+                                 Logger* logger) override;
+
+  bool IsInsertConcurrentlySupported() const override { return true; }
+};
+
+// This creates MemTableReps backed by a vector of owned entry segments. It is
+// intended for the experimental vectorgc path, where a background GC pass can
+// publish compacted segments while existing iterators keep pre-GC segments
+// alive.
+class VectorGCRepFactory : public MemTableRepFactory {
+  size_t count_;
+
+ public:
+  explicit VectorGCRepFactory(size_t count = 0);
+
+  // Methods for Configurable/Customizable class overrides
+  static const char* kClassName() { return "VectorGCRepFactory"; }
+  static const char* kNickName() { return "vectorgc"; }
   const char* Name() const override { return kClassName(); }
   const char* NickName() const override { return kNickName(); }
 

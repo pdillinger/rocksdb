@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -132,6 +133,31 @@ Status MergeWithWideColumnEntityBaseValue(
       columns);
 }
 
+double NormalizeMemTableGCUsefulPayloadRatio(double threshold) {
+  // The existing option is kept as the knob, but interpreted here as the
+  // maximum useful-payload ratio worth attempting to GC. Keep the effective
+  // ratio below 1.0 so the option does not mean "GC even when the whole
+  // memtable is useful."
+  constexpr double kMaxUsefulPayloadRatioForGC = 0.95;
+  if (!(threshold > 0.0)) {
+    return 0.0;
+  }
+  return std::min(kMaxUsefulPayloadRatioForGC, std::max(0.0, threshold));
+}
+
+uint64_t ComputeMemTableGCNextRetryDataSize(uint64_t useful_payload_size,
+                                            double useful_payload_ratio) {
+  if (useful_payload_size == 0 || !(useful_payload_ratio > 0.0)) {
+    return 0;
+  }
+  const double next_retry = std::ceil(static_cast<double>(useful_payload_size) /
+                                      useful_payload_ratio);
+  if (next_retry >= static_cast<double>(std::numeric_limits<uint64_t>::max())) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return static_cast<uint64_t>(next_retry);
+}
+
 }  // namespace
 
 ImmutableMemTableOptions::ImmutableMemTableOptions(
@@ -247,6 +273,8 @@ MemTable::MemTable(const InternalKeyComparator& cmp,
                  : 0),
       prefix_extractor_(mutable_cf_options.prefix_extractor.get()),
       flush_state_(FLUSH_NOT_REQUESTED),
+      memtable_gc_state_(MEMTABLE_GC_NOT_REQUESTED),
+      memtable_gc_next_retry_data_size_(0),
       clock_(ioptions.clock),
       insert_with_hint_prefix_extractor_(
           ioptions.memtable_insert_with_hint_prefix_extractor.get()),
@@ -390,6 +418,46 @@ bool MemTable::ShouldFlushNow() {
   return arena_.AllocatedAndUnused() < kArenaBlockSize / 4;
 }
 
+bool MemTable::ShouldScheduleMemTableGC(
+    double experimental_mempurge_threshold) {
+  const double useful_payload_ratio =
+      NormalizeMemTableGCUsefulPayloadRatio(experimental_mempurge_threshold);
+  if (!(useful_payload_ratio > 0.0) || !table_->SupportsGarbageCollection() ||
+      ts_sz_ != 0 || IsMarkedForFlush() || is_immutable_.LoadRelaxed()) {
+    return false;
+  }
+
+  const auto gc_state = memtable_gc_state_.load(std::memory_order_relaxed);
+  if (gc_state == MEMTABLE_GC_SCHEDULED ||
+      gc_state == MEMTABLE_GC_IN_PROGRESS) {
+    return false;
+  }
+
+  // If a flush is already requested, keep the normal flush path moving. GC is
+  // intended to start before the memtable reaches the full flush threshold.
+  if (flush_state_.load(std::memory_order_relaxed) != FLUSH_NOT_REQUESTED) {
+    return false;
+  }
+
+  size_t write_buffer_size = write_buffer_size_.LoadRelaxed();
+  if (write_buffer_size == 0) {
+    return false;
+  }
+
+  if (data_size_.LoadRelaxed() <
+      memtable_gc_next_retry_data_size_.load(std::memory_order_relaxed)) {
+    return false;
+  }
+
+  const double gc_trigger_ratio = 1.0 / (1.0 + useful_payload_ratio);
+
+  const size_t allocated_memory =
+      table_->ApproximateMemoryUsage() + arena_.MemoryAllocatedBytes();
+  approximate_memory_usage_.StoreRelaxed(allocated_memory);
+  return static_cast<double>(allocated_memory) >=
+         static_cast<double>(write_buffer_size) * gc_trigger_ratio;
+}
+
 void MemTable::UpdateFlushState() {
   auto state = flush_state_.load(std::memory_order_relaxed);
   if (state == FLUSH_NOT_REQUESTED && ShouldFlushNow()) {
@@ -399,6 +467,17 @@ void MemTable::UpdateFlushState() {
                                          std::memory_order_relaxed,
                                          std::memory_order_relaxed);
   }
+}
+
+void MemTable::RefreshFlushStateAfterMemTableGC() {
+  auto state = flush_state_.load(std::memory_order_relaxed);
+  if (state == FLUSH_REQUESTED && !ShouldFlushNow()) {
+    flush_state_.compare_exchange_strong(state, FLUSH_NOT_REQUESTED,
+                                         std::memory_order_relaxed,
+                                         std::memory_order_relaxed);
+    return;
+  }
+  UpdateFlushState();
 }
 
 void MemTable::UpdateOldestKeyTime() {
@@ -1292,6 +1371,181 @@ Status MemTable::Add(SequenceNumber s, ValueType type,
 
   TEST_SYNC_POINT_CALLBACK("MemTable::Add:BeforeReturn:Encoded", &encoded);
   return Status::OK();
+}
+
+Status MemTable::GarbageCollect(
+    const std::vector<SequenceNumber>& snapshot_seqs,
+    double experimental_mempurge_threshold) {
+  const double useful_payload_ratio =
+      NormalizeMemTableGCUsefulPayloadRatio(experimental_mempurge_threshold);
+  if (!(useful_payload_ratio > 0.0)) {
+    return Status::Aborted("memtable GC is disabled");
+  }
+  if (ts_sz_ != 0) {
+    memtable_gc_next_retry_data_size_.store(
+        std::numeric_limits<uint64_t>::max(), std::memory_order_relaxed);
+    return Status::Aborted(
+        "memtable GC does not yet support user-defined timestamps");
+  }
+
+  std::unique_ptr<MemTableRep::GarbageCollectionContext> gc =
+      table_->StartGarbageCollection();
+  if (gc == nullptr) {
+    return Status::Aborted("memtable representation does not support GC now");
+  }
+
+  const Comparator* const ucmp = comparator_.comparator.user_comparator();
+  assert(ucmp);
+  std::vector<SequenceNumber> snapshots = snapshot_seqs;
+  std::sort(snapshots.begin(), snapshots.end());
+  snapshots.erase(std::unique(snapshots.begin(), snapshots.end()),
+                  snapshots.end());
+  std::vector<SequenceNumber> snapshots_desc(snapshots.rbegin(),
+                                             snapshots.rend());
+
+  struct GCEntry {
+    const char* entry = nullptr;
+    ParsedInternalKey ikey;
+    size_t encoded_len = 0;
+    bool keep = false;
+  };
+
+  auto encoded_entry_len = [this](const char* entry) {
+    Slice key_slice = GetLengthPrefixedSlice(entry);
+    Slice value_slice =
+        GetLengthPrefixedSlice(key_slice.data() + key_slice.size());
+    return static_cast<size_t>(value_slice.data() + value_slice.size() -
+                               entry) +
+           moptions_.protection_bytes_per_key;
+  };
+
+  auto copy_entry = [&gc](const GCEntry& entry,
+                          MemTableRep::GarbageCollectionStats* stats) {
+    char* buf = nullptr;
+    KeyHandle handle = gc->Allocate(entry.encoded_len, &buf);
+    memcpy(buf, entry.entry, entry.encoded_len);
+    gc->Insert(handle);
+    ++stats->entries;
+    stats->data_size += entry.encoded_len;
+    if (entry.ikey.type == kTypeDeletion ||
+        entry.ikey.type == kTypeSingleDeletion ||
+        entry.ikey.type == kTypeDeletionWithTimestamp) {
+      ++stats->deletes;
+    }
+  };
+
+  std::unique_ptr<MemTableRep::Iterator> iter(gc->NewIterator());
+  iter->SeekToFirst();
+  Status s;
+  MemTableRep::GarbageCollectionStats output_stats;
+  std::vector<GCEntry> group;
+  while (iter->Valid()) {
+    group.clear();
+    ParsedInternalKey first_ikey;
+    Slice first_key = GetLengthPrefixedSlice(iter->key());
+    s = ParseInternalKey(first_key, &first_ikey, true /* log_err_key */);
+    if (!s.ok()) {
+      break;
+    }
+
+    do {
+      Slice key_slice = GetLengthPrefixedSlice(iter->key());
+      ParsedInternalKey ikey;
+      s = ParseInternalKey(key_slice, &ikey, true /* log_err_key */);
+      if (!s.ok()) {
+        break;
+      }
+      if (ucmp->CompareWithoutTimestamp(ikey.user_key, first_ikey.user_key) !=
+          0) {
+        break;
+      }
+      GCEntry entry;
+      entry.entry = iter->key();
+      entry.ikey = ikey;
+      entry.encoded_len = encoded_entry_len(iter->key());
+      group.push_back(entry);
+      iter->Next();
+    } while (iter->Valid());
+    if (!s.ok()) {
+      break;
+    }
+
+    bool keep_all = false;
+    for (const auto& entry : group) {
+      if (entry.ikey.type == kTypeMerge || !IsValueType(entry.ikey.type)) {
+        keep_all = true;
+        break;
+      }
+    }
+
+    if (keep_all) {
+      for (auto& entry : group) {
+        entry.keep = true;
+      }
+    } else if (!group.empty()) {
+      group[0].keep = true;
+      for (SequenceNumber snapshot : snapshots_desc) {
+        for (auto& entry : group) {
+          if (entry.ikey.sequence <= snapshot) {
+            entry.keep = true;
+            break;
+          }
+        }
+      }
+    }
+
+    for (const auto& entry : group) {
+      if (entry.keep) {
+        copy_entry(entry, &output_stats);
+      }
+    }
+  }
+
+  if (s.ok()) {
+    const auto& input_stats = gc->InputStats();
+    const auto defer_retry =
+        [this, useful_payload_ratio](uint64_t useful_payload_size) {
+          memtable_gc_next_retry_data_size_.store(
+              ComputeMemTableGCNextRetryDataSize(useful_payload_size,
+                                                 useful_payload_ratio),
+              std::memory_order_relaxed);
+        };
+
+    if (input_stats.data_size == 0 ||
+        output_stats.data_size >= input_stats.data_size) {
+      defer_retry(input_stats.data_size);
+      s = Status::Aborted("memtable GC found no point-entry garbage");
+    } else if (static_cast<double>(output_stats.data_size) >
+               static_cast<double>(input_stats.data_size) *
+                   useful_payload_ratio) {
+      defer_retry(output_stats.data_size);
+      s = Status::Aborted(
+          "memtable GC useful-payload ratio is above threshold");
+    } else {
+      s = gc->Finish();
+    }
+
+    if (s.ok()) {
+      num_entries_.FetchSubRelaxed(input_stats.entries - output_stats.entries);
+      data_size_.FetchSubRelaxed(input_stats.data_size -
+                                 output_stats.data_size);
+      num_deletes_.FetchSubRelaxed(input_stats.deletes - output_stats.deletes);
+      memtable_gc_next_retry_data_size_.store(0, std::memory_order_relaxed);
+    }
+  }
+
+  if (!s.ok()) {
+    if (memtable_gc_next_retry_data_size_.load(std::memory_order_relaxed) ==
+        0) {
+      memtable_gc_next_retry_data_size_.store(
+          ComputeMemTableGCNextRetryDataSize(data_size_.LoadRelaxed(),
+                                             useful_payload_ratio),
+          std::memory_order_relaxed);
+    }
+    gc->Abort();
+  }
+  RefreshFlushStateAfterMemTableGC();
+  return s;
 }
 
 // Callback from MemTable::Get()

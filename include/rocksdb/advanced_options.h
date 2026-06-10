@@ -357,19 +357,17 @@ struct AdvancedColumnFamilyOptions {
   size_t inplace_update_num_locks = 10000;
 
   // [experimental]
-  // Used to activate or deactive the Mempurge feature (memtable garbage
-  // collection). (deactivated by default). At every flush, the total useful
-  // payload (total entries minus garbage entries) is estimated as a ratio
-  // [useful payload bytes]/[size of a memtable (in bytes)]. This ratio is then
-  // compared to this `threshold` value:
-  //     - if ratio<threshold: the flush is replaced by a mempurge operation
-  //     - else: a regular flush operation takes place.
+  // Used to activate experimental memtable garbage collection (deactivated by
+  // default). For memtable representations that support GC, this value is the
+  // maximum useful-payload ratio worth compacting in memory. The effective
+  // ratio is capped at 0.95 so GC is not attempted for fully useful memtables.
+  // A ratio r is considered when mutable memtable memory reaches roughly
+  // 1 / (1 + r) of the normal flush threshold, so r=0.5 is considered around
+  // 2/3 full.
   // Threshold values:
-  //   0.0: mempurge deactivated (default).
-  //   1.0: recommended threshold value.
-  //   >1.0 : aggressive mempurge.
-  //   0 < threshold < 1.0: mempurge triggered only for very low useful payload
-  //   ratios.
+  //   0.0: memtable GC deactivated (default).
+  //   0.5: consider GC for up to 50% useful payload.
+  //   >=0.95: most aggressive GC trigger.
   // [experimental]
   double experimental_mempurge_threshold = 0.0;
 
@@ -1216,7 +1214,7 @@ struct AdvancedColumnFamilyOptions {
   //  - checkpoint/backup/live-files enumeration must flush pending
   //    direct-write state first; APIs that intentionally skip the flush, or
   //    run while WAL is locked, can return NotSupported.
-  //  - not compatible with MemPurge or user-defined timestamps.
+  //  - not compatible with memtable GC or user-defined timestamps.
   //  - DB::IngestWriteBatchWithIndex() is not supported while any live column
   //    family enables this option.
   //  - read-only and secondary opens can read flushed/manifest-visible blob

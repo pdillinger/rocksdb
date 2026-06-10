@@ -2025,6 +2025,7 @@ class MemTableInserter : public WriteBatch::Handler {
   SequenceNumber sequence_;
   ColumnFamilyMemTables* const cf_mems_;
   FlushScheduler* const flush_scheduler_;
+  FlushScheduler* const memtable_gc_scheduler_;
   TrimHistoryScheduler* const trim_history_scheduler_;
   const bool ignore_missing_column_families_;
   const uint64_t recovering_log_number_;
@@ -2138,10 +2139,12 @@ class MemTableInserter : public WriteBatch::Handler {
                    bool concurrent_memtable_writes,
                    const WriteBatch::ProtectionInfo* prot_info,
                    bool* has_valid_writes = nullptr, bool seq_per_batch = false,
-                   bool batch_per_txn = true, bool hint_per_batch = false)
+                   bool batch_per_txn = true, bool hint_per_batch = false,
+                   FlushScheduler* memtable_gc_scheduler = nullptr)
       : sequence_(_sequence),
         cf_mems_(cf_mems),
         flush_scheduler_(flush_scheduler),
+        memtable_gc_scheduler_(memtable_gc_scheduler),
         trim_history_scheduler_(trim_history_scheduler),
         ignore_missing_column_families_(ignore_missing_column_families),
         recovering_log_number_(recovering_log_number),
@@ -2984,11 +2987,25 @@ class MemTableInserter : public WriteBatch::Handler {
   }
 
   void CheckMemtableFull() {
+    auto* cfd = cf_mems_->current();
+    assert(cfd != nullptr);
+    bool memtable_gc_pending = false;
+    if (memtable_gc_scheduler_ != nullptr && db_ != nullptr &&
+        !db_->immutable_db_options().atomic_flush) {
+      MemTable* const mem = cfd->mem();
+      const double threshold =
+          cfd->GetLatestMutableCFOptions().experimental_mempurge_threshold;
+      if (mem->ShouldScheduleMemTableGC(threshold) &&
+          mem->MarkMemTableGCScheduled()) {
+        memtable_gc_scheduler_->ScheduleWork(cfd);
+      }
+      memtable_gc_pending = mem->HasMemTableGCScheduledOrInProgress();
+    }
+
     if (flush_scheduler_ != nullptr) {
-      auto* cfd = cf_mems_->current();
-      assert(cfd != nullptr);
-      if (cfd->mem()->ShouldScheduleFlush() &&
-          cfd->mem()->MarkFlushScheduled()) {
+      MemTable* const mem = cfd->mem();
+      if (!memtable_gc_pending && mem->ShouldScheduleFlush() &&
+          mem->MarkFlushScheduled()) {
         // MarkFlushScheduled only returns true if we are the one that
         // should take action, so no need to dedup further
         flush_scheduler_->ScheduleWork(cfd);
@@ -2996,8 +3013,6 @@ class MemTableInserter : public WriteBatch::Handler {
     }
     // check if memtable_list size exceeds max_write_buffer_size_to_maintain
     if (trim_history_scheduler_ != nullptr) {
-      auto* cfd = cf_mems_->current();
-
       assert(cfd);
 
       const size_t size_to_maintain = static_cast<size_t>(
@@ -3266,12 +3281,14 @@ Status WriteBatchInternal::InsertInto(
     ColumnFamilyMemTables* memtables, FlushScheduler* flush_scheduler,
     TrimHistoryScheduler* trim_history_scheduler,
     bool ignore_missing_column_families, uint64_t recovery_log_number, DB* db,
-    bool seq_per_batch, bool batch_per_txn) {
+    bool seq_per_batch, bool batch_per_txn,
+    FlushScheduler* memtable_gc_scheduler) {
   MemTableInserter inserter(
       sequence, memtables, flush_scheduler, trim_history_scheduler,
       ignore_missing_column_families, recovery_log_number, db,
       /*concurrent_memtable_writes=*/false, nullptr /* prot_info */,
-      nullptr /*has_valid_writes*/, seq_per_batch, batch_per_txn);
+      nullptr /*has_valid_writes*/, seq_per_batch, batch_per_txn,
+      false /* hint_per_batch */, memtable_gc_scheduler);
   for (auto w : write_group) {
     if (w->CallbackFailed()) {
       continue;
@@ -3301,17 +3318,18 @@ Status WriteBatchInternal::InsertInto(
     TrimHistoryScheduler* trim_history_scheduler,
     bool ignore_missing_column_families, uint64_t log_number, DB* db,
     bool concurrent_memtable_writes, bool seq_per_batch, size_t batch_cnt,
-    bool batch_per_txn, bool hint_per_batch) {
+    bool batch_per_txn, bool hint_per_batch,
+    FlushScheduler* memtable_gc_scheduler) {
 #ifdef NDEBUG
   (void)batch_cnt;
 #endif
   assert(writer->ShouldWriteToMemtable());
-  MemTableInserter inserter(sequence, memtables, flush_scheduler,
-                            trim_history_scheduler,
-                            ignore_missing_column_families, log_number, db,
-                            concurrent_memtable_writes, nullptr /* prot_info */,
-                            nullptr /*has_valid_writes*/, seq_per_batch,
-                            batch_per_txn, hint_per_batch);
+  MemTableInserter inserter(
+      sequence, memtables, flush_scheduler, trim_history_scheduler,
+      ignore_missing_column_families, log_number, db,
+      concurrent_memtable_writes, nullptr /* prot_info */,
+      nullptr /*has_valid_writes*/, seq_per_batch, batch_per_txn,
+      hint_per_batch, memtable_gc_scheduler);
   SetSequence(writer->batch, sequence);
   inserter.set_log_number_ref(writer->log_ref);
   inserter.set_prot_info(writer->batch->prot_info_.get());
@@ -3330,12 +3348,14 @@ Status WriteBatchInternal::InsertInto(
     TrimHistoryScheduler* trim_history_scheduler,
     bool ignore_missing_column_families, uint64_t log_number, DB* db,
     bool concurrent_memtable_writes, SequenceNumber* next_seq,
-    bool* has_valid_writes, bool seq_per_batch, bool batch_per_txn) {
+    bool* has_valid_writes, bool seq_per_batch, bool batch_per_txn,
+    FlushScheduler* memtable_gc_scheduler) {
   MemTableInserter inserter(Sequence(batch), memtables, flush_scheduler,
                             trim_history_scheduler,
                             ignore_missing_column_families, log_number, db,
                             concurrent_memtable_writes, batch->prot_info_.get(),
-                            has_valid_writes, seq_per_batch, batch_per_txn);
+                            has_valid_writes, seq_per_batch, batch_per_txn,
+                            false /* hint_per_batch */, memtable_gc_scheduler);
   Status s = batch->Iterate(&inserter);
   if (next_seq != nullptr) {
     *next_seq = inserter.sequence();

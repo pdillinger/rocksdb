@@ -91,6 +91,7 @@ class FlushJob {
              ErrorHandler* error_handler = nullptr);
   void Cancel();
   const autovector<ReadOnlyMemTable*>& GetMemTables() const { return mems_; }
+  bool MemPurgeBarrierUsed() const { return mempurge_barrier_used_; }
 
   // Returns the log number recorded in the flush VersionEdit after
   // PickMemTable() initializes `edit_`.
@@ -157,6 +158,8 @@ class FlushJob {
   // process has not matured yet.
   Status MemPurge();
   bool MemPurgeDecider(double threshold);
+  bool ShouldMarkMemPurgeInProgress() const;
+  void SetMemPurgeInProgress(bool in_progress);
   // The rate limiter priority (io_priority) is determined dynamically here.
   Env::IOPriority GetRateLimiterPriority();
   std::unique_ptr<FlushJobInfo> GetFlushJobInfo() const;
@@ -238,6 +241,8 @@ class FlushJob {
   VersionEdit* edit_;
   Version* base_;
   bool pick_memtable_called;
+  bool mempurge_marked_in_progress_ = false;
+  bool mempurge_barrier_used_ = false;
   Env::Priority thread_pri_;
 
   const std::shared_ptr<IOTracer> io_tracer_;

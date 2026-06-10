@@ -237,6 +237,71 @@ TEST_F(MemTableListTest, Empty) {
   ASSERT_EQ(0, to_delete.size());
 }
 
+TEST_F(MemTableListTest, MemPurgeInProgressBlocksYoungerFlush) {
+  MemTableList list(1 /* min_write_buffer_number_to_merge */,
+                    0 /* max_write_buffer_size_to_maintain */);
+
+  auto factory = std::make_shared<SkipListFactory>();
+  options.memtable_factory = factory;
+  ImmutableOptions ioptions(options);
+  InternalKeyComparator cmp(options.comparator);
+  WriteBufferManager wb(options.db_write_buffer_size);
+  MutableCFOptions mutable_cf_options(options);
+  autovector<ReadOnlyMemTable*> to_delete;
+
+  std::vector<MemTable*> tables;
+  SequenceNumber seq = 1;
+  for (int i = 0; i < 3; ++i) {
+    MemTable* mem = new MemTable(cmp, ioptions, mutable_cf_options, &wb,
+                                 kMaxSequenceNumber, 0 /* column_family_id */);
+    mem->SetID(i);
+    mem->Ref();
+    ASSERT_OK(mem->Add(++seq, kTypeValue, "key" + std::to_string(i), "value",
+                       nullptr /* kv_prot_info */));
+    list.Add(mem, &to_delete);
+    tables.push_back(mem);
+  }
+  ASSERT_TRUE(to_delete.empty());
+  ASSERT_TRUE(list.IsFlushPending());
+
+  autovector<ReadOnlyMemTable*> mempurge_input;
+  list.PickMemtablesToFlush(0 /* max_memtable_id */, &mempurge_input);
+  ASSERT_EQ(1, mempurge_input.size());
+  ASSERT_EQ(tables[0], mempurge_input[0]);
+  mempurge_input[0]->SetMemPurgeInProgress(true);
+
+  ASSERT_FALSE(list.IsFlushPending());
+  ASSERT_TRUE(list.imm_flush_needed.load(std::memory_order_acquire));
+
+  list.FlushRequested();
+  autovector<ReadOnlyMemTable*> blocked;
+  list.PickMemtablesToFlush(
+      std::numeric_limits<uint64_t>::max() /* max_memtable_id */, &blocked);
+  ASSERT_TRUE(blocked.empty());
+  ASSERT_TRUE(list.HasFlushRequested());
+  ASSERT_FALSE(list.IsFlushPending());
+
+  mempurge_input[0]->SetMemPurgeInProgress(false);
+  ASSERT_TRUE(list.IsFlushPending());
+
+  autovector<ReadOnlyMemTable*> younger;
+  list.PickMemtablesToFlush(
+      std::numeric_limits<uint64_t>::max() /* max_memtable_id */, &younger);
+  ASSERT_EQ(2, younger.size());
+  ASSERT_EQ(tables[1], younger[0]);
+  ASSERT_EQ(tables[2], younger[1]);
+  ASSERT_FALSE(list.HasFlushRequested());
+  ASSERT_FALSE(list.IsFlushPending());
+
+  list.current()->Unref(&to_delete);
+  ASSERT_EQ(3, to_delete.size());
+  for (const auto& m : to_delete) {
+    m->Ref();
+    ASSERT_EQ(m, m->Unref());
+    delete m;
+  }
+}
+
 TEST_F(MemTableListTest, GetTest) {
   // Create MemTableList
   int min_write_buffer_number_to_merge = 2;

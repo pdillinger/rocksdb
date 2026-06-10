@@ -583,6 +583,8 @@ int main(int argc, char** argv) {
     factory.reset(new ROCKSDB_NAMESPACE::SkipListFactory);
   } else if (FLAGS_memtablerep == "vector") {
     factory.reset(new ROCKSDB_NAMESPACE::VectorRepFactory);
+  } else if (FLAGS_memtablerep == "vectorgc") {
+    factory.reset(new ROCKSDB_NAMESPACE::VectorGCRepFactory);
   } else if (FLAGS_memtablerep == "hashskiplist" ||
              FLAGS_memtablerep == "prefix_hash") {
     factory.reset(ROCKSDB_NAMESPACE::NewHashSkipListRepFactory(

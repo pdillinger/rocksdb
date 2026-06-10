@@ -1558,7 +1558,7 @@ Status ColumnFamilyData::ValidateOptions(
     }
     if (cf_options.experimental_mempurge_threshold > 0.0) {
       return Status::NotSupported(
-          "Blob direct write does not support MemPurge.");
+          "Blob direct write does not support memtable GC.");
     }
     if (ucmp->timestamp_size() > 0) {
       return Status::NotSupported(

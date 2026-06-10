@@ -459,8 +459,9 @@ DEFINE_bool(allow_concurrent_memtable_write, false,
             "Allow multi-writers to update mem tables in parallel.");
 
 DEFINE_double(experimental_mempurge_threshold, 0.0,
-              "Maximum estimated useful payload that triggers a "
-              "mempurge process to collect memtable garbage bytes.");
+              "Maximum useful payload ratio that triggers "
+              "experimental memtable garbage collection. Effective values are "
+              "capped at 0.95.");
 
 DEFINE_bool(enable_write_thread_adaptive_yield,
             ROCKSDB_NAMESPACE::Options().enable_write_thread_adaptive_yield,

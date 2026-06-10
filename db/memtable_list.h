@@ -177,6 +177,10 @@ class MemTableListVersion {
 
   // REQUIRE: m is an immutable memtable
   void Add(ReadOnlyMemTable* m, autovector<ReadOnlyMemTable*>* to_delete);
+  // REQUIRE: old_mems and new_mem are immutable memtables.
+  void Replace(const autovector<ReadOnlyMemTable*>& old_mems,
+               ReadOnlyMemTable* new_mem,
+               autovector<ReadOnlyMemTable*>* to_delete);
   // REQUIRE: m is an immutable memtable
   void Remove(ReadOnlyMemTable* m, autovector<ReadOnlyMemTable*>* to_delete);
 
@@ -332,6 +336,13 @@ class MemTableList {
   // flushed, but in certain situations, like after a mempurge, we may want to
   // avoid flushing the memtable list upon addition of a memtable.
   void Add(ReadOnlyMemTable* m, autovector<ReadOnlyMemTable*>* to_delete);
+
+  // Replaces a MemPurge/vectorgc input with its GC output at the same position
+  // in the immutable list. The replacement becomes a pending, unflushed
+  // memtable without preserving the original flush request.
+  Status ReplaceForMemPurge(const autovector<ReadOnlyMemTable*>& old_mems,
+                            ReadOnlyMemTable* new_mem,
+                            autovector<ReadOnlyMemTable*>* to_delete);
 
   // Returns an estimate of the number of bytes of data in use.
   size_t ApproximateMemoryUsage();
@@ -511,6 +522,10 @@ class MemTableList {
 
   // the number of elements that still need flushing
   int num_flush_not_started_;
+
+  // Number of not-yet-started memtables that can be picked without crossing
+  // an older memtable currently being processed by MemPurge/vectorgc.
+  int NumFlushableNotStarted() const;
 
   // committing in progress
   bool commit_in_progress_;

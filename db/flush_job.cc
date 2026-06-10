@@ -215,6 +215,28 @@ void FlushJob::PickMemTable() {
 
   base_ = cfd_->current();
   base_->Ref();  // it is likely that we do not need this reference
+
+  if (ShouldMarkMemPurgeInProgress()) {
+    SetMemPurgeInProgress(true);
+  }
+}
+
+bool FlushJob::ShouldMarkMemPurgeInProgress() const {
+  // The old prototype ran MemPurge as an alternate FlushJob outcome. The
+  // replacement design runs memtable GC before flush, inside the memtable
+  // representation, so flush jobs should no longer enter the MemPurge path.
+  return false;
+}
+
+void FlushJob::SetMemPurgeInProgress(bool in_progress) {
+  db_mutex_->AssertHeld();
+  for (ReadOnlyMemTable* mem : mems_) {
+    mem->SetMemPurgeInProgress(in_progress);
+  }
+  mempurge_marked_in_progress_ = in_progress;
+  if (in_progress) {
+    mempurge_barrier_used_ = true;
+  }
 }
 
 Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
@@ -256,7 +278,7 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
     prev_cpu_read_nanos = IOSTATS(cpu_read_nanos);
   }
   Status mempurge_s = Status::NotFound("No MemPurge.");
-  if ((mempurge_threshold > 0.0) &&
+  if (mempurge_marked_in_progress_ && (mempurge_threshold > 0.0) &&
       (flush_reason_ == FlushReason::kWriteBufferFull) && (!mems_.empty()) &&
       MemPurgeDecider(mempurge_threshold) && !(db_options_.atomic_flush)) {
     cfd_->SetMempurgeUsed();
@@ -285,6 +307,9 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
       }
     }
   }
+  if (!mempurge_s.ok() && mempurge_marked_in_progress_) {
+    SetMemPurgeInProgress(false);
+  }
   Status s;
   if (mempurge_s.ok()) {
     base_->Unref();
@@ -309,8 +334,13 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
   TEST_SYNC_POINT_CALLBACK("FlushJob::Run:PostBuildTable", &s);
 
   if (!s.ok()) {
-    cfd_->imm()->RollbackMemtableFlush(
-        mems_, /*rollback_succeeding_memtables=*/!db_options_.atomic_flush);
+    if (!mempurge_s.ok()) {
+      cfd_->imm()->RollbackMemtableFlush(
+          mems_, /*rollback_succeeding_memtables=*/!db_options_.atomic_flush);
+    }
+  } else if (mempurge_s.ok()) {
+    // MemPurge/vectorgc already replaced the picked memtable in the immutable
+    // list. There is no L0 file or manifest edit to install for this job.
   } else if (write_manifest_) {
     assert(!db_options_.atomic_flush);
     if (!db_options_.atomic_flush &&
@@ -401,12 +431,26 @@ Status FlushJob::Run(LogsWithPrepTracker* prep_tracker, FileMetaData* file_meta,
 void FlushJob::Cancel() {
   db_mutex_->AssertHeld();
   assert(base_ != nullptr);
+  if (mempurge_marked_in_progress_) {
+    SetMemPurgeInProgress(false);
+  }
   base_->Unref();
 }
 
 Status FlushJob::MemPurge() {
   Status s;
   db_mutex_->AssertHeld();
+  const auto& memtable_factory = cfd_->ioptions().memtable_factory;
+  if (memtable_factory == nullptr ||
+      !memtable_factory->IsInstanceOf(VectorGCRepFactory::kNickName())) {
+    if (mempurge_marked_in_progress_) {
+      SetMemPurgeInProgress(false);
+    }
+    return Status::Aborted(
+        "vectorgc mempurge requires memtable_factory=vectorgc.");
+  }
+
+  ReadOnlyMemTable* newest_input_mem = mems_.back();
   db_mutex_->Unlock();
   assert(!mems_.empty());
 
@@ -473,9 +517,8 @@ Status FlushJob::MemPurge() {
     range_del_agg->AddTombstones(std::move(rd_iter));
   }
 
-  // If there is valid data in the memtable,
-  // or at least range tombstones, copy over the info
-  // to the new memtable.
+  // If there is valid data in the memtable, or at least range tombstones, copy
+  // over the info to a replacement memtable.
   if (iter->Valid() || !range_del_agg->IsEmpty()) {
     // MaxSize is the size of a memtable.
     size_t maxSize = mutable_cf_options_.write_buffer_size;
@@ -495,6 +538,10 @@ Status FlushJob::MemPurge() {
         s = Status::NotSupported(
             "CompactionFilter::IgnoreSnapshots() = false is not supported "
             "anymore.");
+        db_mutex_->Lock();
+        if (mempurge_marked_in_progress_) {
+          SetMemPurgeInProgress(false);
+        }
         return s;
       }
     }
@@ -622,65 +669,61 @@ Status FlushJob::MemPurge() {
       }
     }
 
-    // If everything happened smoothly and new_mem contains valid data,
-    // decide if it is flushed to storage or kept in the imm()
-    // memtable list (memory).
+    // If everything happened smoothly and new_mem contains valid data, publish
+    // it at the same immutable-list position as the input memtable. This keeps
+    // MemTable IDs ordered and lets old SuperVersions continue referencing the
+    // pre-GC memtable object.
     if (s.ok() && (new_first_seqno != kMaxSequenceNumber)) {
       // Rectify the first sequence number, which (unlike the earliest seq
       // number) needs to be present in the new memtable.
       new_mem->SetFirstSequenceNumber(new_first_seqno);
 
-      // The new_mem is added to the list of immutable memtables
-      // only if it filled at less than 100% capacity and isn't flagged
-      // as in need of being flushed.
+      // The new_mem replaces the input only if it filled at less than 100%
+      // capacity and isn't flagged as in need of being flushed.
       if (new_mem->ApproximateMemoryUsage() < maxSize &&
           !(new_mem->ShouldFlushNow())) {
         // Construct fragmented memtable range tombstones without mutex
         new_mem->ConstructFragmentedRangeTombstones();
+        new_mem->MarkImmutable();
         TEST_SYNC_POINT("FlushJob::MemPurge:BeforeReacquireMutex");
         TEST_SYNC_POINT("FlushJob::MemPurge:AfterWaitForTest");
         db_mutex_->Lock();
-        // Take the newest id, so that memtables in MemtableList don't have
-        // out-of-order memtable ids. While the db mutex was released during
-        // MemPurge, new memtables may have been switched to the immutable
-        // list with higher IDs, so we must use the maximum of the original
-        // flush batch ID and the current latest immutable memtable ID.
-        uint64_t new_mem_id = std::max(
-            mems_.back()->GetID(),
-            cfd_->imm()->GetLatestMemTableID(false /*for_atomic_flush*/));
-
-        new_mem->SetID(new_mem_id);
-        // Take the latest memtable's next log number.
-        new_mem->SetNextLogNumber(mems_.back()->GetNextLogNumber());
-
-        // This addition will not trigger another flush, because
-        // we do not call EnqueuePendingFlush().
-        cfd_->imm()->Add(new_mem, &job_context_->memtables_to_free);
-        new_mem->Ref();
-        // Piggyback FlushJobInfo on the first flushed memtable.
-        db_mutex_->AssertHeld();
+        new_mem->SetID(newest_input_mem->GetID());
+        new_mem->SetNextLogNumber(newest_input_mem->GetNextLogNumber());
+        new_mem->SetMemPurgeOutput(true);
         meta_.fd.file_size = 0;
-        mems_[0]->SetFlushJobInfo(GetFlushJobInfo());
+        s = cfd_->imm()->ReplaceForMemPurge(mems_, new_mem,
+                                            &job_context_->memtables_to_free);
+        SetMemPurgeInProgress(false);
+        if (s.ok()) {
+          new_mem = nullptr;
+        }
         db_mutex_->Unlock();
       } else {
         s = Status::Aborted(Slice("Mempurge filled more than one memtable."));
         new_mem_capacity = 1.0;
-        if (new_mem) {
-          job_context_->memtables_to_free.push_back(new_mem);
-        }
       }
     } else {
-      // In this case, the newly allocated new_mem is empty.
+      // In this case, the newly allocated new_mem is empty. Fall back to a
+      // regular flush so WAL/recovery metadata advances normally.
       assert(new_mem != nullptr);
-      job_context_->memtables_to_free.push_back(new_mem);
+      s = Status::Aborted(Slice("Mempurge output is empty."));
     }
+  } else {
+    s = Status::Aborted(Slice("Mempurge output is empty."));
   }
 
   // Reacquire the mutex for WriteLevel0 function.
   db_mutex_->Lock();
+  if (mempurge_marked_in_progress_) {
+    SetMemPurgeInProgress(false);
+  }
+  if (new_mem != nullptr) {
+    job_context_->memtables_to_free.push_back(new_mem);
+  }
 
   // If mempurge successful, don't write input tables to level0,
-  // but write any full output table to level0.
+  // but keep the replacement memtable pending for a later flush.
   if (s.ok()) {
     TEST_SYNC_POINT("DBImpl::FlushJob:MemPurgeSuccessful");
   } else {

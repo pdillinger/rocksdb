@@ -1277,6 +1277,12 @@ TEST_F(OptionsTest, GetMemTableRepFactoryFromString) {
   ASSERT_NOK(GetMemTableRepFactoryFromString("vector:1024:invalid_opt",
                                              &new_mem_factory));
 
+  ASSERT_OK(GetMemTableRepFactoryFromString("vectorgc", &new_mem_factory));
+  ASSERT_OK(GetMemTableRepFactoryFromString("vectorgc:1024", &new_mem_factory));
+  ASSERT_EQ(std::string(new_mem_factory->Name()), "VectorGCRepFactory");
+  ASSERT_NOK(GetMemTableRepFactoryFromString("vectorgc:1024:invalid_opt",
+                                             &new_mem_factory));
+
   ASSERT_NOK(GetMemTableRepFactoryFromString("cuckoo", &new_mem_factory));
   // CuckooHash memtable is already removed.
   ASSERT_NOK(GetMemTableRepFactoryFromString("cuckoo:1024", &new_mem_factory));
@@ -1365,6 +1371,19 @@ TEST_F(OptionsTest, MemTableRepFactoryCreateFromString) {
       config_options, "id=vector; count=42", &new_mem_factory));
   ASSERT_NOK(MemTableRepFactory::CreateFromString(
       config_options, "id=vector; invalid=unknown", &new_mem_factory));
+  ASSERT_OK(MemTableRepFactory::CreateFromString(config_options, "vectorgc",
+                                                 &new_mem_factory));
+  ASSERT_OK(MemTableRepFactory::CreateFromString(
+      config_options, "vectorgc:1024", &new_mem_factory));
+  ASSERT_STREQ(new_mem_factory->Name(), "VectorGCRepFactory");
+  ASSERT_TRUE(new_mem_factory->IsInstanceOf("vectorgc"));
+  ASSERT_TRUE(new_mem_factory->IsInstanceOf("VectorGCRepFactory"));
+  ASSERT_NOK(MemTableRepFactory::CreateFromString(
+      config_options, "vectorgc:1024:invalid_opt", &new_mem_factory));
+  ASSERT_OK(MemTableRepFactory::CreateFromString(
+      config_options, "id=vectorgc; count=42", &new_mem_factory));
+  ASSERT_NOK(MemTableRepFactory::CreateFromString(
+      config_options, "id=vectorgc; invalid=unknown", &new_mem_factory));
   ASSERT_NOK(MemTableRepFactory::CreateFromString(config_options, "cuckoo",
                                                   &new_mem_factory));
   // CuckooHash memtable is already removed.

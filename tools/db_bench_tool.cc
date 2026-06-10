@@ -1561,8 +1561,9 @@ DEFINE_bool(allow_concurrent_memtable_write, true,
             "Allow multi-writers to update mem tables in parallel.");
 
 DEFINE_double(experimental_mempurge_threshold, 0.0,
-              "Maximum useful payload ratio estimate that triggers a mempurge "
-              "(memtable garbage collection).");
+              "Maximum useful payload ratio that triggers "
+              "experimental memtable garbage collection. Effective values are "
+              "capped at 0.95.");
 
 DEFINE_bool(inplace_update_support,
             ROCKSDB_NAMESPACE::Options().inplace_update_support,
@@ -1981,6 +1982,9 @@ static Status CreateMemTableRepFactory(
   } else if (!strcasecmp(FLAGS_memtablerep.c_str(),
                          VectorRepFactory::kNickName())) {
     factory->reset(new VectorRepFactory());
+  } else if (!strcasecmp(FLAGS_memtablerep.c_str(),
+                         VectorGCRepFactory::kNickName())) {
+    factory->reset(new VectorGCRepFactory());
   } else if (!strcasecmp(FLAGS_memtablerep.c_str(), "hash_linkedlist")) {
     factory->reset(NewHashLinkListRepFactory(FLAGS_hash_bucket_count));
   } else {

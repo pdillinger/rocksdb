@@ -230,6 +230,9 @@ struct ConfigOptions {
 //     [Example]:
 //     * {"memtable", "vector:1024"} is equivalent to setting memtable
 //       to VectorRepFactory(1024).
+//   - VectorGCRepFactory:
+//     Pass "vectorgc:<count>" to config memtable to use VectorGCRepFactory,
+//     or simply "vectorgc" to use the default VectorGC memtable.
 //
 //  * compression_opts:
 //    Use "compression_opts" to config compression_opts.  The value format
