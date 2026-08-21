@@ -122,20 +122,36 @@ enum EpochNumberRequirement {
   kMustPresent,
 };
 
+// Parameters controlling randomized-but-stable phasing of periodic
+// (time-based) compaction, derived per Version from
+// DBOptions::compaction_schedule_seed and
+// periodic_compaction_phase_recovery_percent together with the DB/CF identity.
+// recovery_percent == 0 disables phasing (exact legacy behavior).
+struct PeriodicCompactionPhaseParams {
+  // Stable per-(DB, CF) hash seeding the preferred phase.
+  uint64_t seed_hash = 0;
+  // Unix time (seconds) at which phasing took effect for this DB (DB::Open, or
+  // the last relevant SetDBOptions change). Used to spread the initial
+  // catch-up burst across [anchor_time, natural deadline].
+  uint64_t anchor_time = 0;
+  // Percent [0, 100] of the phase gap closed per trigger; 0 disables phasing.
+  int recovery_percent = 0;
+};
+
 // Information of the storage associated with each Version, including number of
 // levels of LSM tree, files information at each level, files marked for
 // compaction, blob files, etc.
 class VersionStorageInfo {
  public:
-  VersionStorageInfo(const InternalKeyComparator* internal_comparator,
-                     const Comparator* user_comparator, int num_levels,
-                     CompactionStyle compaction_style,
-                     VersionStorageInfo* src_vstorage,
-                     bool _force_consistency_checks,
-                     EpochNumberRequirement epoch_number_requirement,
-                     SystemClock* clock,
-                     uint32_t bottommost_file_compaction_delay,
-                     OffpeakTimeOption offpeak_time_option);
+  VersionStorageInfo(
+      const InternalKeyComparator* internal_comparator,
+      const Comparator* user_comparator, int num_levels,
+      CompactionStyle compaction_style, VersionStorageInfo* src_vstorage,
+      bool _force_consistency_checks,
+      EpochNumberRequirement epoch_number_requirement, SystemClock* clock,
+      uint32_t bottommost_file_compaction_delay,
+      OffpeakTimeOption offpeak_time_option,
+      PeriodicCompactionPhaseParams periodic_compaction_phase_params);
   // No copying allowed
   VersionStorageInfo(const VersionStorageInfo&) = delete;
   void operator=(const VersionStorageInfo&) = delete;
@@ -219,6 +235,18 @@ class VersionStorageInfo {
   void ComputeFilesMarkedForPeriodicCompaction(
       const ImmutableOptions& ioptions,
       const uint64_t periodic_compaction_seconds, int last_level);
+
+  // Returns the wall-clock time (unix seconds) at which a file with the given
+  // modification time becomes eligible for periodic compaction under the given
+  // phasing parameters, NOT accounting for the offpeak pull (which the caller
+  // applies). When params.recovery_percent == 0 (phasing disabled) this is
+  // simply file_modification_time + periodic_compaction_seconds (the classic
+  // behavior). Otherwise the trigger is pulled earlier toward the file's
+  // preferred phase; it is never later than the classic deadline. Public and
+  // static for testing.
+  static uint64_t PeriodicCompactionTriggerTime(
+      uint64_t file_modification_time, uint64_t periodic_compaction_seconds,
+      const PeriodicCompactionPhaseParams& params);
 
   // This computes bottommost_files_marked_for_compaction_ and is called by
   // ComputeCompactionScore() or UpdateOldestSnapshot().
@@ -830,6 +858,8 @@ class VersionStorageInfo {
   EpochNumberRequirement epoch_number_requirement_;
 
   OffpeakTimeOption offpeak_time_option_;
+
+  PeriodicCompactionPhaseParams periodic_compaction_phase_params_;
 
   friend class Version;
   friend class VersionSet;
@@ -1654,6 +1684,13 @@ class VersionSet {
     offpeak_time_option_.SetFromOffpeakTimeString(daily_offpeak_time_utc);
   }
 
+  // Resolves compaction_schedule_seed_ (with whole-value __db_name__/__db_id__
+  // substitution) and combines it with the given CF name into a stable 64-bit
+  // seed, packaging it with the recovery percent and phasing anchor for that
+  // CF. Returns disabled params (recovery_percent == 0) when phasing is off.
+  PeriodicCompactionPhaseParams GetPeriodicCompactionPhaseParams(
+      const std::string& cf_name) const;
+
   const ImmutableDBOptions* db_options() const { return db_options_; }
 
   static uint64_t GetNumLiveVersions(Version* dummy_versions);
@@ -1903,6 +1940,15 @@ class VersionSet {
 
   // Off-peak time option used for compaction scoring
   OffpeakTimeOption offpeak_time_option_;
+
+  // Compaction-schedule phasing (see DBOptions::compaction_schedule_seed).
+  // Updated together in UpdatedMutableDbOptions().
+  std::string compaction_schedule_seed_;
+  int periodic_compaction_phase_recovery_percent_ = 0;
+  // Unix time (seconds) at which phasing took effect for this DB (construction
+  // or last relevant SetDBOptions change); used to spread the initial
+  // periodic-compaction catch-up burst.
+  uint64_t compaction_phase_anchor_time_ = 0;
 
   // Pointer to the DB's ErrorHandler.
   ErrorHandler* const error_handler_;

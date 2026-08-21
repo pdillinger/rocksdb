@@ -71,6 +71,8 @@
 #include "util/cast_util.h"
 #include "util/coding.h"
 #include "util/coro_utils.h"
+#include "util/fastrange.h"
+#include "util/hash.h"
 #include "util/stop_watch.h"
 #include "util/string_util.h"
 #include "util/user_comparator_wrapper.h"
@@ -2673,7 +2675,8 @@ VersionStorageInfo::VersionStorageInfo(
     bool _force_consistency_checks,
     EpochNumberRequirement epoch_number_requirement, SystemClock* clock,
     uint32_t bottommost_file_compaction_delay,
-    OffpeakTimeOption offpeak_time_option)
+    OffpeakTimeOption offpeak_time_option,
+    PeriodicCompactionPhaseParams periodic_compaction_phase_params)
     : internal_comparator_(internal_comparator),
       user_comparator_(user_comparator),
       // cfd is nullptr if Version is dummy
@@ -2706,7 +2709,8 @@ VersionStorageInfo::VersionStorageInfo(
       finalized_(false),
       force_consistency_checks_(_force_consistency_checks),
       epoch_number_requirement_(epoch_number_requirement),
-      offpeak_time_option_(std::move(offpeak_time_option)) {
+      offpeak_time_option_(std::move(offpeak_time_option)),
+      periodic_compaction_phase_params_(periodic_compaction_phase_params) {
   if (ref_vstorage != nullptr) {
     accumulated_file_size_ = ref_vstorage->accumulated_file_size_;
     accumulated_raw_key_size_ = ref_vstorage->accumulated_raw_key_size_;
@@ -2752,7 +2756,10 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
           cfd_ == nullptr ? nullptr : cfd_->ioptions().clock,
           cfd_ == nullptr ? 0
                           : mutable_cf_options.bottommost_file_compaction_delay,
-          vset->offpeak_time_option()),
+          vset->offpeak_time_option(),
+          cfd_ == nullptr
+              ? PeriodicCompactionPhaseParams{}
+              : vset->GetPeriodicCompactionPhaseParams(cfd_->GetName())),
       vset_(vset),
       next_(this),
       prev_(this),
@@ -3822,18 +3829,21 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
     return;
   }
 
-  const uint64_t allowed_time_limit =
-      current_time - periodic_compaction_seconds;
-
-  // Find the adjust_allowed_time_limit such that it includes files that are
-  // going to expire by the time next daily offpeak starts.
+  // Existing offpeak behavior pulls a file's deadline earlier by the time until
+  // the next daily offpeak window (so a whole TTL's worth can be marked at the
+  // start of offpeak).
   const OffpeakTimeInfo offpeak_time_info =
       offpeak_time_option_.GetOffpeakTimeInfo(current_time);
-  const uint64_t adjusted_allowed_time_limit =
-      allowed_time_limit +
-      (offpeak_time_info.is_now_offpeak
-           ? offpeak_time_info.seconds_till_next_offpeak_start
-           : 0);
+  const uint64_t offpeak_pull =
+      offpeak_time_info.is_now_offpeak
+          ? offpeak_time_info.seconds_till_next_offpeak_start
+          : 0;
+
+  // Preferred-phase scheduling (see DBOptions::compaction_schedule_seed). When
+  // recovery_percent == 0 this is disabled and marking matches the classic
+  // "file age >= periodic_compaction_seconds" behavior (adjusted for offpeak).
+  const PeriodicCompactionPhaseParams& phase_params =
+      periodic_compaction_phase_params_;
 
   for (int level = 0; level <= last_level; level++) {
     for (auto f : files_[level]) {
@@ -3860,13 +3870,54 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
             continue;
           }
         }
-        if (file_modification_time > 0 &&
-            file_modification_time < adjusted_allowed_time_limit) {
+        if (file_modification_time == 0) {
+          continue;
+        }
+
+        const uint64_t trigger_time = PeriodicCompactionTriggerTime(
+            file_modification_time, periodic_compaction_seconds, phase_params);
+        if (current_time + offpeak_pull > trigger_time) {
           files_marked_for_periodic_compaction_.emplace_back(level, f);
         }
       }
     }
   }
+}
+
+uint64_t VersionStorageInfo::PeriodicCompactionTriggerTime(
+    uint64_t file_modification_time, uint64_t periodic_compaction_seconds,
+    const PeriodicCompactionPhaseParams& params) {
+  const uint64_t n = periodic_compaction_seconds;
+  // Unphased deadline: file age reaches periodic_compaction_seconds. This is a
+  // hard upper bound on age; phasing only ever triggers earlier.
+  const uint64_t natural_trigger = file_modification_time + n;
+  const int recovery_percent = params.recovery_percent;
+  if (recovery_percent <= 0 || n == 0) {
+    return natural_trigger;
+  }
+  // Preferred-phase time within each period, floor(p*n) with p == seed / 2^64.
+  const uint64_t target = FastRange64(params.seed_hash, n);
+  // Distance (in [0, n)) from the natural deadline back to the nearest
+  // preferred-phase time at or before it.
+  const uint64_t offset = (file_modification_time % n + n - target) % n;
+  // Close recovery_percent% of that gap, triggering earlier. Over successive
+  // re-stamped cycles the phase error decays geometrically toward the phase.
+  const uint64_t early_pull =
+      offset * static_cast<uint64_t>(std::min(recovery_percent, 100)) / 100;
+  const uint64_t recovery_trigger = natural_trigger - early_pull;
+  const uint64_t anchor = params.anchor_time;
+  if (natural_trigger <= anchor) {
+    // Already at/past the hard deadline when phasing took effect: fire at the
+    // deadline (i.e. immediately), never later than the classic behavior.
+    return natural_trigger;
+  } else if (recovery_trigger >= anchor) {
+    return recovery_trigger;
+  }
+  // Past due against the recovery target at the anchor: spread the catch-up
+  // across [anchor, natural deadline] using the phase (no recovery), so
+  // enabling phasing fleet-wide does not fire everything at once, and never
+  // later than the natural deadline.
+  return anchor + FastRange64(params.seed_hash, natural_trigger - anchor);
 }
 
 void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
@@ -5612,7 +5663,67 @@ void VersionSet::UpdatedMutableDbOptions(
   manifest_preallocation_size_ = updated_options.manifest_preallocation_size;
   verify_manifest_content_on_close_ =
       updated_options.verify_manifest_content_on_close;
+
+  const bool phase_config_changed =
+      updated_options.compaction_schedule_seed != compaction_schedule_seed_ ||
+      updated_options.periodic_compaction_phase_recovery_percent !=
+          periodic_compaction_phase_recovery_percent_;
+  compaction_schedule_seed_ = updated_options.compaction_schedule_seed;
+  periodic_compaction_phase_recovery_percent_ =
+      updated_options.periodic_compaction_phase_recovery_percent;
+  if (phase_config_changed) {
+    // (Re)anchor phasing so that switching it on (at open or via SetDBOptions)
+    // spreads the initial periodic-compaction catch-up burst over time rather
+    // than triggering it all at once.
+    int64_t now = 0;
+    if (clock_ != nullptr && clock_->GetCurrentTime(&now).ok()) {
+      compaction_phase_anchor_time_ = static_cast<uint64_t>(now);
+    }
+    if (mu != nullptr) {
+      // Live SetDBOptions change (not construction): push the refreshed phase
+      // params into each column family's current Version so the change takes
+      // effect on the next periodic re-evaluation (which recomputes scores on
+      // the current Version) rather than only when the next Version is built.
+      // Safe because periodic_compaction_phase_params_ is read only under the
+      // DB mutex, which is held here.
+      for (auto* cfd : *column_family_set_) {
+        if (cfd->IsDropped()) {
+          continue;
+        }
+        Version* v = cfd->current();
+        if (v != nullptr) {
+          v->storage_info_.periodic_compaction_phase_params_ =
+              GetPeriodicCompactionPhaseParams(cfd->GetName());
+        }
+      }
+    }
+  }
+
   TuneMaxManifestFileSize();
+}
+
+PeriodicCompactionPhaseParams VersionSet::GetPeriodicCompactionPhaseParams(
+    const std::string& cf_name) const {
+  PeriodicCompactionPhaseParams params;
+  const int recovery_percent = periodic_compaction_phase_recovery_percent_;
+  if (recovery_percent <= 0) {
+    // Phasing disabled; return default (disabled) params.
+    return params;
+  }
+  // Whole-value token substitution (mirrors db_host_id / kHostnameForDbHostId).
+  const std::string* resolved = &compaction_schedule_seed_;
+  if (compaction_schedule_seed_ == kDbNameForScheduleSeed) {
+    resolved = &dbname_;
+  } else if (compaction_schedule_seed_ == kDbIdForScheduleSeed) {
+    resolved = &db_id_;
+  }
+  // Seed-chain the CF name into the DB-level seed for a stable per-(DB, CF)
+  // hash (see the pattern in table/unique_id.cc).
+  const uint64_t db_seed = Hash64(resolved->data(), resolved->size());
+  params.seed_hash = Hash64(cf_name.data(), cf_name.size(), db_seed);
+  params.anchor_time = compaction_phase_anchor_time_;
+  params.recovery_percent = std::min(recovery_percent, 100);
+  return params;
 }
 
 void VersionSet::TuneMaxManifestFileSize() {

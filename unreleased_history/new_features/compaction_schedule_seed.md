@@ -1,0 +1,1 @@
+Added DB options `compaction_schedule_seed` and `periodic_compaction_phase_recovery_percent` that give each DB (and column family) a randomized-but-stable preferred phase for periodic (time-based) compaction, spreading periodic compactions across time to avoid fleet-wide "thundering herd" bursts. Both are dynamically changeable with `SetDBOptions()`.

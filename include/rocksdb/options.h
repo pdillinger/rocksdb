@@ -457,6 +457,13 @@ struct DbPath {
 
 extern const char* kHostnameForDbHostId;
 
+// Whole-value substitution tokens for DBOptions::compaction_schedule_seed. If
+// the entire seed string equals one of these, it is replaced with the DB name
+// or the DB ID (from the IDENTITY file) respectively when deriving the
+// per-(DB, CF) compaction schedule phase.
+extern const char* kDbNameForScheduleSeed;
+extern const char* kDbIdForScheduleSeed;
+
 enum class CompactionServiceJobStatus : char {
   kSuccess,
   kFailure,
@@ -1819,6 +1826,55 @@ struct DBOptions {
   //
   // Dynamically changeable through SetDBOptions() API.
   uint64_t max_compaction_trigger_wakeup_seconds = 43200;
+
+  // Seed for randomizing the phase of periodic (time-based) compaction across
+  // DBs and column families, so that DBs configured alike do not all trigger
+  // their periodic_compaction_seconds compactions at the same wall-clock times
+  // (a "thundering herd"). Each column family additionally mixes in its own
+  // name, so different CFs in the same DB get different phases.
+  //
+  // Whole-value substitution (like db_host_id): if the entire string equals
+  //   "__db_name__" it is replaced with the DB name (the path passed to
+  //                 DB::Open), or
+  //   "__db_id__"   it is replaced with the DB ID (from the IDENTITY file);
+  // any other value is used verbatim as the seed. Note that replicas produced
+  // by copying a DB typically share both the DB name and DB ID, so they will
+  // share a phase.
+  //
+  // The derived phase only takes effect when
+  // periodic_compaction_phase_recovery_percent > 0.
+  //
+  // Default: "__db_name__"
+  //
+  // Dynamically changeable through SetDBOptions() API.
+  std::string compaction_schedule_seed = kDbNameForScheduleSeed;
+
+  // Controls how aggressively periodic (time-based) compaction converges to its
+  // preferred phase (see compaction_schedule_seed). On each periodic-compaction
+  // trigger for a file, this percent (0-100) of the gap between the file's
+  // unphased trigger time and its preferred-phase time is closed, always by
+  // triggering *earlier* -- never later than periodic_compaction_seconds, which
+  // remains a hard upper bound on data age. Because each compaction re-stamps
+  // the file, the phase error then decays geometrically toward the preferred
+  // phase over successive cycles.
+  //
+  // 0 disables phasing entirely (exact legacy behavior; this is the kill
+  // switch). 100 snaps to the preferred phase in a single cycle, which can
+  // recompact some files well before their normal interval and is generally not
+  // recommended. Values are clamped to [0, 100].
+  //
+  // Lower values converge more slowly but incur less extra compaction work,
+  // especially under write-driven or bursty workloads that keep re-randomizing
+  // a file's phase (where a high recovery rate wastefully "chases" the moving
+  // phase). ~33 is a good balance of spreading speed vs. extra work: almost
+  // always widely spread after a few periods while almost always below 5%
+  // extra compaction work overall, trending toward 0% in the long term for
+  // most workloads.
+  //
+  // Default: 33
+  //
+  // Dynamically changeable through SetDBOptions() API.
+  int periodic_compaction_phase_recovery_percent = 33;
 
   // EXPERIMENTAL
 

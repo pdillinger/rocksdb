@@ -2205,6 +2205,7 @@ TEST_F(DBTestUniversalCompaction2, PeriodicCompactionDefault) {
             dbfull()->GetOptions().periodic_compaction_seconds);
 
   options.periodic_compaction_seconds = 45 * 24 * 60 * 60;
+  options.periodic_compaction_phase_recovery_percent = 0;
   options.ttl = 50 * 24 * 60 * 60;
   Reopen(options);
   ASSERT_EQ(45 * 24 * 60 * 60,
@@ -2227,6 +2228,7 @@ TEST_F(DBTestUniversalCompaction2, PeriodicCompaction) {
   opts.compaction_options_universal.min_merge_width = 2;
   opts.compaction_options_universal.max_size_amplification_percent = 200;
   opts.periodic_compaction_seconds = 48 * 60 * 60;  // 2 days
+  opts.periodic_compaction_phase_recovery_percent = 0;
   opts.num_levels = 5;
   env_->SetMockSleep();
   Reopen(opts);
@@ -2298,6 +2300,7 @@ TEST_F(DBTestUniversalCompaction2, PeriodicCompactionOffpeak) {
   opts.compaction_options_universal.min_merge_width = 2;
   opts.compaction_options_universal.max_size_amplification_percent = 200;
   opts.periodic_compaction_seconds = 5 * kSecondsPerDay;  // 5 days
+  opts.periodic_compaction_phase_recovery_percent = 0;
   opts.num_levels = 5;
 
   // Just to add some extra random days to current time

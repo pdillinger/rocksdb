@@ -1,0 +1,1 @@
+Periodic (time-based) compaction now converges to a per-DB/column-family preferred phase by default (`periodic_compaction_phase_recovery_percent` defaults to 33), which can trigger a file's periodic compaction somewhat earlier than `periodic_compaction_seconds` (but never later). Set `periodic_compaction_phase_recovery_percent=0` to restore the previous exact timing.
