@@ -41,6 +41,7 @@
 #include "db/error_handler.h"
 #include "db/file_indexer.h"
 #include "db/log_reader.h"
+#include "db/periodic_compaction_phaser.h"
 #include "db/range_del_aggregator.h"
 #include "db/read_callback.h"
 #include "db/table_cache.h"
@@ -120,22 +121,6 @@ void DoGenerateLevelFilesBrief(LevelFilesBrief* file_level,
 enum EpochNumberRequirement {
   kMightMissing,
   kMustPresent,
-};
-
-// Parameters controlling randomized-but-stable phasing of periodic
-// (time-based) compaction, derived per Version from
-// DBOptions::compaction_schedule_seed and
-// periodic_compaction_phase_recovery_percent together with the DB/CF identity.
-// recovery_percent == 0 disables phasing (exact legacy behavior).
-struct PeriodicCompactionPhaseParams {
-  // Stable per-(DB, CF) hash seeding the preferred phase.
-  uint64_t seed_hash = 0;
-  // Unix time (seconds) at which phasing took effect for this DB (DB::Open, or
-  // the last relevant SetDBOptions change). Used to spread the initial
-  // catch-up burst across [anchor_time, natural deadline].
-  uint64_t anchor_time = 0;
-  // Percent [0, 100] of the phase gap closed per trigger; 0 disables phasing.
-  int recovery_percent = 0;
 };
 
 // Information of the storage associated with each Version, including number of
@@ -235,18 +220,6 @@ class VersionStorageInfo {
   void ComputeFilesMarkedForPeriodicCompaction(
       const ImmutableOptions& ioptions,
       const uint64_t periodic_compaction_seconds, int last_level);
-
-  // Returns the wall-clock time (unix seconds) at which a file with the given
-  // modification time becomes eligible for periodic compaction under the given
-  // phasing parameters, NOT accounting for the offpeak pull (which the caller
-  // applies). When params.recovery_percent == 0 (phasing disabled) this is
-  // simply file_modification_time + periodic_compaction_seconds (the classic
-  // behavior). Otherwise the trigger is pulled earlier toward the file's
-  // preferred phase; it is never later than the classic deadline. Public and
-  // static for testing.
-  static uint64_t PeriodicCompactionTriggerTime(
-      uint64_t file_modification_time, uint64_t periodic_compaction_seconds,
-      const PeriodicCompactionPhaseParams& params);
 
   // This computes bottommost_files_marked_for_compaction_ and is called by
   // ComputeCompactionScore() or UpdateOldestSnapshot().
@@ -1684,12 +1657,18 @@ class VersionSet {
     offpeak_time_option_.SetFromOffpeakTimeString(daily_offpeak_time_utc);
   }
 
-  // Resolves compaction_schedule_seed_ (with whole-value __db_name__/__db_id__
-  // substitution) and combines it with the given CF name into a stable 64-bit
-  // seed, packaging it with the recovery percent and phasing anchor for that
-  // CF. Returns disabled params (recovery_percent == 0) when phasing is off.
+  // Thin forwarder to periodic_compaction_phaser_.ParamsForCf(cf_id): the
+  // per-CF phasing params (base phase from the seed + golden-ratio CF spread +
+  // anchor + recovery percent). Returns disabled params when phasing is off.
   PeriodicCompactionPhaseParams GetPeriodicCompactionPhaseParams(
-      const std::string& cf_name) const;
+      uint32_t cf_id) const;
+
+  // (Re)anchor periodic-compaction phasing to now and refresh the cached phase
+  // params on every column family's current Version. Called when a CF's
+  // periodic_compaction_seconds changes via SetOptions, so a turn-down's newly
+  // past-due cohort is spread (over the phase grid within ~N/4 of now) instead
+  // of firing all at once. Caller must hold the DB mutex.
+  void ReanchorCompactionPhase();
 
   const ImmutableDBOptions* db_options() const { return db_options_; }
 
@@ -1841,6 +1820,9 @@ class VersionSet {
   SystemClock* const clock_;
   const std::string dbname_;
   std::string db_id_;
+  // Periodic-compaction phasing. Declared right after dbname_/db_id_ because it
+  // holds live references to them (for __db_name__/__db_id__ substitution).
+  PeriodicCompactionPhaser periodic_compaction_phaser_{dbname_, db_id_};
   const ImmutableDBOptions* const db_options_;
   std::atomic<uint64_t> next_file_number_;
   // Any WAL number smaller than this should be ignored during recovery,
@@ -1940,15 +1922,6 @@ class VersionSet {
 
   // Off-peak time option used for compaction scoring
   OffpeakTimeOption offpeak_time_option_;
-
-  // Compaction-schedule phasing (see DBOptions::compaction_schedule_seed).
-  // Updated together in UpdatedMutableDbOptions().
-  std::string compaction_schedule_seed_;
-  int periodic_compaction_phase_recovery_percent_ = 0;
-  // Unix time (seconds) at which phasing took effect for this DB (construction
-  // or last relevant SetDBOptions change); used to spread the initial
-  // periodic-compaction catch-up burst.
-  uint64_t compaction_phase_anchor_time_ = 0;
 
   // Pointer to the DB's ErrorHandler.
   ErrorHandler* const error_handler_;

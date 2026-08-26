@@ -492,7 +492,7 @@ TEST_F(OptionsSettableTest, DBOptionsAllFieldsSettable) {
       "enforce_single_del_contracts=false;"
       "daily_offpeak_time_utc=08:30-19:00;"
       "max_compaction_trigger_wakeup_seconds=43200;"
-      "compaction_schedule_seed=__db_id__;"
+      "compaction_schedule_seed=__db_name__;"
       "periodic_compaction_phase_recovery_percent=25;"
       "follower_refresh_catchup_period_ms=123;"
       "follower_catchup_retry_count=456;"

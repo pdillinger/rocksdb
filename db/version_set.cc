@@ -2759,7 +2759,7 @@ Version::Version(ColumnFamilyData* column_family_data, VersionSet* vset,
           vset->offpeak_time_option(),
           cfd_ == nullptr
               ? PeriodicCompactionPhaseParams{}
-              : vset->GetPeriodicCompactionPhaseParams(cfd_->GetName())),
+              : vset->GetPeriodicCompactionPhaseParams(cfd_->GetID())),
       vset_(vset),
       next_(this),
       prev_(this),
@@ -3874,7 +3874,7 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
           continue;
         }
 
-        const uint64_t trigger_time = PeriodicCompactionTriggerTime(
+        const uint64_t trigger_time = PeriodicCompactionPhaser::TriggerTime(
             file_modification_time, periodic_compaction_seconds, phase_params);
         if (current_time + offpeak_pull > trigger_time) {
           files_marked_for_periodic_compaction_.emplace_back(level, f);
@@ -3882,42 +3882,6 @@ void VersionStorageInfo::ComputeFilesMarkedForPeriodicCompaction(
       }
     }
   }
-}
-
-uint64_t VersionStorageInfo::PeriodicCompactionTriggerTime(
-    uint64_t file_modification_time, uint64_t periodic_compaction_seconds,
-    const PeriodicCompactionPhaseParams& params) {
-  const uint64_t n = periodic_compaction_seconds;
-  // Unphased deadline: file age reaches periodic_compaction_seconds. This is a
-  // hard upper bound on age; phasing only ever triggers earlier.
-  const uint64_t natural_trigger = file_modification_time + n;
-  const int recovery_percent = params.recovery_percent;
-  if (recovery_percent <= 0 || n == 0) {
-    return natural_trigger;
-  }
-  // Preferred-phase time within each period, floor(p*n) with p == seed / 2^64.
-  const uint64_t target = FastRange64(params.seed_hash, n);
-  // Distance (in [0, n)) from the natural deadline back to the nearest
-  // preferred-phase time at or before it.
-  const uint64_t offset = (file_modification_time % n + n - target) % n;
-  // Close recovery_percent% of that gap, triggering earlier. Over successive
-  // re-stamped cycles the phase error decays geometrically toward the phase.
-  const uint64_t early_pull =
-      offset * static_cast<uint64_t>(std::min(recovery_percent, 100)) / 100;
-  const uint64_t recovery_trigger = natural_trigger - early_pull;
-  const uint64_t anchor = params.anchor_time;
-  if (natural_trigger <= anchor) {
-    // Already at/past the hard deadline when phasing took effect: fire at the
-    // deadline (i.e. immediately), never later than the classic behavior.
-    return natural_trigger;
-  } else if (recovery_trigger >= anchor) {
-    return recovery_trigger;
-  }
-  // Past due against the recovery target at the anchor: spread the catch-up
-  // across [anchor, natural deadline] using the phase (no recovery), so
-  // enabling phasing fleet-wide does not fire everything at once, and never
-  // later than the natural deadline.
-  return anchor + FastRange64(params.seed_hash, natural_trigger - anchor);
 }
 
 void VersionStorageInfo::ComputeFilesMarkedForForcedBlobGC(
@@ -5664,20 +5628,15 @@ void VersionSet::UpdatedMutableDbOptions(
   verify_manifest_content_on_close_ =
       updated_options.verify_manifest_content_on_close;
 
-  const bool phase_config_changed =
-      updated_options.compaction_schedule_seed != compaction_schedule_seed_ ||
-      updated_options.periodic_compaction_phase_recovery_percent !=
-          periodic_compaction_phase_recovery_percent_;
-  compaction_schedule_seed_ = updated_options.compaction_schedule_seed;
-  periodic_compaction_phase_recovery_percent_ =
-      updated_options.periodic_compaction_phase_recovery_percent;
-  if (phase_config_changed) {
+  if (periodic_compaction_phaser_.SetConfig(
+          updated_options.compaction_schedule_seed,
+          updated_options.periodic_compaction_phase_recovery_percent)) {
     // (Re)anchor phasing so that switching it on (at open or via SetDBOptions)
     // spreads the initial periodic-compaction catch-up burst over time rather
     // than triggering it all at once.
     int64_t now = 0;
     if (clock_ != nullptr && clock_->GetCurrentTime(&now).ok()) {
-      compaction_phase_anchor_time_ = static_cast<uint64_t>(now);
+      periodic_compaction_phaser_.Reanchor(static_cast<uint64_t>(now));
     }
     if (mu != nullptr) {
       // Live SetDBOptions change (not construction): push the refreshed phase
@@ -5693,7 +5652,7 @@ void VersionSet::UpdatedMutableDbOptions(
         Version* v = cfd->current();
         if (v != nullptr) {
           v->storage_info_.periodic_compaction_phase_params_ =
-              GetPeriodicCompactionPhaseParams(cfd->GetName());
+              GetPeriodicCompactionPhaseParams(cfd->GetID());
         }
       }
     }
@@ -5703,27 +5662,31 @@ void VersionSet::UpdatedMutableDbOptions(
 }
 
 PeriodicCompactionPhaseParams VersionSet::GetPeriodicCompactionPhaseParams(
-    const std::string& cf_name) const {
-  PeriodicCompactionPhaseParams params;
-  const int recovery_percent = periodic_compaction_phase_recovery_percent_;
-  if (recovery_percent <= 0) {
-    // Phasing disabled; return default (disabled) params.
-    return params;
+    uint32_t cf_id) const {
+  return periodic_compaction_phaser_.ParamsForCf(cf_id);
+}
+
+void VersionSet::ReanchorCompactionPhase() {
+  // Caller holds the DB mutex. Move the phasing anchor to now and refresh each
+  // CF's current Version's cached params, mirroring the refresh done for
+  // seed/recovery changes in UpdatedMutableDbOptions(). Used when a CF's
+  // periodic_compaction_seconds changes, so a turn-down's newly past-due cohort
+  // is spread rather than fired at once. Re-anchoring is DB-level and benign to
+  // CFs whose interval did not change (their not-past-due files keep phasing).
+  int64_t now = 0;
+  if (clock_ != nullptr && clock_->GetCurrentTime(&now).ok()) {
+    periodic_compaction_phaser_.Reanchor(static_cast<uint64_t>(now));
   }
-  // Whole-value token substitution (mirrors db_host_id / kHostnameForDbHostId).
-  const std::string* resolved = &compaction_schedule_seed_;
-  if (compaction_schedule_seed_ == kDbNameForScheduleSeed) {
-    resolved = &dbname_;
-  } else if (compaction_schedule_seed_ == kDbIdForScheduleSeed) {
-    resolved = &db_id_;
+  for (auto* cfd : *column_family_set_) {
+    if (cfd->IsDropped()) {
+      continue;
+    }
+    Version* v = cfd->current();
+    if (v != nullptr) {
+      v->storage_info_.periodic_compaction_phase_params_ =
+          GetPeriodicCompactionPhaseParams(cfd->GetID());
+    }
   }
-  // Seed-chain the CF name into the DB-level seed for a stable per-(DB, CF)
-  // hash (see the pattern in table/unique_id.cc).
-  const uint64_t db_seed = Hash64(resolved->data(), resolved->size());
-  params.seed_hash = Hash64(cf_name.data(), cf_name.size(), db_seed);
-  params.anchor_time = compaction_phase_anchor_time_;
-  params.recovery_percent = std::min(recovery_percent, 100);
-  return params;
 }
 
 void VersionSet::TuneMaxManifestFileSize() {

@@ -127,12 +127,21 @@ void RunScenario(const std::string& name, const std::string& base_dir,
                  int recovery_percent, bool staggered, double upgrade_after_s,
                  int upgrade_recovery, double restart_after_s = -1,
                  int restart_recovery = 0, double natural_period = 0,
-                 double burst_mean = 0) {
-  fprintf(stderr, "\n=== %s (N=%llu, M=%d, run=%.0fs, rp=%d%s%s%s) ===\n",
+                 double burst_mean = 0, double period_change_after_s = -1,
+                 uint64_t new_n_seconds = 0, int period_change_recovery = -1) {
+  // Optional scenario filter: PC_SIM_ONLY=<substr> runs only matching scenarios
+  // (e.g. PC_SIM_ONLY=turn for the turn-up/turn-down cases).
+  const char* only = getenv("PC_SIM_ONLY");
+  if (only != nullptr && *only != '\0' &&
+      name.find(only) == std::string::npos) {
+    return;
+  }
+  fprintf(stderr, "\n=== %s (N=%llu, M=%d, run=%.0fs, rp=%d%s%s%s%s) ===\n",
           name.c_str(), (unsigned long long)n_seconds, num_dbs, run_seconds,
           recovery_percent, staggered ? ", staggered" : "",
           natural_period > 0 ? ", natural" : "",
-          burst_mean > 0 ? ", burst" : "");
+          burst_mean > 0 ? ", burst" : "",
+          period_change_after_s >= 0 ? ", period-change" : "");
   g_scenario = name;
 
   std::vector<Db> dbs(num_dbs);
@@ -163,7 +172,7 @@ void RunScenario(const std::string& name, const std::string& base_dir,
     for (int i = 0; i < num_dbs; ++i) next_burst[i] = u01(rng) * burst_mean;
   }
 
-  bool upgraded = false, restarted = false;
+  bool upgraded = false, restarted = false, period_changed = false;
   while (NowRel() < run_seconds) {
     const double now = NowRel();
     if (upgrade_after_s >= 0 && !upgraded && now >= upgrade_after_s) {
@@ -186,6 +195,48 @@ void RunScenario(const std::string& name, const std::string& base_dir,
       restarted = true;
       fprintf(stderr, "  [t=%.1fs] RESTART enable rp=%d\n", NowRel(),
               restart_recovery);
+    }
+    if (period_change_after_s >= 0 && !period_changed &&
+        now >= period_change_after_s) {
+      // Turn periodic_compaction_seconds up or down for all DBs. A turn-down
+      // makes the past-due portion of the (age-spread) fleet eligible at once;
+      // the re-anchor + newN/4 grid spreads that cohort instead of bursting. A
+      // turn-up just extends deadlines (no burst). Report the age mix at the
+      // change (relative to the smaller/tighter period) to characterize it.
+      const uint64_t ref = new_n_seconds > n_seconds
+                               ? n_seconds / 2  // turn-up: "recent" vs half old
+                               : std::min(n_seconds, new_n_seconds);
+      int recent = 0, past_due = 0;
+      {
+        std::lock_guard<std::mutex> l(g_mu);
+        for (int i = 0; i < num_dbs; ++i) {
+          if (now - g_last_comp[i] < static_cast<double>(ref)) {
+            recent++;
+          } else {
+            past_due++;
+          }
+        }
+      }
+      for (auto& d : dbs) {
+        Check(d.db->SetOptions({{"periodic_compaction_seconds",
+                                 std::to_string(new_n_seconds)}}),
+              "SetOptions(period)");
+        if (period_change_recovery >= 0) {
+          // Also switch recovery_percent at the change (e.g. 100 -> 33): start
+          // fully spread (rp=100), then let the turn play out at the default.
+          Check(
+              d.db->SetDBOptions({{"periodic_compaction_phase_recovery_percent",
+                                   std::to_string(period_change_recovery)}}),
+              "SetDBOptions(rp@change)");
+        }
+      }
+      period_changed = true;
+      fprintf(stderr,
+              "  [t=%.1fs] PERIOD change -> %llu (rp -> %d); at change "
+              "(ref=%llus): recent(age<ref)=%d past_due(age>=ref)=%d of %d\n",
+              NowRel(), (unsigned long long)new_n_seconds,
+              period_change_recovery, (unsigned long long)ref, recent, past_due,
+              num_dbs);
     }
     if (natural_period > 0) {
       std::vector<double> last;
@@ -229,18 +280,37 @@ int main(int argc, char** argv) {
   const double P075 = 0.75 * N, B15 = 1.5 * N;
 
   // --- Pure periodic (no external writes) ---
-  // Dynamic enable at 3 recovery rates (shows the fix + transient badness).
-  RunScenario("upgrade_dynamic_r33", base, M, n, 6.2 * N, 0, false, 2.4 * N,
+  // Dynamic enable at 3 recovery rates (shows the de-herd + transient badness).
+  // Interval = N (the base periodic-compaction interval). Run 8N so ~4-5
+  // post-enable cycles are visible. Pass a larger N (e.g. 36) for a cleaner,
+  // less "circulating" convergence view.
+  RunScenario("upgrade_dynamic_r33", base, M, n, 8.0 * N, 0, false, 2.4 * N,
               33);
-  RunScenario("upgrade_dynamic_r50", base, M, n, 6.2 * N, 0, false, 2.4 * N,
+  RunScenario("upgrade_dynamic_r50", base, M, n, 8.0 * N, 0, false, 2.4 * N,
               50);
-  RunScenario("upgrade_dynamic_r100", base, M, n, 6.2 * N, 0, false, 2.4 * N,
+  RunScenario("upgrade_dynamic_r100", base, M, n, 8.0 * N, 0, false, 2.4 * N,
               100);
   // Restart (reopen) enable at 33 -- should look like the dynamic r33 case.
-  RunScenario("upgrade_restart_r33", base, M, n, 6.2 * N, 0, false, -1, 0,
+  RunScenario("upgrade_restart_r33", base, M, n, 8.0 * N, 0, false, -1, 0,
               2.4 * N, 33);
   // Staggered fresh times, phasing on -> rearrange to seed phases (re-seed).
   RunScenario("staggered_phased_r33", base, M, n, 6.2 * N, 33, true, -1, 0);
+
+  // --- Interval change: turn the periodic-compaction interval DOWN then UP by
+  // a
+  //     factor of 3, expressed in the base interval N (36s<->12s at N=12).
+  //     Start at rp=100 so the fleet is fully spread within ~1 cycle, then the
+  //     config change flips BOTH the interval and rp->33 mid-cycle. A
+  //     fully-spread fleet has uniform ages, so turn-DOWN (3N->N) leaves ~2/3
+  //     of DBs past the new deadline -> the re-anchor + new (N/4) grid spreads
+  //     that cohort while ~1/3 carry on; turn-UP (N->3N) finds ~1/2 recently
+  //     compacted and just extends deadlines (no burst). Turn-up runs long
+  //     (16N) so ~4-5 cycles of the new 3N interval are visible after the
+  //     change.
+  RunScenario("turndown_r33", base, M, 3 * n, 9.0 * N, 100, false, -1, 0, -1, 0,
+              0, 0, 3.5 * N, n, 33);
+  RunScenario("turnup_r33", base, M, n, 12.0 * N, 100, false, -1, 0, -1, 0, 0,
+              0, 2.0 * N, 3 * n, 33);
 
   // --- Natural write-driven full compaction every 0.75N ---
   RunScenario("natural_sync_r0", base, M, n, 5.2 * N, 0, false, -1, 0, -1, 0,

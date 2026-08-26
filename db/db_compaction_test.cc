@@ -14,6 +14,7 @@
 #include "db/blob/blob_index.h"
 #include "db/db_test_util.h"
 #include "db/dbformat.h"
+#include "db/periodic_compaction_phaser.h"
 #include "db/table_cache.h"
 #include "env/mock_env.h"
 #include "file/filename.h"
@@ -5582,7 +5583,7 @@ TEST_F(DBCompactionTest, LevelPeriodicCompaction) {
 }
 
 TEST_F(DBCompactionTest, PeriodicCompactionPhaseTriggerTime) {
-  // Unit-tests VersionStorageInfo::PeriodicCompactionTriggerTime, the core of
+  // Unit-tests PeriodicCompactionPhaser::TriggerTime, the core of
   // preferred-phase periodic compaction (see
   // DBOptions::compaction_schedule_seed /
   // periodic_compaction_phase_recovery_percent).
@@ -5602,8 +5603,7 @@ TEST_F(DBCompactionTest, PeriodicCompactionPhaseTriggerTime) {
     p.seed_hash = kSeed;
     p.recovery_percent = 0;
     for (uint64_t fm : {uint64_t{1}, uint64_t{7}, uint64_t{12345}}) {
-      ASSERT_EQ(VersionStorageInfo::PeriodicCompactionTriggerTime(fm, kN, p),
-                fm + kN);
+      ASSERT_EQ(PeriodicCompactionPhaser::TriggerTime(fm, kN, p), fm + kN);
     }
   }
 
@@ -5618,8 +5618,7 @@ TEST_F(DBCompactionTest, PeriodicCompactionPhaseTriggerTime) {
     const uint64_t natural = fm + kN;
     const uint64_t offset = (fm % kN + kN - target) % kN;
     const uint64_t expected = natural - offset * 50 / 100;
-    ASSERT_EQ(VersionStorageInfo::PeriodicCompactionTriggerTime(fm, kN, p),
-              expected);
+    ASSERT_EQ(PeriodicCompactionPhaser::TriggerTime(fm, kN, p), expected);
     ASSERT_LE(expected, natural);
   }
 
@@ -5633,16 +5632,15 @@ TEST_F(DBCompactionTest, PeriodicCompactionPhaseTriggerTime) {
     uint64_t fm = 123;
     uint64_t prev_error = kN;
     for (int cycle = 0; cycle < 64; ++cycle) {
-      const uint64_t trig =
-          VersionStorageInfo::PeriodicCompactionTriggerTime(fm, kN, p);
+      const uint64_t trig = PeriodicCompactionPhaser::TriggerTime(fm, kN, p);
       ASSERT_LE(trig, fm + kN);  // never later than the deadline
       const uint64_t error = (trig % kN + kN - target) % kN;
       ASSERT_LE(error, prev_error);
       prev_error = error;
       fm = trig;
     }
-    // 100% snaps to the phase exactly; smaller rates leave a tiny integer
-    // rounding residue.
+    // rp=100 pulls the whole gap so it reaches the phase exactly; smaller rates
+    // decay geometrically and leave a tiny integer-rounding residue.
     if (recovery_percent == 100) {
       ASSERT_EQ(prev_error, uint64_t{0});
     } else {
@@ -5650,16 +5648,24 @@ TEST_F(DBCompactionTest, PeriodicCompactionPhaseTriggerTime) {
     }
   }
 
-  // Already at/past the hard deadline when phasing took effect => fire at the
-  // deadline (immediately), never later than the classic behavior.
+  // Already past the hard deadline when phasing took effect (e.g. the DB was
+  // down, or periodic_compaction_seconds was turned down): instead of firing
+  // the whole cohort immediately, spread it over the first quarter-period after
+  // the anchor on an absolute (epoch-aligned) grid of period N/4.
   {
     Params p;
     p.seed_hash = kSeed;
     p.recovery_percent = 50;
     p.anchor_time = 200;
-    // natural deadline (10 + 100 = 110) is before the anchor.
-    ASSERT_EQ(VersionStorageInfo::PeriodicCompactionTriggerTime(10, 100, p),
-              uint64_t{110});
+    const uint64_t n = 100;
+    const uint64_t grid = n / 4;  // 25
+    const uint64_t phase = FastRange64(kSeed, grid);
+    // natural deadline (10 + 100 = 110) is before the anchor (200).
+    const uint64_t expected = 200 + (phase + grid - 200 % grid) % grid;
+    const uint64_t trig = PeriodicCompactionPhaser::TriggerTime(10, n, p);
+    ASSERT_EQ(trig, expected);
+    ASSERT_GE(trig, uint64_t{200});  // never before the anchor
+    ASSERT_LT(trig, 200 + grid);     // within N/4 of the anchor
   }
 
   // Past due against the recovery target but not yet at the deadline => spread
@@ -5677,11 +5683,111 @@ TEST_F(DBCompactionTest, PeriodicCompactionPhaseTriggerTime) {
     p.anchor_time = anchor;
     ASSERT_EQ((fm % n + n - small_target) % n, uint64_t{50});
     const uint64_t expected = anchor + FastRange64(kSeed, natural - anchor);
-    const uint64_t trig =
-        VersionStorageInfo::PeriodicCompactionTriggerTime(fm, n, p);
+    const uint64_t trig = PeriodicCompactionPhaser::TriggerTime(fm, n, p);
     ASSERT_EQ(trig, expected);
     ASSERT_GE(trig, anchor);
     ASSERT_LT(trig, natural);
+  }
+}
+
+TEST_F(DBCompactionTest, PeriodicCompactionPhaseExplicitSeed) {
+  // Unit-tests VersionStorageInfo::TryParseExplicitPhaseSeed -- the explicit
+  // phase-position form of DBOptions::compaction_schedule_seed, where a value
+  // "0.<digits>" is a fraction in [0, 1) used directly as the preferred phase.
+  using VSI = PeriodicCompactionPhaser;
+
+  // Rejected forms (fall through to the normal token/hash seed path) must
+  // return false and leave the out-param untouched. Covers a bare "0.",
+  // missing/extra dots, signs, scientific notation, trailing junk/space, and
+  // normal seeds.
+  for (const char* bad :
+       {"",     "0",         "0.",          ".5",         "1.5",  "00.5",
+        "00.0", "0.5e2",     "0.5E2",       "0.5e-1",     "0.5f", "0.5 ",
+        " 0.5", "-0.5",      "+0.5",        "0.5.5",      "0.-5", "0..5",
+        "0x.5", "__db_id__", "__db_name__", "custom_seed"}) {
+    uint64_t h = 0xABCDu;
+    ASSERT_FALSE(VSI::TryParseExplicitPhaseSeed(bad, &h))
+        << "should reject: '" << bad << "'";
+    ASSERT_EQ(h, uint64_t{0xABCDu});  // untouched on rejection
+  }
+
+  // Accepted forms map to phase == floor(fraction * n) for any interval n. The
+  // integer method is exact; the <=1 tolerance is only for the double reference
+  // `want` (float rounding of frac*n), not the method itself.
+  struct Case {
+    const char* seed;
+    double frac;
+  };
+  const std::vector<Case> cases = {
+      {"0.0", 0.0},     {"0.5", 0.5},   {"0.25", 0.25},
+      {"0.75", 0.75},   {"0.1", 0.1},   {"0.333", 0.333},
+      {"0.999", 0.999}, {"0.500", 0.5}, {"0.05", 0.05}};
+  for (const Case& c : cases) {
+    uint64_t seed_hash = 0;
+    ASSERT_TRUE(VSI::TryParseExplicitPhaseSeed(c.seed, &seed_hash))
+        << "should accept: '" << c.seed << "'";
+    for (uint64_t n :
+         {uint64_t{100}, uint64_t{1000}, uint64_t{86400}, uint64_t{604800}}) {
+      const uint64_t got = FastRange64(seed_hash, n);
+      const uint64_t want = static_cast<uint64_t>(c.frac * n);
+      ASSERT_LT(got, n);
+      const uint64_t diff = got > want ? got - want : want - got;
+      ASSERT_LE(diff, uint64_t{1}) << "seed=" << c.seed << " n=" << n
+                                   << " got=" << got << " want=" << want;
+    }
+  }
+
+  // With the +1 rounding, clean fractions map to their exact phase.
+  const uint64_t kN = 1000;
+  uint64_t h00 = 0, h25 = 0, h50 = 0, h75 = 0;
+  ASSERT_TRUE(VSI::TryParseExplicitPhaseSeed("0.0", &h00));
+  ASSERT_TRUE(VSI::TryParseExplicitPhaseSeed("0.25", &h25));
+  ASSERT_TRUE(VSI::TryParseExplicitPhaseSeed("0.5", &h50));
+  ASSERT_TRUE(VSI::TryParseExplicitPhaseSeed("0.75", &h75));
+  ASSERT_EQ(FastRange64(h00, kN), uint64_t{0});
+  ASSERT_EQ(FastRange64(h25, kN), uint64_t{250});
+  ASSERT_EQ(FastRange64(h50, kN), uint64_t{500});
+  ASSERT_EQ(FastRange64(h75, kN), uint64_t{750});
+}
+
+TEST_F(DBCompactionTest, PeriodicCompactionPhaseCfSpread) {
+  // Unit-tests VersionStorageInfo::CfPhaseSeedHash: a DB's column families are
+  // spread quasi-uniformly around the DB base phase via the golden-ratio
+  // recurrence, for any base (hashed or explicit) and any number of CFs.
+  using VSI = PeriodicCompactionPhaser;
+
+  // cf_id 0 leaves the base phase unchanged; distinct cf_ids -> distinct
+  // phases.
+  for (uint64_t base : {uint64_t{0}, uint64_t{0x9e3779b97f4a7c15ULL},
+                        uint64_t{12345678901234567ULL}, ~uint64_t{0}}) {
+    ASSERT_EQ(VSI::CfPhaseSeedHash(base, 0), base);
+    std::vector<uint64_t> hs;
+    for (uint32_t id = 0; id < 64; ++id) {
+      hs.push_back(VSI::CfPhaseSeedHash(base, id));
+    }
+    std::sort(hs.begin(), hs.end());
+    for (size_t i = 1; i < hs.size(); ++i) {
+      ASSERT_NE(hs[i], hs[i - 1]) << "duplicate CF phase seed at base=" << base;
+    }
+  }
+
+  // Low-discrepancy: for N CFs the phases over an interval are well spread --
+  // no gap larger than ~2x the average (a hash would allow chance clustering).
+  for (uint64_t base : {uint64_t{0}, uint64_t{0xdeadbeefcafef00dULL}}) {
+    for (uint32_t N : {uint32_t{3}, uint32_t{8}, uint32_t{16}, uint32_t{40}}) {
+      const uint64_t n = 100000;
+      std::vector<uint64_t> phases;
+      for (uint32_t id = 0; id < N; ++id) {
+        phases.push_back(FastRange64(VSI::CfPhaseSeedHash(base, id), n));
+      }
+      std::sort(phases.begin(), phases.end());
+      uint64_t max_gap = n - phases.back() + phases.front();  // wrap-around gap
+      for (size_t i = 1; i < phases.size(); ++i) {
+        max_gap = std::max(max_gap, phases[i] - phases[i - 1]);
+      }
+      ASSERT_LE(max_gap, 2 * (n / N))
+          << "base=" << base << " N=" << N << " max_gap=" << max_gap;
+    }
   }
 }
 
